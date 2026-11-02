@@ -1,6 +1,7 @@
 const std = @import("std");
 const ethernet = @import("ethernet");
 const EthernetFrame = ethernet.EthernetFrame;
+const TPID = ethernet.TPID;
 const Mac = ethernet.Mac;
 const VlanTag = ethernet.VlanTag;
 
@@ -61,7 +62,7 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]EthernetFrame {
             frame.ethertype = try std.fmt.parseInt(u16, vlan_etype_str[2..], 16);
 
             var vlan_tag: VlanTag = undefined;
-            vlan_tag.tpid = ethernet.TPID;
+            vlan_tag.tpid = TPID;
             vlan_tag.tci.vid = try std.fmt.parseInt(u12, vlan_vid_str, 10);
             vlan_tag.tci.pcp = try std.fmt.parseInt(u3, vlan_pcp_str, 10);
 

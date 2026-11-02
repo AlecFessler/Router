@@ -32,13 +32,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const ethernet = b.createModule(.{
-        .root_source_file = b.path("src/protocols/ethernet.zig"),
-    });
     const ethernet_csv_parser = b.createModule(.{
         .root_source_file = b.path("test_fixtures/ethernet_csv_parser.zig"),
     });
-    ethernet_csv_parser.addImport("ethernet", ethernet);
+    ethernet_csv_parser.addImport("ethernet", exe_tests.root_module);
     const pcap_parser = b.createModule(.{
         .root_source_file = b.path("test_fixtures/pcap_parser.zig"),
     });
