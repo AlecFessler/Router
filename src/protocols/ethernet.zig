@@ -136,8 +136,8 @@ pub fn parse(buffer: []const u8) !EthernetFrame {
     try reader.readSliceAll(&frame.src_mac);
     const discriminator = try reader.takeInt(u16, .big);
 
-    const is_ethernet_II_frame = discriminator > PAYLOAD_LEN_MAX;
-    const ethertype_invalid = is_ethernet_II_frame and discriminator <= VALID_ETHERTYPE_MIN;
+    var is_ethernet_II_frame = discriminator > PAYLOAD_LEN_MAX;
+    var ethertype_invalid = is_ethernet_II_frame and discriminator <= VALID_ETHERTYPE_MIN;
     if (ethertype_invalid) {
         return error.InvalidEthertype;
     }
@@ -150,6 +150,12 @@ pub fn parse(buffer: []const u8) !EthernetFrame {
             .tci = @bitCast(tci_bits),
         };
         frame.ethertype = try reader.takeInt(u16, .big);
+
+        is_ethernet_II_frame = frame.ethertype > PAYLOAD_LEN_MAX;
+        ethertype_invalid = is_ethernet_II_frame and frame.ethertype <= VALID_ETHERTYPE_MIN;
+        if (ethertype_invalid) {
+            return error.InvalidEthertype;
+        }
     } else {
         frame.ethertype = discriminator;
         frame.vlan_tag = null;
