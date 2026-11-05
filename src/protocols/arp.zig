@@ -20,17 +20,12 @@ const Mac = ethernet.Mac;
 
 pub const ArpTable = struct {
     pub const Entry = struct {
-        mac: Mac,
-        timestamp: std.Io.Timestamp,
-    };
-
-    pub const Table = std.AutoHashMapUnmanaged(u32, Entry);
-
-    pub const KVPair = struct {
         ip: IPv4,
         mac: Mac,
         timestamp: std.Io.Timestamp,
     };
+
+    pub const Table = std.MultiArrayList(Entry);
 
     io: std.Io,
     table: Table,
@@ -43,7 +38,7 @@ pub const ArpTable = struct {
         ttl: std.Io.Duration,
     ) !ArpTable {
         var table: Table = .empty;
-        try table.ensureTotalCapacity(alloc, capacity);
+        try table.setCapacity(alloc, capacity);
         return .{
             .io = io,
             .table = table,
@@ -55,61 +50,63 @@ pub const ArpTable = struct {
         self.table.deinit(alloc);
     }
 
+    fn FieldType(comptime field: std.meta.FieldEnum(Entry)) type {
+        return @FieldType(Entry, @tagName(field));
+    }
+
+    // It's a little overcooked, considering we only search for IPs, but damn was it fun to write
+    pub fn indexOfValue(
+        self: *ArpTable,
+        comptime field: Table.Field,
+        value: FieldType(field),
+    ) ?usize {
+        const IntType = std.meta.Int(.unsigned, @bitSizeOf(FieldType(field)));
+        const target: IntType = @bitCast(value);
+        for (self.table.items(field), 0..) |item, i| {
+            const key: IntType = @bitCast(item);
+            if (target == key) return i;
+        } else return null;
+    }
+
     pub fn lookup(self: *ArpTable, ip: IPv4) ?Mac {
-        const entry = self.table.get(@bitCast(ip)) orelse return null;
-        const age = entry.timestamp.untilNow(self.io, .boot);
+        const index = self.indexOfValue(.ip, ip) orelse return null;
+        const timestamp = self.table.items(.timestamp)[index];
+        const age = timestamp.untilNow(self.io, .boot);
         const is_expired = (self.ttl.toNanoseconds() - age.toNanoseconds()) <= 0;
         if (is_expired) {
-            const removed = self.table.remove(@bitCast(ip));
-            std.debug.assert(removed);
+            self.table.swapRemove(index);
             return null;
         }
-        return entry.mac;
+        return self.table.items(.mac)[index];
     }
 
     pub fn cache(self: *ArpTable, ip: IPv4, mac: Mac) void {
         const entry: Entry = .{
+            .ip = ip,
             .mac = mac,
             .timestamp = std.Io.Timestamp.now(self.io, .boot),
         };
-        const key: u32 = std.mem.readInt(u32, &ip, .little);
 
-        if (self.lookup(ip) != null) {
-            self.table.putAssumeCapacity(key, entry);
+        var index = self.indexOfValue(.ip, ip);
+        if (index != null) {
+            self.table.set(index.?, entry);
             return;
         }
 
-        if (self.table.available == 0) {
-            var target: u32 = undefined;
-            var target_age: std.Io.Duration = std.Io.Duration.fromMilliseconds(0);
-            var it = self.table.iterator();
-            while (it.next()) |kv| {
-                const age = kv.value_ptr.timestamp.untilNow(self.io, .boot);
+        if (self.table.len == self.table.capacity) {
+            var target_age = std.Io.Duration.fromMilliseconds(0);
+            for (self.table.items(.timestamp), 0..) |timestamp, i| {
+                const age = timestamp.untilNow(self.io, .boot);
                 const found_new_oldest = age.toNanoseconds() >= target_age.toNanoseconds();
                 if (!found_new_oldest) continue;
-                target = kv.key_ptr.*;
+                index = i;
                 target_age = age;
             }
-            const removed = self.table.remove(target);
-            std.debug.assert(removed);
+            self.table.set(index.?, entry);
+            return;
         }
 
-        self.table.putAssumeCapacity(key, entry);
-    }
-
-    pub fn dump(self: *ArpTable, alloc: std.mem.Allocator) ![]KVPair {
-        const buffer = try alloc.alloc(KVPair, self.table.size);
-        var it = self.table.iterator();
-        var i: u32 = 0;
-        while (it.next()) |kv| : (i += 1) {
-            const ip: IPv4 = std.mem.toBytes(kv.key_ptr.*)[0..4].*;
-            buffer[i] = KVPair{
-                .ip = ip,
-                .mac = kv.value_ptr.mac,
-                .timestamp = kv.value_ptr.timestamp,
-            };
-        }
-        return buffer;
+        self.table.appendAssumeCapacity(entry);
     }
 };
 
@@ -135,8 +132,9 @@ test "ArpTable.cache() stores the IP->MAC key value pair" {
     const test_mac: Mac = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 
     table.cache(test_ip, test_mac);
-    const entry = table.table.get(@bitCast(test_ip));
-    try std.testing.expectEqual(test_mac, entry.?.mac);
+    const index = table.indexOfValue(.ip, test_ip);
+    const entry = table.table.get(index.?);
+    try std.testing.expectEqual(test_mac, entry.mac);
 }
 
 test "ArpTable.cache() evicts one entry on full capacity" {
@@ -147,18 +145,12 @@ test "ArpTable.cache() evicts one entry on full capacity" {
         std.Io.Duration.fromMilliseconds(10_000),
     );
     defer table.deinit(std.testing.allocator);
-    const target_test_ip: IPv4 = .{ 255, 255, 255, 255 };
+    const test_ip1: IPv4 = .{ 255, 255, 255, 255 };
+    const test_ip2: IPv4 = .{ 1, 1, 1, 1 };
     const test_mac: Mac = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
-    table.cache(target_test_ip, test_mac);
-    try std.testing.io.sleep(.fromMilliseconds(1), .boot);
-
-    for (0..table.table.available + 1) |i| {
-        const as_u8: u8 = @intCast(i);
-        const test_ip: IPv4 = .{ as_u8, as_u8, as_u8, as_u8 };
-        table.cache(test_ip, test_mac);
-    }
-
-    const expected_null = table.table.get(@bitCast(target_test_ip));
+    table.cache(test_ip1, test_mac);
+    table.cache(test_ip2, test_mac);
+    const expected_null = table.indexOfValue(.ip, test_ip1);
     try std.testing.expectEqual(null, expected_null);
 }
 
@@ -174,10 +166,11 @@ test "ArpTable.cache() updates the timestamp on existing entries" {
     const test_mac: Mac = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 
     table.cache(test_ip, test_mac);
-    const entry_timestamp1 = table.table.get(@bitCast(test_ip)).?.timestamp;
-    try std.testing.io.sleep(.fromMilliseconds(1), .boot);
+    const index = table.indexOfValue(.ip, test_ip);
+    const timestamp_list = table.table.items(.timestamp);
+    const entry_timestamp1 = timestamp_list[index.?];
     table.cache(test_ip, test_mac);
-    const entry_timestamp2 = table.table.get(@bitCast(test_ip)).?.timestamp;
+    const entry_timestamp2 = timestamp_list[index.?];
     try std.testing.expect(entry_timestamp1.toNanoseconds() < entry_timestamp2.toNanoseconds());
 }
 
@@ -206,8 +199,9 @@ test "ArpTable.lookup() returns null for expired cache entries" {
     const test_mac: Mac = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 
     table.cache(test_ip, test_mac);
-    const entry = table.table.get(@bitCast(test_ip));
-    try std.testing.expectEqual(test_mac, entry.?.mac);
+    const index = table.indexOfValue(.ip, test_ip);
+    const entry = table.table.get(index.?);
+    try std.testing.expectEqual(test_mac, entry.mac);
     try std.testing.io.sleep(.fromMilliseconds(2), .boot);
     try std.testing.expectEqual(null, table.lookup(test_ip));
 }
