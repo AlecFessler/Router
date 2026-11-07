@@ -90,79 +90,80 @@ pub fn request(
     return packet;
 }
 
-test "ArpPacketView.serialize() writes a wire-sized packet" {
-    const packet = ArpPacket{};
-    var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try ArpPacketView.serialize(packet, &writer);
+const test_packet = [_]u8{
+    0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+} ++ ([_]u8{0} ** 20);
 
-    const expected = [_]u8{
-        0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
-    } ++ ([_]u8{0} ** 20);
-    try std.testing.expectEqualSlices(u8, &expected, &buffer);
+const invalid_fields = [_]struct { offset: usize, value: u8 }{
+    .{ .offset = 1, .value = 2 },
+    .{ .offset = 3, .value = 1 },
+    .{ .offset = 4, .value = 7 },
+    .{ .offset = 5, .value = 5 },
+    .{ .offset = 7, .value = 3 },
+};
 
-    var parsed = try parse(&buffer);
-    try std.testing.expectEqualDeep(packet, parsed.copy());
-}
-
-test "parse() rejects serialized packets containing invalid metadata" {
-    const default_packet = ArpPacket{};
-    const invalid_packets = [_]ArpPacket{
-        .{ .hardware_type = default_packet.hardware_type + 1 },
-        .{ .protocol_type = default_packet.protocol_type + 1 },
-        .{ .hardware_size = default_packet.hardware_size + 1 },
-        .{ .protocol_size = default_packet.protocol_size + 1 },
-    };
-
-    for (invalid_packets) |packet| {
-        var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buffer);
-        try ArpPacketView.serialize(packet, &writer);
-        try std.testing.expectError(error.InvalidField, parse(&buffer));
-    }
+test "parse() reads ARP fields from wire bytes" {
+    const expected = ArpPacket{};
+    const view = try parse(&test_packet);
+    try std.testing.expect(view.isEqual(&expected));
 }
 
 test "parse() rejects truncated packets and accepts trailing bytes" {
-    const packet = ArpPacket{};
-    var buffer: [@sizeOf(ArpPacket) + 1]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(buffer[0..@sizeOf(ArpPacket)]);
-    try ArpPacketView.serialize(packet, &writer);
-    buffer[@sizeOf(ArpPacket)] = 0xff;
+    const buffer = test_packet ++ [_]u8{0xff};
 
-    for (0..@sizeOf(ArpPacket)) |len| {
+    for (0..test_packet.len) |len| {
         try std.testing.expectError(error.EndOfStream, parse(buffer[0..len]));
     }
 
-    var parsed = try parse(&buffer);
-    try std.testing.expectEqualDeep(packet, parsed.copy());
+    const expected = ArpPacket{};
+    const view = try parse(&buffer);
+    try std.testing.expect(view.isEqual(&expected));
 }
 
-test "parse() rejects packet buffers containing invalid metadata fields" {
-    var valid_buffer: [@sizeOf(ArpPacket)]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&valid_buffer);
-    try ArpPacketView.serialize(ArpPacket{}, &writer);
-
-    const invalid_fields = [_]struct { offset: usize, value: u8 }{
-        .{ .offset = 1, .value = 2 },
-        .{ .offset = 3, .value = 1 },
-        .{ .offset = 4, .value = 7 },
-        .{ .offset = 5, .value = 5 },
-        .{ .offset = 7, .value = 3 },
-    };
-
+test "parse() rejects invalid metadata fields" {
     for (invalid_fields) |invalid| {
-        var buffer = valid_buffer;
+        var buffer = test_packet;
         buffer[invalid.offset] = invalid.value;
         try std.testing.expectError(error.InvalidField, parse(&buffer));
     }
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    // TODO: implement this
+    const pcap_parser = router.test_fixtures.arp.pcap_parser;
+    const csv_parser = router.test_fixtures.arp.csv_parser;
+    const pcap_file = router.test_fixtures.arp.pcap;
+    const csv_file = router.test_fixtures.arp.csv;
+
+    var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
+    defer parsed_pcap.deinit(std.testing.allocator);
+    const parsed_packets = try csv_parser.parse(csv_file, std.testing.allocator);
+    defer std.testing.allocator.free(parsed_packets);
+
+    try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
+    for (parsed_packets, 0..) |ws_packet, i| {
+        const frame = try router.protocols.ethernet.parse(parsed_pcap.packet_bytes[i]);
+        try std.testing.expectEqual(@as(u16, 0x0806), frame.get(.ethertype));
+        const view = try parse(frame.get(.payload));
+        try std.testing.expect(view.isEqual(&ws_packet));
+    }
 }
 
 test "parse() then serialize() returns the original bytes" {
-    // TODO: implement this
+    const pcap_parser = router.test_fixtures.arp.pcap_parser;
+    const pcap_file = router.test_fixtures.arp.pcap;
+
+    var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
+    defer parsed_pcap.deinit(std.testing.allocator);
+
+    for (parsed_pcap.packet_bytes) |packet| {
+        const frame = try router.protocols.ethernet.parse(packet);
+        const arp_bytes = frame.get(.payload);
+        var view = try parse(arp_bytes);
+        var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try ArpPacketView.serialize(view.copy(), &writer);
+        try std.testing.expectEqualSlices(u8, arp_bytes[0..buffer.len], &buffer);
+    }
 }
 
 test "request() returns a packet struct with valid metadata fields" {
