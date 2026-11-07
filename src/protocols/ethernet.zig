@@ -113,7 +113,12 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
         try frame_view.takeField(.ethertype, &reader);
     }
 
-    try frame_view.takeBytes(.payload, reader.bufferedLen(), &reader);
+    const ethertype = frame_view.get(.ethertype);
+    const payload_len = if (ethertype <= PAYLOAD_LEN_MAX)
+        ethertype
+    else
+        reader.bufferedLen();
+    try frame_view.takeBytes(.payload, payload_len, &reader);
 
     try validate(frame_view);
     return frame_view;
@@ -136,7 +141,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
     }
 }
 
-test "parse() then serialize() returns the original bytes" {
+test "parse() then serialize() preserves frame fields and payload" {
     const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
     const pcap_file = router.test_fixtures.ethernet.pcap;
 
@@ -151,7 +156,39 @@ test "parse() then serialize() returns the original bytes" {
         var frame_view = try parse(packet);
         const copy = frame_view.copy();
         try EthernetFrameView.serialize(copy, &writer);
-        try std.testing.expectEqualSlices(u8, packet, buffer);
+        const header_len: usize = if (copy.tpid != null) 18 else 14;
+        try std.testing.expectEqual(header_len + copy.payload.len, writer.end);
+        try std.testing.expectEqualSlices(u8, packet[0..writer.end], buffer[0..writer.end]);
+    }
+}
+
+test "parse() uses the 802.3 length field and excludes padding" {
+    const payload = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+
+    for ([_]bool{ false, true }) |tagged| {
+        const frame = EthernetFrame{
+            .dst_mac = .{ 0, 1, 2, 3, 4, 5 },
+            .src_mac = .{ 6, 7, 8, 9, 10, 11 },
+            .tpid = if (tagged) TPID else null,
+            .tci = if (tagged) Tci{ .vid = 100, .dei = false, .pcp = 3 } else null,
+            .ethertype = payload.len,
+            .payload = &payload,
+        };
+        var buffer: [64]u8 = .{0xee} ** 64;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try EthernetFrameView.serialize(frame, &writer);
+
+        const packet_len: usize = if (tagged) 22 else 18;
+        try std.testing.expectEqual(packet_len, writer.end);
+
+        const view = try parse(&buffer);
+        try std.testing.expectEqual(@as(u16, payload.len), view.get(.ethertype));
+        try std.testing.expectEqualSlices(u8, &payload, view.get(.payload));
+        try std.testing.expectEqual(
+            @intFromPtr(&buffer[packet_len - payload.len]),
+            @intFromPtr(view.get(.payload).ptr),
+        );
+        try std.testing.expectError(error.EndOfStream, parse(buffer[0 .. packet_len - 1]));
     }
 }
 
