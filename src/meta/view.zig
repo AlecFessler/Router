@@ -86,6 +86,12 @@ pub fn View(Base: type) type {
     return struct {
         fields: ViewFields,
 
+        pub const EqualityMode = enum {
+            shallow,
+            deep,
+            ignore_slices,
+        };
+
         pub fn takeField(
             self: *@This(),
             comptime field: FieldEnum,
@@ -256,6 +262,14 @@ pub fn View(Base: type) type {
             value: FieldType(Base, field),
         ) void {
             const T = UnderlyingType(FieldType(Base, field));
+
+            if (@typeInfo(FieldType(Base, field)) == .optional) {
+                if (value == null) {
+                    @field(self.fields, @tagName(field)) = null;
+                    return;
+                }
+            }
+
             const storage = @field(self.fields, @tagName(field));
 
             const ptr = if (comptime @typeInfo(FieldType(Base, field)) == .optional)
@@ -264,7 +278,7 @@ pub fn View(Base: type) type {
                 storage;
 
             const actual_value = if (comptime @typeInfo(FieldType(Base, field)) == .optional)
-                value orelse @panic("Cannot set field to null")
+                value.?
             else
                 value;
 
@@ -274,7 +288,7 @@ pub fn View(Base: type) type {
                 },
 
                 .int => {
-                    ptr.* = std.mem.nativeToBig(@TypeOf(actual_value), actual_value);
+                    ptr.* = std.mem.nativeToBig(T, actual_value);
                 },
 
                 .pointer => |info| {
@@ -298,6 +312,179 @@ pub fn View(Base: type) type {
                 else => {
                     ptr.* = actual_value;
                 },
+            }
+        }
+
+        fn readField(source: anytype, comptime field: FieldEnum) FieldType(Base, field) {
+            const T = @TypeOf(source);
+            const name = @tagName(field);
+
+            if (T == Base) return @field(source, name);
+            if (T == *Base or T == *const Base) return @field(source.*, name);
+            if (T == @This()) return source.get(field);
+            if (T == *@This() or T == *const @This()) return source.get(field);
+
+            @compileError("Expected Base or View(Base)");
+        }
+
+        pub fn compare(a: anytype, b: anytype, comptime mode: EqualityMode) bool {
+            inline for (fields) |field| {
+                field_check: {
+                    const T = UnderlyingType(field.type);
+                    const field_enum = @field(FieldEnum, field.name);
+
+                    if (mode == .ignore_slices and @typeInfo(T) == .pointer)
+                        break :field_check;
+
+                    const left_value = readField(a, field_enum);
+                    const right_value = readField(b, field_enum);
+
+                    if (@typeInfo(field.type) == .optional) {
+                        if (left_value == null and right_value == null)
+                            break :field_check;
+                        if (left_value == null or right_value == null)
+                            return false;
+                    }
+
+                    const left = if (@typeInfo(field.type) == .optional)
+                        left_value.?
+                    else
+                        left_value;
+                    const right = if (@typeInfo(field.type) == .optional)
+                        right_value.?
+                    else
+                        right_value;
+
+                    switch (@typeInfo(T)) {
+                        .pointer => {
+                            if (mode == .deep) {
+                                if (!std.mem.eql(u8, left, right)) return false;
+                            } else {
+                                if (left.ptr != right.ptr or left.len != right.len)
+                                    return false;
+                            }
+                        },
+                        else => {
+                            if (!std.meta.eql(left, right)) return false;
+                        },
+                    }
+                }
+            }
+            return true;
+        }
+
+        pub fn isEqual(self: *const @This(), other: anytype) bool {
+            return compare(self, other, .shallow);
+        }
+
+        pub fn isDeepEqual(self: *const @This(), other: anytype) bool {
+            return compare(self, other, .deep);
+        }
+
+        pub fn isEqualIgnoringSlices(self: *const @This(), other: anytype) bool {
+            return compare(self, other, .ignore_slices);
+        }
+
+        fn printValue(comptime T: type, value: T) void {
+            switch (@typeInfo(T)) {
+                .optional => |info| {
+                    if (value) |present| {
+                        printValue(info.child, present);
+                    } else {
+                        std.debug.print("null", .{});
+                    }
+                },
+                .int => std.debug.print("0x{x}", .{value}),
+                .bool => std.debug.print("{}", .{value}),
+                .@"enum" => std.debug.print("{s}", .{@tagName(value)}),
+                .@"struct" => |info| {
+                    std.debug.print("{{ ", .{});
+                    inline for (info.fields, 0..) |field, i| {
+                        if (i != 0) std.debug.print(", ", .{});
+                        std.debug.print("{s}: ", .{field.name});
+                        const field_value = @field(value, field.name);
+                        switch (@typeInfo(field.type)) {
+                            .int => std.debug.print("{}", .{field_value}),
+                            else => printValue(field.type, field_value),
+                        }
+                    }
+                    std.debug.print(" }}", .{});
+                },
+                .array => |info| {
+                    switch (info.len) {
+                        4 => {
+                            inline for (0..4) |i| {
+                                if (i != 0) std.debug.print(".", .{});
+                                std.debug.print("{}", .{value[i]});
+                            }
+                        },
+                        6 => {
+                            inline for (0..6) |i| {
+                                if (i != 0) std.debug.print(":", .{});
+                                std.debug.print("{x:0>2}", .{value[i]});
+                            }
+                        },
+                        16 => {
+                            var groups: [8]u16 = undefined;
+                            inline for (0..8) |i| {
+                                groups[i] = (@as(u16, value[i * 2]) << 8) |
+                                    @as(u16, value[i * 2 + 1]);
+                            }
+                            var best_start: usize = 0;
+                            var best_len: usize = 0;
+                            var i: usize = 0;
+                            while (i < groups.len) {
+                                if (groups[i] != 0) {
+                                    i += 1;
+                                    continue;
+                                }
+                                const start = i;
+                                while (i < groups.len and groups[i] == 0) : (i += 1) {}
+                                const len = i - start;
+                                if (len >= 2 and len > best_len) {
+                                    best_start = start;
+                                    best_len = len;
+                                }
+                            }
+                            i = 0;
+                            while (i < groups.len) {
+                                if (best_len >= 2 and i == best_start) {
+                                    std.debug.print("::", .{});
+                                    i += best_len;
+                                    continue;
+                                }
+                                if (i != 0 and i != best_start + best_len)
+                                    std.debug.print(":", .{});
+                                std.debug.print("{x}", .{groups[i]});
+                                i += 1;
+                            }
+                        },
+                        else => {
+                            inline for (0..info.len) |i| {
+                                if (i != 0) std.debug.print(" ", .{});
+                                std.debug.print("{x:0>2}", .{value[i]});
+                            }
+                        },
+                    }
+                },
+                .pointer => |info| {
+                    if (info.size == .slice) {
+                        std.debug.print("0x{x} ({} bytes)", .{
+                            @intFromPtr(value.ptr),
+                            value.len,
+                        });
+                    }
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn print(self: *const @This()) void {
+            inline for (fields) |field| {
+                const field_enum = @field(FieldEnum, field.name);
+                std.debug.print("{s}: ", .{field.name});
+                printValue(field.type, self.get(field_enum));
+                std.debug.print("\n", .{});
             }
         }
 
@@ -704,6 +891,63 @@ test "View.set() writes all field types correctly" {
         @as(?[]const u8, null),
         view.get(.test_absent_slice),
     );
+}
+
+test "View.set() clears optional fields without changing the wire buffer" {
+    var buffer = test_buffer;
+    var view = parseTestBuffer(&buffer);
+
+    view.set(.test_optional_int, null);
+    view.set(.test_optional_slice, null);
+    view.set(.test_absent_int, null);
+    view.set(.test_absent_slice, null);
+
+    try std.testing.expectEqual(@as(?u16, null), view.get(.test_optional_int));
+    try std.testing.expectEqual(@as(?[]const u8, null), view.get(.test_optional_slice));
+    try std.testing.expectEqual(@as(?u16, null), view.get(.test_absent_int));
+    try std.testing.expectEqual(@as(?[]const u8, null), view.get(.test_absent_slice));
+    try std.testing.expectEqualSlices(u8, &test_buffer, &buffer);
+}
+
+test "View.compare() supports views, bases, and all equality modes" {
+    var first_buffer = test_buffer;
+    var second_buffer = test_buffer;
+    var first = parseTestBuffer(&first_buffer);
+    var second = parseTestBuffer(&second_buffer);
+    const base = first.copy();
+
+    try std.testing.expect(first.isEqual(&first));
+    try std.testing.expect(!first.isEqual(&second));
+    try std.testing.expect(first.isDeepEqual(&second));
+    try std.testing.expect(first.isEqualIgnoringSlices(&second));
+    try std.testing.expect(first.isEqual(&base));
+    try std.testing.expect(TestView.compare(base, first, .shallow));
+    try std.testing.expect(TestView.compare(&base, &second, .deep));
+    try std.testing.expect(TestView.compare(base, base, .shallow));
+    try std.testing.expect(TestView.compare(&first, base, .ignore_slices));
+
+    second.set(.test_slice, &.{ 0xAA, 0xBB });
+    second.set(.test_optional_slice, null);
+    try std.testing.expect(!first.isDeepEqual(second));
+    try std.testing.expect(!first.isEqual(second));
+    try std.testing.expect(first.isEqualIgnoringSlices(second));
+
+    second.set(.test_int, 0x1234);
+    try std.testing.expect(!first.isEqualIgnoringSlices(second));
+
+    var changed_base = base;
+    changed_base.test_array[0] = 0xFF;
+    try std.testing.expect(!TestView.compare(base, changed_base, .deep));
+
+    changed_base = base;
+    changed_base.test_optional_int = null;
+    try std.testing.expect(!TestView.compare(&first, &changed_base, .ignore_slices));
+
+    changed_base = base;
+    changed_base.test_slice = second.get(.test_slice);
+    try std.testing.expect(!TestView.compare(base, changed_base, .shallow));
+    try std.testing.expect(!TestView.compare(base, changed_base, .deep));
+    try std.testing.expect(TestView.compare(base, changed_base, .ignore_slices));
 }
 
 test "View.validate() handles optional field presence and values" {
