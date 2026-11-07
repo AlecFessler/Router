@@ -1,4 +1,4 @@
 .zig-cache/
 zig-out/
-test_fixtures/*.csv
-test_fixtures/*.pcap
+test_fixtures/**/*.csv
+test_fixtures/**/*.pcap
