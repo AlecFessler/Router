@@ -8,6 +8,13 @@ fn FieldType(
     return @FieldType(Base, @tagName(field));
 }
 
+fn UnderlyingType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |info| info.child,
+        else => T,
+    };
+}
+
 pub fn View(Base: type) type {
     const base_info = @typeInfo(Base).@"struct";
     const fields = base_info.fields;
@@ -18,9 +25,10 @@ pub fn View(Base: type) type {
     inline for (fields, 0..) |field, i| {
         field_names[i] = field.name;
 
-        switch (@typeInfo(field.type)) {
+        const T = UnderlyingType(field.type);
+        switch (@typeInfo(T)) {
             .int => {
-                if (@bitSizeOf(field.type) % 8 != 0)
+                if (@bitSizeOf(T) % 8 != 0)
                     @compileError("Integer fields must be whole-byte sized");
             },
             .@"enum" => |info| {
@@ -30,7 +38,7 @@ pub fn View(Base: type) type {
             .@"struct" => |info| {
                 if (info.layout != .@"packed")
                     @compileError("Only packed structs are supported");
-                if (@bitSizeOf(field.type) % 8 != 0)
+                if (@bitSizeOf(T) % 8 != 0)
                     @compileError("Packed structs must be whole-byte sized");
             },
             .array => |info| {
@@ -44,19 +52,24 @@ pub fn View(Base: type) type {
             else => @compileError("Unsupported field type"),
         }
 
-        const StorageType = switch (@typeInfo(field.type)) {
+        const StorageType = switch (@typeInfo(T)) {
             .@"enum" => |info| info.tag_type,
-            else => field.type,
+            else => T,
         };
 
-        field_types[i] = switch (@typeInfo(field.type)) {
-            .pointer => field.type,
+        const ViewType = switch (@typeInfo(T)) {
+            .pointer => T,
             else => @Pointer(
                 .one,
                 .{ .@"align" = 1 },
                 StorageType,
                 null,
             ),
+        };
+
+        field_types[i] = switch (@typeInfo(field.type)) {
+            .optional => ?ViewType,
+            else => ViewType,
         };
     }
 
@@ -73,31 +86,33 @@ pub fn View(Base: type) type {
     return struct {
         fields: ViewFields,
 
-        pub fn parse(
+        pub fn takeField(
             self: *@This(),
             comptime field: FieldEnum,
             reader: *std.Io.Reader,
         ) !void {
-            const T = @FieldType(ViewFields, @tagName(field));
+            const T = UnderlyingType(FieldType(Base, field));
+            const PtrType = UnderlyingType(@FieldType(ViewFields, @tagName(field)));
 
-            switch (@typeInfo(FieldType(Base, field))) {
-                .pointer => @compileError("Use take() for slices"),
+            switch (@typeInfo(T)) {
+                .pointer => @compileError("Use takeBytes() for slices"),
                 else => {},
             }
 
             @field(self.fields, @tagName(field)) =
-                @ptrCast(try reader.takeArray(@sizeOf(@typeInfo(T).pointer.child)));
+                @ptrCast(try reader.takeArray(@sizeOf(@typeInfo(PtrType).pointer.child)));
         }
 
-        pub fn take(
+        pub fn takeBytes(
             self: *@This(),
             comptime field: FieldEnum,
             len: usize,
             reader: *std.Io.Reader,
         ) !void {
-            switch (@typeInfo(FieldType(Base, field))) {
+            const T = UnderlyingType(FieldType(Base, field));
+            switch (@typeInfo(T)) {
                 .pointer => {},
-                else => @compileError("Use parse() for non-slices"),
+                else => @compileError("Use takeField() for non-slices"),
             }
 
             @field(self.fields, @tagName(field)) = try reader.take(len);
@@ -105,43 +120,65 @@ pub fn View(Base: type) type {
 
         pub fn serialize(
             base: Base,
-            comptime field: FieldEnum,
             writer: *std.Io.Writer,
         ) !void {
-            const value = @field(base, @tagName(field));
-            const T = FieldType(Base, field);
+            inline for (fields) |field| {
+                field_value: {
+                    const T = UnderlyingType(field.type);
+                    const storage = @field(base, field.name);
+                    const value = if (@typeInfo(field.type) == .optional)
+                        storage orelse break :field_value
+                    else
+                        storage;
 
-            switch (@typeInfo(T)) {
-                .int => {
-                    try writer.writeInt(T, value, .big);
-                },
-                .@"enum" => |info| {
-                    try writer.writeInt(info.tag_type, @intFromEnum(value), .big);
-                },
-                .@"struct" => {
-                    const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
-                    try writer.writeInt(IntType, @bitCast(value), .big);
-                },
-                .array => {
-                    try writer.writeAll(&value);
-                },
-                .pointer => {
-                    try writer.writeAll(value);
-                },
-                else => unreachable,
+                    switch (@typeInfo(T)) {
+                        .int => {
+                            try writer.writeInt(T, value, .big);
+                        },
+                        .@"enum" => |info| {
+                            try writer.writeInt(info.tag_type, @intFromEnum(value), .big);
+                        },
+                        .@"struct" => {
+                            const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
+                            try writer.writeInt(IntType, @bitCast(value), .big);
+                        },
+                        .array => {
+                            try writer.writeAll(&value);
+                        },
+                        .pointer => {
+                            try writer.writeAll(value);
+                        },
+                        else => unreachable,
+                    }
+                }
             }
         }
 
         pub fn validate(
             self: *const @This(),
             comptime field: FieldEnum,
-            expected: ?FieldType(Base, field),
+            expected: ?UnderlyingType(FieldType(Base, field)),
         ) error{InvalidField}!void {
-            const T = FieldType(Base, field);
+            const FieldT = FieldType(Base, field);
+            const T = UnderlyingType(FieldT);
+            const storage = @field(self.fields, @tagName(field));
+
+            if (@typeInfo(FieldT) == .optional) {
+                if (expected == null) {
+                    if (storage != null) return error.InvalidField;
+                    return;
+                }
+
+                if (storage == null) return error.InvalidField;
+            }
 
             switch (@typeInfo(T)) {
                 .@"enum" => |info| {
-                    const ptr = @field(self.fields, @tagName(field));
+                    const ptr = if (@typeInfo(FieldT) == .optional)
+                        storage.?
+                    else
+                        storage;
+
                     const raw = std.mem.bigToNative(info.tag_type, ptr.*);
                     const actual = std.enums.fromInt(T, raw) orelse
                         return error.InvalidField;
@@ -149,6 +186,17 @@ pub fn View(Base: type) type {
                     if (expected) |value| {
                         if (actual != value) return error.InvalidField;
                     }
+                },
+
+                .pointer => {
+                    const value = expected orelse return error.InvalidField;
+                    const actual = if (@typeInfo(FieldT) == .optional)
+                        self.get(field).?
+                    else
+                        self.get(field);
+
+                    if (!std.mem.eql(u8, actual, value))
+                        return error.InvalidField;
                 },
 
                 else => {
@@ -163,14 +211,21 @@ pub fn View(Base: type) type {
             self: *const @This(),
             comptime field: FieldEnum,
         ) FieldType(Base, field) {
-            const ptr = @field(self.fields, @tagName(field));
-            switch (@typeInfo(FieldType(Base, field))) {
+            const T = UnderlyingType(FieldType(Base, field));
+            const storage = @field(self.fields, @tagName(field));
+
+            const ptr = if (comptime @typeInfo(FieldType(Base, field)) == .optional)
+                storage orelse return null
+            else
+                storage;
+
+            switch (@typeInfo(T)) {
                 .@"enum" => |info| {
                     return @enumFromInt(std.mem.bigToNative(info.tag_type, ptr.*));
                 },
 
                 .int => {
-                    return std.mem.bigToNative(FieldType(Base, field), ptr.*);
+                    return std.mem.bigToNative(T, ptr.*);
                 },
 
                 .pointer => |info| {
@@ -182,7 +237,7 @@ pub fn View(Base: type) type {
 
                 .@"struct" => |info| {
                     if (info.layout == .@"packed") {
-                        const IntType = std.meta.Int(.unsigned, @bitSizeOf(FieldType(Base, field)));
+                        const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
                         const bits: IntType = @bitCast(ptr.*);
                         return @bitCast(std.mem.bigToNative(IntType, bits));
                     }
@@ -200,36 +255,48 @@ pub fn View(Base: type) type {
             comptime field: FieldEnum,
             value: FieldType(Base, field),
         ) void {
-            const ptr = @field(self.fields, @tagName(field));
-            switch (@typeInfo(FieldType(Base, field))) {
+            const T = UnderlyingType(FieldType(Base, field));
+            const storage = @field(self.fields, @tagName(field));
+
+            const ptr = if (comptime @typeInfo(FieldType(Base, field)) == .optional)
+                storage orelse @panic("Cannot set absent field")
+            else
+                storage;
+
+            const actual_value = if (comptime @typeInfo(FieldType(Base, field)) == .optional)
+                value orelse @panic("Cannot set field to null")
+            else
+                value;
+
+            switch (@typeInfo(T)) {
                 .@"enum" => |info| {
-                    ptr.* = std.mem.nativeToBig(info.tag_type, @intFromEnum(value));
+                    ptr.* = std.mem.nativeToBig(info.tag_type, @intFromEnum(actual_value));
                 },
 
                 .int => {
-                    ptr.* = std.mem.nativeToBig(@TypeOf(value), value);
+                    ptr.* = std.mem.nativeToBig(@TypeOf(actual_value), actual_value);
                 },
 
                 .pointer => |info| {
                     if (info.size == .slice) {
-                        @field(self.fields, @tagName(field)) = value;
+                        @field(self.fields, @tagName(field)) = actual_value;
                     } else {
-                        ptr.* = value;
+                        ptr.* = actual_value;
                     }
                 },
 
                 .@"struct" => |info| {
                     if (info.layout == .@"packed") {
-                        const IntType = std.meta.Int(.unsigned, @bitSizeOf(FieldType(Base, field)));
-                        const bits: IntType = @bitCast(value);
+                        const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
+                        const bits: IntType = @bitCast(actual_value);
                         ptr.* = @bitCast(std.mem.nativeToBig(IntType, bits));
                     } else {
-                        ptr.* = value;
+                        ptr.* = actual_value;
                     }
                 },
 
                 else => {
-                    ptr.* = value;
+                    ptr.* = actual_value;
                 },
             }
         }
@@ -251,34 +318,41 @@ pub fn View(Base: type) type {
 
             errdefer {
                 inline for (fields, 0..) |field, i| {
-                    if (i < initialized) {
-                        switch (@typeInfo(field.type)) {
-                            .pointer => |info| {
-                                if (info.size != .slice) continue;
-                                alloc.free(@field(result, field.name));
-                            },
+                    const T = UnderlyingType(field.type);
+                    const is_slice = switch (@typeInfo(T)) {
+                        .pointer => |info| info.size == .slice,
+                        else => false,
+                    };
 
-                            else => {},
+                    if (is_slice and i < initialized) {
+                        const slice = @field(result, field.name);
+
+                        if (@typeInfo(field.type) == .optional) {
+                            if (slice) |present| alloc.free(present);
+                        } else {
+                            alloc.free(slice);
                         }
                     }
                 }
             }
 
             inline for (fields) |field| {
-                switch (@typeInfo(field.type)) {
-                    .pointer => |info| {
-                        if (info.size == .slice) {
-                            const original = self.get(@field(FieldEnum, field.name));
-                            const copied = try alloc.alloc(info.child, original.len);
-                            @memcpy(copied, original);
-                            @field(result, field.name) = copied;
-                        } else {
-                            @field(result, field.name) = self.get(@field(FieldEnum, field.name));
-                        }
-                    },
+                const T = UnderlyingType(field.type);
+                const value = self.get(@field(FieldEnum, field.name));
 
-                    else => @field(result, field.name) = self.get(@field(FieldEnum, field.name)),
+                if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
+                    if (comptime @typeInfo(field.type) == .optional) {
+                        @field(result, field.name) = if (value) |slice|
+                            try alloc.dupe(u8, slice)
+                        else
+                            null;
+                    } else {
+                        @field(result, field.name) = try alloc.dupe(u8, value);
+                    }
+                } else {
+                    @field(result, field.name) = value;
                 }
+
                 initialized += 1;
             }
 
@@ -304,31 +378,43 @@ const TestBase = struct {
     test_packed_struct: TestPackedStruct = .{},
     test_array: [4]u8 = .{ 1, 2, 3, 4 },
     test_slice: []const u8 = &.{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
+    test_optional_int: ?u16 = 0x8100,
+    test_absent_int: ?u16 = null,
+    test_optional_slice: ?[]const u8 = &.{ 0x11, 0x22, 0x33 },
+    test_absent_slice: ?[]const u8 = null,
 };
 
 const TestView = View(TestBase);
 
-const test_buffer = result: {
-    const default = TestBase{};
-    var buffer: [18]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    TestView.serialize(default, .test_int, &writer) catch unreachable;
-    TestView.serialize(default, .test_enum, &writer) catch unreachable;
-    TestView.serialize(default, .test_packed_struct, &writer) catch unreachable;
-    TestView.serialize(default, .test_array, &writer) catch unreachable;
-    TestView.serialize(default, .test_slice, &writer) catch unreachable;
-    break :result buffer;
+const test_buffer = [_]u8{
+    0x08, 0x06,
+    0xAB, 0xCD,
+    0x9A, 0xBC,
+    0x01, 0x02,
+    0x03, 0x04,
+    0xAA, 0xBB,
+    0xCC, 0xDD,
+    0xEE, 0xFF,
+    0x81, 0x00,
+    0x11, 0x22,
+    0x33,
 };
 
 fn parseTestBuffer(buffer: []u8) TestView {
     const default = TestBase{};
     var output: TestView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
-    output.parse(.test_int, &reader) catch unreachable;
-    output.parse(.test_enum, &reader) catch unreachable;
-    output.parse(.test_packed_struct, &reader) catch unreachable;
-    output.parse(.test_array, &reader) catch unreachable;
-    output.take(.test_slice, default.test_slice.len, &reader) catch unreachable;
+
+    output.takeField(.test_int, &reader) catch unreachable;
+    output.takeField(.test_enum, &reader) catch unreachable;
+    output.takeField(.test_packed_struct, &reader) catch unreachable;
+    output.takeField(.test_array, &reader) catch unreachable;
+    output.takeBytes(.test_slice, default.test_slice.len, &reader) catch unreachable;
+    output.takeField(.test_optional_int, &reader) catch unreachable;
+    output.fields.test_absent_int = null;
+    output.takeBytes(.test_optional_slice, default.test_optional_slice.?.len, &reader) catch unreachable;
+    output.fields.test_absent_slice = null;
+
     return output;
 }
 
@@ -355,6 +441,165 @@ test "View() generates a struct with the expected field types" {
     try std.testing.expectEqual(
         []const u8,
         @TypeOf(test_view.fields.test_slice),
+    );
+    try std.testing.expectEqual(
+        ?*align(1) u16,
+        @TypeOf(test_view.fields.test_optional_int),
+    );
+    try std.testing.expectEqual(
+        ?*align(1) u16,
+        @TypeOf(test_view.fields.test_absent_int),
+    );
+    try std.testing.expectEqual(
+        ?[]const u8,
+        @TypeOf(test_view.fields.test_optional_slice),
+    );
+    try std.testing.expectEqual(
+        ?[]const u8,
+        @TypeOf(test_view.fields.test_absent_slice),
+    );
+}
+
+test "View.takeField() binds fields to the wire buffer" {
+    var buffer = test_buffer;
+    var reader: std.Io.Reader = .fixed(&buffer);
+    var view: TestView = undefined;
+
+    try view.takeField(.test_int, &reader);
+    try view.takeField(.test_enum, &reader);
+    try view.takeField(.test_packed_struct, &reader);
+    try view.takeField(.test_array, &reader);
+
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[0]),
+        @intFromPtr(view.fields.test_int),
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[2]),
+        @intFromPtr(view.fields.test_enum),
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[4]),
+        @intFromPtr(view.fields.test_packed_struct),
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[6]),
+        @intFromPtr(view.fields.test_array),
+    );
+
+    try std.testing.expectEqual(@as(u16, 0x0806), view.get(.test_int));
+    try std.testing.expectEqual(TestEnum.first, view.get(.test_enum));
+    try std.testing.expectEqualDeep(TestPackedStruct{}, view.get(.test_packed_struct));
+    try std.testing.expectEqualDeep([4]u8{ 1, 2, 3, 4 }, view.get(.test_array));
+
+    var optional_reader: std.Io.Reader = .fixed(buffer[16..]);
+    try view.takeField(.test_optional_int, &optional_reader);
+
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[16]),
+        @intFromPtr(view.fields.test_optional_int.?),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, 0x8100),
+        view.get(.test_optional_int),
+    );
+
+    view.fields.test_absent_int = null;
+
+    try std.testing.expectEqual(
+        @as(?u16, null),
+        view.get(.test_absent_int),
+    );
+}
+
+test "View.takeBytes() binds slices to the wire buffer" {
+    var buffer = test_buffer;
+    var view: TestView = undefined;
+    var reader: std.Io.Reader = .fixed(buffer[10..]);
+
+    try view.takeBytes(.test_slice, 6, &reader);
+
+    const slice = view.get(.test_slice);
+    try std.testing.expectEqualSlices(
+        u8,
+        buffer[10..16],
+        slice,
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[10]),
+        @intFromPtr(slice.ptr),
+    );
+    try std.testing.expectEqual(@as(usize, 6), slice.len);
+
+    var optional_reader: std.Io.Reader = .fixed(buffer[18..]);
+    try view.takeBytes(.test_optional_slice, 3, &optional_reader);
+
+    const optional_slice = view.get(.test_optional_slice).?;
+    try std.testing.expectEqualSlices(
+        u8,
+        buffer[18..21],
+        optional_slice,
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&buffer[18]),
+        @intFromPtr(optional_slice.ptr),
+    );
+    try std.testing.expectEqual(@as(usize, 3), optional_slice.len);
+
+    view.fields.test_absent_slice = null;
+
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        view.get(.test_absent_slice),
+    );
+}
+
+test "View.serialize() writes all field types correctly" {
+    const value = TestBase{};
+    var buffer: [test_buffer.len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try TestView.serialize(value, &writer);
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &test_buffer,
+        &buffer,
+    );
+}
+
+test "View.serialize() skips absent optional fields" {
+    var value = TestBase{};
+    value.test_optional_int = null;
+    value.test_optional_slice = null;
+
+    var buffer: [16]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try TestView.serialize(value, &writer);
+
+    try std.testing.expectEqualSlices(
+        u8,
+        test_buffer[0..16],
+        &buffer,
+    );
+
+    value.test_optional_slice = &.{ 0x11, 0x22, 0x33 };
+
+    var partial_buffer: [19]u8 = undefined;
+    var partial_writer: std.Io.Writer = .fixed(&partial_buffer);
+
+    try TestView.serialize(value, &partial_writer);
+
+    try std.testing.expectEqualSlices(
+        u8,
+        test_buffer[0..16],
+        partial_buffer[0..16],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        test_buffer[18..21],
+        partial_buffer[16..19],
     );
 }
 
@@ -384,6 +629,23 @@ test "View.get() reads all field types correctly" {
         expected.test_slice,
         view.get(.test_slice),
     );
+    try std.testing.expectEqual(
+        expected.test_optional_int,
+        view.get(.test_optional_int),
+    );
+    try std.testing.expectEqual(
+        expected.test_absent_int,
+        view.get(.test_absent_int),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.test_optional_slice.?,
+        view.get(.test_optional_slice).?,
+    );
+    try std.testing.expectEqual(
+        expected.test_absent_slice,
+        view.get(.test_absent_slice),
+    );
 }
 
 test "View.set() writes all field types correctly" {
@@ -396,10 +658,22 @@ test "View.set() writes all field types correctly" {
     view.set(.test_packed_struct, expected.test_packed_struct);
     view.set(.test_array, expected.test_array);
     view.set(.test_slice, expected.test_slice);
+    view.set(.test_optional_int, expected.test_optional_int);
+    view.set(.test_optional_slice, expected.test_optional_slice);
+
     try std.testing.expectEqualSlices(
         u8,
         test_buffer[0..10],
         buffer[0..10],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        test_buffer[16..18],
+        buffer[16..18],
+    );
+    try std.testing.expectEqual(
+        expected.test_optional_int,
+        view.get(.test_optional_int),
     );
 
     const actual_slice = view.get(.test_slice);
@@ -410,6 +684,83 @@ test "View.set() writes all field types correctly" {
     try std.testing.expectEqual(
         expected.test_slice.len,
         actual_slice.len,
+    );
+
+    const actual_optional_slice = view.get(.test_optional_slice).?;
+    try std.testing.expectEqual(
+        @intFromPtr(expected.test_optional_slice.?.ptr),
+        @intFromPtr(actual_optional_slice.ptr),
+    );
+    try std.testing.expectEqual(
+        expected.test_optional_slice.?.len,
+        actual_optional_slice.len,
+    );
+
+    try std.testing.expectEqual(
+        @as(?u16, null),
+        view.get(.test_absent_int),
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        view.get(.test_absent_slice),
+    );
+}
+
+test "View.validate() handles optional field presence and values" {
+    const default = TestBase{};
+    var buffer = test_buffer;
+    var view = parseTestBuffer(&buffer);
+
+    try view.validate(.test_int, 0x0806);
+    try view.validate(.test_enum, null);
+    try view.validate(.test_enum, .first);
+    try view.validate(.test_packed_struct, .{});
+    try view.validate(.test_array, .{ 1, 2, 3, 4 });
+    try view.validate(.test_slice, default.test_slice);
+    try view.validate(.test_optional_int, 0x8100);
+    try view.validate(.test_absent_int, null);
+    try view.validate(.test_optional_slice, default.test_optional_slice);
+    try view.validate(.test_absent_slice, null);
+
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_int, 0x1234),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_enum, .second),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_slice, &.{ 0xAA, 0xBB }),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_optional_int, 0x1234),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_optional_int, null),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_absent_int, 0x8100),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_optional_slice, &.{ 0x11, 0x22 }),
+    );
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_absent_slice, &.{0x11}),
+    );
+
+    buffer[2] = 0xFF;
+    buffer[3] = 0xFF;
+
+    try std.testing.expectError(
+        error.InvalidField,
+        view.validate(.test_enum, null),
     );
 }
 
@@ -425,6 +776,18 @@ test "View() generated copy() copies non-owned slices" {
         @intFromPtr(view.get(.test_slice).ptr),
         @intFromPtr(copied.test_slice.ptr),
     );
+    try std.testing.expectEqual(
+        @intFromPtr(view.get(.test_optional_slice).?.ptr),
+        @intFromPtr(copied.test_optional_slice.?.ptr),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, null),
+        copied.test_absent_int,
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        copied.test_absent_slice,
+    );
 }
 
 test "View() generated deepCopy() copies into owned slices" {
@@ -434,7 +797,25 @@ test "View() generated deepCopy() copies into owned slices" {
 
     const copied = try view.deepCopy(std.testing.allocator);
     defer std.testing.allocator.free(copied.test_slice);
+    defer std.testing.allocator.free(copied.test_optional_slice.?);
 
     try std.testing.expectEqualDeep(expected, copied);
-    try std.testing.expect(@intFromPtr(view.get(.test_slice).ptr) != @intFromPtr(copied.test_slice.ptr));
+
+    try std.testing.expect(
+        @intFromPtr(view.get(.test_slice).ptr) !=
+            @intFromPtr(copied.test_slice.ptr),
+    );
+    try std.testing.expect(
+        @intFromPtr(view.get(.test_optional_slice).?.ptr) !=
+            @intFromPtr(copied.test_optional_slice.?.ptr),
+    );
+
+    try std.testing.expectEqual(
+        @as(?u16, null),
+        copied.test_absent_int,
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        copied.test_absent_slice,
+    );
 }
