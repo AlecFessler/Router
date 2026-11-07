@@ -5,6 +5,10 @@ pub const Mac = ethernet.Mac;
 pub const VlanTag = ethernet.VlanTag;
 
 test {
+    // src/meta/
+    _ = @import("meta/view.zig");
+
+    // src/procotols/
     _ = @import("protocols/arp.zig");
     _ = @import("protocols/dhcp_client.zig");
     _ = @import("protocols/dhcp_server.zig");
