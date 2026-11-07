@@ -13,12 +13,13 @@
 const std = @import("std");
 const router = @import("router");
 
+const View = router.meta.view.View;
 const IPv4 = router.protocols.ipv4.IPv4;
 const Mac = router.protocols.ethernet.Mac;
 
 pub const OpCode = enum(u16) {
-    request,
-    reply,
+    request = 1,
+    reply = 2,
 };
 
 pub const ArpPacket = struct {
@@ -33,50 +34,34 @@ pub const ArpPacket = struct {
     target_ip: IPv4 = .{0} ** 4,
 };
 
-pub fn parse(buffer: []const u8) !ArpPacket {
-    if (buffer.len != @sizeOf(ArpPacket)) return error.InvalidBuffer;
+pub const ArpPacketView = View(ArpPacket);
 
-    var packet: ArpPacket = undefined;
-    var reader: std.Io.Reader = .fixed(buffer);
-
-    packet.hardware_type = try reader.takeInt(u16, .big);
-    if (packet.hardware_type != 1) return error.InvalidPacket;
-    packet.protocol_type = try reader.takeInt(u16, .big);
-    if (packet.protocol_type != 0x0800) return error.InvalidPacket;
-    packet.hardware_size = try reader.takeInt(u8, .big);
-    if (packet.hardware_size != 6) return error.InvalidPacket;
-    packet.protocol_size = try reader.takeInt(u8, .big);
-    if (packet.protocol_size != 4) return error.InvalidPacket;
-
-    const opcode = try reader.takeInt(u16, .big);
-    if (opcode != 1 or opcode != 2) return error.InvalidPacket;
-    packet.opcode = @enumFromInt(opcode);
-
-    try reader.readSliceAll(&packet.sender_mac);
-    try reader.readSliceAll(&packet.sender_ip);
-    try reader.readSliceAll(&packet.target_mac);
-    try reader.readSliceAll(&packet.target_ip);
-
-    return packet;
+pub fn validate(view: ArpPacketView) !void {
+    try view.validate(.hardware_type, 1);
+    try view.validate(.protocol_type, 0x0800);
+    try view.validate(.hardware_size, 6);
+    try view.validate(.protocol_size, 4);
+    try view.validate(.opcode, null);
 }
 
-pub fn serialize(packet: ArpPacket, buffer: []u8) !void {
+pub fn parse(buffer: []const u8) !ArpPacketView {
     if (buffer.len != @sizeOf(ArpPacket)) return error.InvalidBuffer;
-    if (packet.hardware_type != 1) return error.InvalidPacket;
-    if (packet.protocol_type != 0x0800) return error.InvalidPacket;
-    if (packet.hardware_size != 6) return error.InvalidPacket;
-    if (packet.protocol_size != 4) return error.InvalidPacket;
 
-    var writer: std.Io.Writer = .fixed(buffer);
-    try writer.writeInt(u16, packet.hardware_type, .big);
-    try writer.writeInt(u16, packet.protocol_type, .big);
-    try writer.writeInt(u8, packet.hardware_size, .big);
-    try writer.writeInt(u8, packet.protocol_size, .big);
-    try writer.writeInt(u16, @intFromEnum(packet.opcode), .big);
-    try writer.writeAll(&packet.sender_mac);
-    try writer.writeAll(&packet.sender_ip);
-    try writer.writeAll(&packet.target_mac);
-    try writer.writeAll(&packet.target_ip);
+    var view: ArpPacketView = undefined;
+    var reader: std.Io.Reader = .fixed(buffer);
+
+    try view.takeField(.hardware_type, &reader);
+    try view.takeField(.protocol_type, &reader);
+    try view.takeField(.hardware_size, &reader);
+    try view.takeField(.protocol_size, &reader);
+    try view.takeField(.opcode, &reader);
+    try view.takeField(.sender_mac, &reader);
+    try view.takeField(.sender_ip, &reader);
+    try view.takeField(.target_mac, &reader);
+    try view.takeField(.target_ip, &reader);
+
+    try validate(view);
+    return view;
 }
 
 pub fn reply(
@@ -107,29 +92,36 @@ pub fn request(
     return packet;
 }
 
-test "serialize() rejects buffers not ArpPacket sized" {
+test "ArpPacketView.serialize() writes a wire-sized packet" {
     const packet = ArpPacket{};
-    var small_buffer: [@sizeOf(ArpPacket) - 1]u8 = undefined;
-    try std.testing.expectError(error.InvalidBuffer, serialize(packet, &small_buffer));
-    var large_buffer: [@sizeOf(ArpPacket) + 1]u8 = undefined;
-    try std.testing.expectError(error.InvalidBuffer, serialize(packet, &large_buffer));
+    var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try ArpPacketView.serialize(packet, &writer);
+
+    const expected = [_]u8{
+        0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+    } ++ ([_]u8{0} ** 20);
+    try std.testing.expectEqualSlices(u8, &expected, &buffer);
+
+    var parsed = try parse(&buffer);
+    try std.testing.expectEqualDeep(packet, parsed.copy());
 }
 
-test "serialize() rejects packet structs containing invalid metadata" {
+test "parse() rejects serialized packets containing invalid metadata" {
     const default_packet = ArpPacket{};
-    var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
+    const invalid_packets = [_]ArpPacket{
+        .{ .hardware_type = default_packet.hardware_type + 1 },
+        .{ .protocol_type = default_packet.protocol_type + 1 },
+        .{ .hardware_size = default_packet.hardware_size + 1 },
+        .{ .protocol_size = default_packet.protocol_size + 1 },
+    };
 
-    const invalid_hardware_type = ArpPacket{ .hardware_type = default_packet.hardware_type + 1 };
-    try std.testing.expectError(error.InvalidPacket, serialize(invalid_hardware_type, &buffer));
-
-    const invalid_protocol_type = ArpPacket{ .protocol_type = default_packet.protocol_type + 1 };
-    try std.testing.expectError(error.InvalidPacket, serialize(invalid_protocol_type, &buffer));
-
-    const invalid_hardware_size = ArpPacket{ .hardware_type = default_packet.hardware_size + 1 };
-    try std.testing.expectError(error.InvalidPacket, serialize(invalid_hardware_size, &buffer));
-
-    const invalid_protocol_size = ArpPacket{ .protocol_size = default_packet.protocol_size + 1 };
-    try std.testing.expectError(error.InvalidPacket, serialize(invalid_protocol_size, &buffer));
+    for (invalid_packets) |packet| {
+        var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try ArpPacketView.serialize(packet, &writer);
+        try std.testing.expectError(error.InvalidField, parse(&buffer));
+    }
 }
 
 test "parse() rejects buffers not ArpPacket sized" {
@@ -140,52 +132,23 @@ test "parse() rejects buffers not ArpPacket sized" {
 }
 
 test "parse() rejects packet buffers containing invalid metadata fields" {
-    const default_packet = ArpPacket{};
+    var valid_buffer: [@sizeOf(ArpPacket)]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&valid_buffer);
+    try ArpPacketView.serialize(ArpPacket{}, &writer);
 
-    var invalid_hardware_type: [@sizeOf(ArpPacket)]u8 = undefined;
-    var invalid_hardware_type_writer: std.Io.Writer = .fixed(&invalid_hardware_type);
-    try invalid_hardware_type_writer.writeInt(u16, default_packet.hardware_type + 1, .big);
-    try invalid_hardware_type_writer.writeInt(u16, default_packet.protocol_type, .big);
-    try invalid_hardware_type_writer.writeInt(u8, default_packet.hardware_size, .big);
-    try invalid_hardware_type_writer.writeInt(u8, default_packet.protocol_size, .big);
-    try invalid_hardware_type_writer.writeInt(u16, @intFromEnum(default_packet.opcode), .big);
-    try std.testing.expectError(error.InvalidPacket, parse(&invalid_hardware_type));
+    const invalid_fields = [_]struct { offset: usize, value: u8 }{
+        .{ .offset = 1, .value = 2 },
+        .{ .offset = 3, .value = 1 },
+        .{ .offset = 4, .value = 7 },
+        .{ .offset = 5, .value = 5 },
+        .{ .offset = 7, .value = 3 },
+    };
 
-    var invalid_protocol_type: [@sizeOf(ArpPacket)]u8 = undefined;
-    var invalid_protocol_type_writer: std.Io.Writer = .fixed(&invalid_protocol_type);
-    try invalid_protocol_type_writer.writeInt(u16, default_packet.hardware_type, .big);
-    try invalid_protocol_type_writer.writeInt(u16, default_packet.protocol_type + 1, .big);
-    try invalid_protocol_type_writer.writeInt(u8, default_packet.hardware_size, .big);
-    try invalid_protocol_type_writer.writeInt(u8, default_packet.protocol_size, .big);
-    try invalid_protocol_type_writer.writeInt(u16, @intFromEnum(default_packet.opcode), .big);
-    try std.testing.expectError(error.InvalidPacket, parse(&invalid_protocol_type));
-
-    var invalid_hardware_size: [@sizeOf(ArpPacket)]u8 = undefined;
-    var invalid_hardware_size_writer: std.Io.Writer = .fixed(&invalid_hardware_size);
-    try invalid_hardware_size_writer.writeInt(u16, default_packet.hardware_type, .big);
-    try invalid_hardware_size_writer.writeInt(u16, default_packet.protocol_type, .big);
-    try invalid_hardware_size_writer.writeInt(u8, default_packet.hardware_size + 1, .big);
-    try invalid_hardware_size_writer.writeInt(u8, default_packet.protocol_size, .big);
-    try invalid_hardware_size_writer.writeInt(u16, @intFromEnum(default_packet.opcode), .big);
-    try std.testing.expectError(error.InvalidPacket, parse(&invalid_hardware_size));
-
-    var invalid_protocol_size: [@sizeOf(ArpPacket)]u8 = undefined;
-    var invalid_protocol_size_writer: std.Io.Writer = .fixed(&invalid_protocol_size);
-    try invalid_protocol_size_writer.writeInt(u16, default_packet.hardware_type, .big);
-    try invalid_protocol_size_writer.writeInt(u16, default_packet.protocol_type, .big);
-    try invalid_protocol_size_writer.writeInt(u8, default_packet.hardware_size, .big);
-    try invalid_protocol_size_writer.writeInt(u8, default_packet.protocol_size + 1, .big);
-    try invalid_protocol_size_writer.writeInt(u16, @intFromEnum(default_packet.opcode), .big);
-    try std.testing.expectError(error.InvalidPacket, parse(&invalid_protocol_size));
-
-    var invalid_opcode: [@sizeOf(ArpPacket)]u8 = undefined;
-    var invalid_opcode_writer: std.Io.Writer = .fixed(&invalid_opcode);
-    try invalid_opcode_writer.writeInt(u16, default_packet.hardware_type, .big);
-    try invalid_opcode_writer.writeInt(u16, default_packet.protocol_type, .big);
-    try invalid_opcode_writer.writeInt(u8, default_packet.hardware_size, .big);
-    try invalid_opcode_writer.writeInt(u8, default_packet.protocol_size, .big);
-    try invalid_opcode_writer.writeInt(u16, @intFromEnum(default_packet.opcode) + 2, .big);
-    try std.testing.expectError(error.InvalidPacket, parse(&invalid_opcode));
+    for (invalid_fields) |invalid| {
+        var buffer = valid_buffer;
+        buffer[invalid.offset] = invalid.value;
+        try std.testing.expectError(error.InvalidField, parse(&buffer));
+    }
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
@@ -260,17 +223,19 @@ test "reply() swaps the request's address fields, sets the sender mac, and sets 
     const sender_ip: IPv4 = .{ 192, 168, 86, 198 };
     const target_mac: Mac = .{ 0x90, 0xca, 0xfa, 0x60, 0x3c, 0xec };
     const target_ip: IPv4 = .{ 192, 168, 86, 1 };
-    try std.testing.expectEqualDeep(
-        ArpPacket{
-            .sender_mac = sender_mac,
-            .sender_ip = sender_ip,
-            .target_mac = target_mac,
-            .target_ip = target_ip,
-            .opcode = .reply,
-        },
-        reply(
-            sender_mac,
-            request(target_ip, target_mac, sender_ip, null), // request args are reversed of local names
-        ),
-    );
+    const expected = ArpPacket{
+        .sender_mac = sender_mac,
+        .sender_ip = sender_ip,
+        .target_mac = target_mac,
+        .target_ip = target_ip,
+        .opcode = .reply,
+    };
+    const request_packet = request(target_ip, target_mac, sender_ip, null);
+    try std.testing.expectEqualDeep(expected, reply(sender_mac, request_packet));
+
+    var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try ArpPacketView.serialize(request_packet, &writer);
+    var request_view = try parse(&buffer);
+    try std.testing.expectEqualDeep(expected, reply(sender_mac, request_view.copy()));
 }
