@@ -53,6 +53,8 @@
 const std = @import("std");
 const router = @import("router");
 
+const View = router.meta.view.View;
+
 pub const PAYLOAD_LEN_MAX = 1500;
 pub const VALID_ETHERTYPE_MIN = 1535;
 
@@ -68,120 +70,53 @@ pub const Tci = packed struct(u16) {
     pcp: u3, // priority code point
 };
 
-pub const VlanTag = packed struct(u32) {
-    tpid: u16 = TPID, // tag protocol identifier
-    tci: Tci, // tag control information
-};
-
 pub const EthernetFrame = struct {
     dst_mac: Mac,
     src_mac: Mac,
-    vlan_tag: ?VlanTag = null,
+    tpid: ?u16, // tag protocol identifier
+    tci: ?Tci, // tag control information
     ethertype: u16,
     payload: []const u8,
-
-    pub fn isEqual(self: *const EthernetFrame, other: *const EthernetFrame) bool {
-        if (!std.mem.eql(u8, &self.dst_mac, &other.dst_mac)) {
-            return false;
-        }
-        if (!std.mem.eql(u8, &self.src_mac, &other.src_mac)) {
-            return false;
-        }
-        if (!std.meta.eql(self.vlan_tag, other.vlan_tag)) {
-            return false;
-        }
-        if (self.ethertype != other.ethertype) {
-            return false;
-        }
-        return true;
-    }
-
-    pub fn printDebug(self: *const EthernetFrame) void {
-        std.debug.print("Dst MAC: ", .{});
-        std.debug.print("{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\n", .{
-            self.dst_mac[0],
-            self.dst_mac[1],
-            self.dst_mac[2],
-            self.dst_mac[3],
-            self.dst_mac[4],
-            self.dst_mac[5],
-        });
-        std.debug.print("Src MAC: ", .{});
-        std.debug.print("{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\n", .{
-            self.src_mac[0],
-            self.src_mac[1],
-            self.src_mac[2],
-            self.src_mac[3],
-            self.src_mac[4],
-            self.src_mac[5],
-        });
-        std.debug.print("Ethertype: 0x{X:0>4}\n", .{self.ethertype});
-        if (self.vlan_tag != null) {
-            const vlan_tag = self.vlan_tag.?;
-            std.debug.print("TPID: 0x{X}\nPCP: {}\nDEI: {}\nVID: {}\n", .{
-                vlan_tag.tpid,
-                vlan_tag.tci.pcp,
-                vlan_tag.tci.dei,
-                vlan_tag.tci.vid,
-            });
-        }
-        std.debug.print("\n", .{});
-    }
 };
 
-pub fn parse(buffer: []const u8) !EthernetFrame {
-    var frame: EthernetFrame = undefined;
-    var reader: std.Io.Reader = .fixed(buffer);
+pub const EthernetFrameView = View(EthernetFrame);
 
-    try reader.readSliceAll(&frame.dst_mac);
-    try reader.readSliceAll(&frame.src_mac);
-    const discriminator = try reader.takeInt(u16, .big);
+pub fn validate(view: EthernetFrameView) !void {
+    if (view.get(.tpid) != null) {
+        // if these are not both null or set together, that's a parse() bug
+        std.debug.assert(view.get(.tci) != null);
+    }
 
-    var is_ethernet_II_frame = discriminator > PAYLOAD_LEN_MAX;
-    var ethertype_invalid = is_ethernet_II_frame and discriminator <= VALID_ETHERTYPE_MIN;
+    const ethertype = view.get(.ethertype);
+    const is_ethernet_II_frame = ethertype > PAYLOAD_LEN_MAX;
+    const ethertype_invalid = is_ethernet_II_frame and ethertype <= VALID_ETHERTYPE_MIN;
     if (ethertype_invalid) {
         return error.InvalidEthertype;
     }
-
-    const vlan_tag_present = discriminator == TPID;
-    if (vlan_tag_present) {
-        const tci_bits = try reader.takeInt(u16, .big);
-        frame.vlan_tag = .{
-            .tpid = discriminator,
-            .tci = @bitCast(tci_bits),
-        };
-        frame.ethertype = try reader.takeInt(u16, .big);
-
-        is_ethernet_II_frame = frame.ethertype > PAYLOAD_LEN_MAX;
-        ethertype_invalid = is_ethernet_II_frame and frame.ethertype <= VALID_ETHERTYPE_MIN;
-        if (ethertype_invalid) {
-            return error.InvalidEthertype;
-        }
-    } else {
-        frame.ethertype = discriminator;
-        frame.vlan_tag = null;
-    }
-
-    if (is_ethernet_II_frame) {
-        frame.payload = reader.buffer[reader.seek..reader.end];
-    } else { // is IEEE 802.3 frame
-        frame.payload = try reader.take(discriminator);
-    }
-
-    return frame;
 }
 
-pub fn serialize(frame: EthernetFrame, buffer: []u8) ![]u8 {
-    var writer: std.Io.Writer = .fixed(buffer);
-    try writer.writeAll(&frame.dst_mac);
-    try writer.writeAll(&frame.src_mac);
-    if (frame.vlan_tag != null) {
-        try writer.writeInt(u16, frame.vlan_tag.?.tpid, .big);
-        try writer.writeInt(u16, @bitCast(frame.vlan_tag.?.tci), .big);
+pub fn parse(buffer: []const u8) !EthernetFrameView {
+    var frame_view: EthernetFrameView = undefined;
+    var reader: std.Io.Reader = .fixed(buffer);
+
+    try frame_view.takeField(.dst_mac, &reader);
+    try frame_view.takeField(.src_mac, &reader);
+
+    const vlan_tag_present = try reader.peekInt(u16, .big) == TPID;
+    if (vlan_tag_present) {
+        try frame_view.takeField(.tpid, &reader);
+        try frame_view.takeField(.tci, &reader);
+        try frame_view.takeField(.ethertype, &reader);
+    } else {
+        frame_view.set(.tpid, null);
+        frame_view.set(.tci, null);
+        try frame_view.takeField(.ethertype, &reader);
     }
-    try writer.writeInt(u16, frame.ethertype, .big);
-    try writer.writeAll(frame.payload);
-    return writer.buffer[0..writer.end];
+
+    try frame_view.takeBytes(.payload, reader.bufferedLen(), &reader);
+
+    try validate(frame_view);
+    return frame_view;
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
@@ -197,15 +132,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 
     for (parsed_frames, 0..) |ws_frame, i| {
         const my_frame = try parse(parsed_pcap.packet_bytes[i]);
-        const is_equal = my_frame.isEqual(&ws_frame);
-        if (!is_equal) {
-            std.debug.print("Frame #{}\n\n", .{i + 1});
-            std.debug.print("My frame:\n", .{});
-            my_frame.printDebug();
-            std.debug.print("Wireshark frame:\n", .{});
-            ws_frame.printDebug();
-        }
-        try std.testing.expect(is_equal);
+        try std.testing.expect(my_frame.isEqualIgnoringSlices(&ws_frame));
     }
 }
 
@@ -219,9 +146,12 @@ test "parse() then serialize() returns the original bytes" {
     for (parsed_pcap.packet_bytes) |packet| {
         const buffer = try std.testing.allocator.alloc(u8, packet.len);
         defer std.testing.allocator.free(buffer);
+        var writer: std.Io.Writer = .fixed(buffer);
 
-        const serialized = try serialize(try parse(packet), buffer);
-        try std.testing.expectEqualSlices(u8, packet, serialized);
+        var frame_view = try parse(packet);
+        const copy = frame_view.copy();
+        try EthernetFrameView.serialize(copy, &writer);
+        try std.testing.expectEqualSlices(u8, packet, buffer);
     }
 }
 
@@ -238,27 +168,31 @@ test "parse() rejects insufficient sized buffers" {
 
 test "parse() rejects invalid ethertypes" {
     const base_test_buffer: [60]u8 = result: {
-        const dst_mac = Mac{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
-        const src_mac = Mac{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
-        const ethertype: u16 = 0x0806;
-        const payload: [46]u8 = .{0x11} ** 46;
+        var frame: EthernetFrame = undefined;
+        frame.dst_mac = Mac{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+        frame.src_mac = Mac{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+        frame.tpid = null;
+        frame.tci = null;
+        frame.ethertype = 0x0806;
+        frame.payload = &([_]u8{0x11} ** 46);
+
         var buffer: [60]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
-        writer.writeAll(&dst_mac) catch {};
-        writer.writeAll(&src_mac) catch {};
-        writer.writeInt(u16, ethertype, .big) catch {};
-        writer.writeAll(&payload) catch {};
+        EthernetFrameView.serialize(frame, &writer) catch unreachable;
         break :result buffer;
     };
 
     for (1501..1536) |invalid_ethertype| {
-        var frame = try parse(&base_test_buffer);
-        frame.ethertype = @intCast(invalid_ethertype);
+        var packet = base_test_buffer;
+        var frame_view = try parse(&packet);
+        frame_view.set(.ethertype, @intCast(invalid_ethertype));
+        const copy = frame_view.copy();
         var buffer: [base_test_buffer.len]u8 = undefined;
-        const serialized = try serialize(frame, &buffer);
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try EthernetFrameView.serialize(copy, &writer);
         try std.testing.expectError(
             error.InvalidEthertype,
-            parse(serialized),
+            parse(writer.buffer),
         );
     }
 }
