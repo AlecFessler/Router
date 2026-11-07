@@ -11,12 +11,10 @@
 //! An opcode of 1 indicates a request, and 2 indicates a reply.
 
 const std = @import("std");
+const router = @import("router");
 
-const ethernet = @import("ethernet.zig");
-const ipv4 = @import("ipv4.zig");
-
-const IPv4 = ipv4.IPv4;
-const Mac = ethernet.Mac;
+const IPv4 = router.protocols.ipv4.IPv4;
+const Mac = router.protocols.ethernet.Mac;
 
 pub const OpCode = enum(u16) {
     request,
