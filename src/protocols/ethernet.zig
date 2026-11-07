@@ -124,6 +124,58 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     return frame_view;
 }
 
+const test_frame = [_]u8{
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+    0x08, 0x06,
+};
+
+test "parse() rejects insufficient sized buffers" {
+    for (0..14) |invalid_size| {
+        const buffer = try std.testing.allocator.alloc(u8, invalid_size);
+        defer std.testing.allocator.free(buffer);
+        try std.testing.expectError(
+            error.EndOfStream,
+            parse(buffer),
+        );
+    }
+}
+
+test "parse() rejects invalid ethertypes" {
+    for (1501..1536) |invalid_ethertype| {
+        var packet = test_frame;
+        packet[12] = @intCast(invalid_ethertype >> 8);
+        packet[13] = @intCast(invalid_ethertype & 0xff);
+        try std.testing.expectError(error.InvalidEthertype, parse(&packet));
+    }
+}
+
+test "parse() uses the 802.3 length field and excludes padding" {
+    const payload = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const untagged = [_]u8{
+        0, 1, 2,    3,    4,    5,    6, 7, 8, 9, 10, 11,
+        0, 4, 0xaa, 0xbb, 0xcc, 0xdd,
+    };
+    const tagged = [_]u8{
+        0,    1,    2,    3,    4, 5, 6,    7,    8,    9,    10, 11,
+        0x81, 0x00, 0x60, 0x64, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd,
+    };
+
+    for ([_][]const u8{ &untagged, &tagged }) |packet| {
+        var buffer: [64]u8 = .{0xee} ** 64;
+        @memcpy(buffer[0..packet.len], packet);
+
+        const view = try parse(&buffer);
+        try std.testing.expectEqual(@as(u16, payload.len), view.get(.ethertype));
+        try std.testing.expectEqualSlices(u8, &payload, view.get(.payload));
+        try std.testing.expectEqual(
+            @intFromPtr(&buffer[packet.len - payload.len]),
+            @intFromPtr(view.get(.payload).ptr),
+        );
+        try std.testing.expectError(error.EndOfStream, parse(buffer[0 .. packet.len - 1]));
+    }
+}
+
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
     const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
     const csv_parser = router.test_fixtures.ethernet.csv_parser;
@@ -141,7 +193,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
     }
 }
 
-test "parse() then serialize() preserves frame fields and payload" {
+test "parse() then serialize() returns the original bytes" {
     const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
     const pcap_file = router.test_fixtures.ethernet.pcap;
 
@@ -159,77 +211,5 @@ test "parse() then serialize() preserves frame fields and payload" {
         const header_len: usize = if (copy.tpid != null) 18 else 14;
         try std.testing.expectEqual(header_len + copy.payload.len, writer.end);
         try std.testing.expectEqualSlices(u8, packet[0..writer.end], buffer[0..writer.end]);
-    }
-}
-
-test "parse() uses the 802.3 length field and excludes padding" {
-    const payload = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
-
-    for ([_]bool{ false, true }) |tagged| {
-        const frame = EthernetFrame{
-            .dst_mac = .{ 0, 1, 2, 3, 4, 5 },
-            .src_mac = .{ 6, 7, 8, 9, 10, 11 },
-            .tpid = if (tagged) TPID else null,
-            .tci = if (tagged) Tci{ .vid = 100, .dei = false, .pcp = 3 } else null,
-            .ethertype = payload.len,
-            .payload = &payload,
-        };
-        var buffer: [64]u8 = .{0xee} ** 64;
-        var writer: std.Io.Writer = .fixed(&buffer);
-        try EthernetFrameView.serialize(frame, &writer);
-
-        const packet_len: usize = if (tagged) 22 else 18;
-        try std.testing.expectEqual(packet_len, writer.end);
-
-        const view = try parse(&buffer);
-        try std.testing.expectEqual(@as(u16, payload.len), view.get(.ethertype));
-        try std.testing.expectEqualSlices(u8, &payload, view.get(.payload));
-        try std.testing.expectEqual(
-            @intFromPtr(&buffer[packet_len - payload.len]),
-            @intFromPtr(view.get(.payload).ptr),
-        );
-        try std.testing.expectError(error.EndOfStream, parse(buffer[0 .. packet_len - 1]));
-    }
-}
-
-test "parse() rejects insufficient sized buffers" {
-    for (0..14) |invalid_size| {
-        const buffer = try std.testing.allocator.alloc(u8, invalid_size);
-        defer std.testing.allocator.free(buffer);
-        try std.testing.expectError(
-            error.EndOfStream,
-            parse(buffer),
-        );
-    }
-}
-
-test "parse() rejects invalid ethertypes" {
-    const base_test_buffer: [60]u8 = result: {
-        var frame: EthernetFrame = undefined;
-        frame.dst_mac = Mac{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
-        frame.src_mac = Mac{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
-        frame.tpid = null;
-        frame.tci = null;
-        frame.ethertype = 0x0806;
-        frame.payload = &([_]u8{0x11} ** 46);
-
-        var buffer: [60]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buffer);
-        EthernetFrameView.serialize(frame, &writer) catch unreachable;
-        break :result buffer;
-    };
-
-    for (1501..1536) |invalid_ethertype| {
-        var packet = base_test_buffer;
-        var frame_view = try parse(&packet);
-        frame_view.set(.ethertype, @intCast(invalid_ethertype));
-        const copy = frame_view.copy();
-        var buffer: [base_test_buffer.len]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buffer);
-        try EthernetFrameView.serialize(copy, &writer);
-        try std.testing.expectError(
-            error.InvalidEthertype,
-            parse(writer.buffer),
-        );
     }
 }
