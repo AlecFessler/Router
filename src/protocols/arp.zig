@@ -45,8 +45,6 @@ pub fn validate(view: ArpPacketView) !void {
 }
 
 pub fn parse(buffer: []const u8) !ArpPacketView {
-    if (buffer.len != @sizeOf(ArpPacket)) return error.InvalidBuffer;
-
     var view: ArpPacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
@@ -124,11 +122,19 @@ test "parse() rejects serialized packets containing invalid metadata" {
     }
 }
 
-test "parse() rejects buffers not ArpPacket sized" {
-    var small_buffer: [@sizeOf(ArpPacket) - 1]u8 = undefined;
-    try std.testing.expectError(error.InvalidBuffer, parse(&small_buffer));
-    var large_buffer: [@sizeOf(ArpPacket) + 1]u8 = undefined;
-    try std.testing.expectError(error.InvalidBuffer, parse(&large_buffer));
+test "parse() rejects truncated packets and accepts trailing bytes" {
+    const packet = ArpPacket{};
+    var buffer: [@sizeOf(ArpPacket) + 1]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(buffer[0..@sizeOf(ArpPacket)]);
+    try ArpPacketView.serialize(packet, &writer);
+    buffer[@sizeOf(ArpPacket)] = 0xff;
+
+    for (0..@sizeOf(ArpPacket)) |len| {
+        try std.testing.expectError(error.EndOfStream, parse(buffer[0..len]));
+    }
+
+    var parsed = try parse(&buffer);
+    try std.testing.expectEqualDeep(packet, parsed.copy());
 }
 
 test "parse() rejects packet buffers containing invalid metadata fields" {
