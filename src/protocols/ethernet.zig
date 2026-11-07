@@ -51,6 +51,7 @@
 //!   - 0x86dd IPv6, Internet Protocol version 6
 
 const std = @import("std");
+const router = @import("router");
 
 pub const PAYLOAD_LEN_MAX = 1500;
 pub const VALID_ETHERTYPE_MIN = 1535;
@@ -184,10 +185,10 @@ pub fn serialize(frame: EthernetFrame, buffer: []u8) ![]u8 {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const pcap_parser = @import("pcap_parser");
-    const csv_parser = @import("ethernet_csv_parser");
-    const pcap_file = @embedFile("ethernet_test_pcap");
-    const csv_file = @embedFile("ethernet_test_csv");
+    const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
+    const csv_parser = router.test_fixtures.ethernet.csv_parser;
+    const pcap_file = router.test_fixtures.ethernet.pcap;
+    const csv_file = router.test_fixtures.ethernet.csv;
 
     var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
@@ -209,8 +210,8 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const pcap_parser = @import("pcap_parser");
-    const pcap_file = @embedFile("ethernet_test_pcap");
+    const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
+    const pcap_file = router.test_fixtures.ethernet.pcap;
 
     var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);

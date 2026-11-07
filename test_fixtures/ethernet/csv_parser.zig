@@ -1,9 +1,10 @@
 const std = @import("std");
-const ethernet = @import("ethernet");
-const EthernetFrame = ethernet.EthernetFrame;
-const TPID = ethernet.TPID;
-const Mac = ethernet.Mac;
-const VlanTag = ethernet.VlanTag;
+const router = @import("router");
+
+const EthernetFrame = router.protocols.ethernet.EthernetFrame;
+const TPID = router.protocols.ethernet.TPID;
+const Mac = router.protocols.ethernet.Mac;
+const VlanTag = router.protocols.ethernet.VlanTag;
 
 fn parseMac(str: []const u8) !Mac {
     var parts = std.mem.splitScalar(u8, str, ':');
