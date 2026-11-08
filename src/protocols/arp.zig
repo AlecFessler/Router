@@ -13,9 +13,11 @@
 const std = @import("std");
 const Router = @import("router");
 
-const View = Router.Meta.View.View;
+const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const Mac = Router.Protocols.Ethernet.Mac;
+const NicApi = Router.Nic.Api.Api;
+const View = Router.Meta.View.View;
 
 pub const OpCode = enum(u16) {
     request = 1,
@@ -60,6 +62,26 @@ pub fn parse(buffer: []const u8) !ArpPacketView {
 
     try validate(view);
     return view;
+}
+
+pub fn handle(
+    buffer: []u8,
+    packet: []u8,
+    device: NicApi,
+    iface: IFace,
+) !void {
+    const view = try parse(packet);
+    // cli entry
+    const opcode = view.get(.opcode);
+    switch (opcode) {
+        else => {
+            std.debug.print(
+                "ARP: packet with opcode: {s} unhandled by {s} interface\n",
+                .{ @tagName(opcode), @tagName(iface) },
+            );
+            device.release(buffer);
+        },
+    }
 }
 
 pub fn reply(

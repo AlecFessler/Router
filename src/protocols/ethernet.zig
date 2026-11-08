@@ -53,6 +53,9 @@
 const std = @import("std");
 const Router = @import("router");
 
+const Arp = Router.Protocols.Arp;
+const IFace = Router.Nic.Api.IFace;
+const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
 
 pub const PAYLOAD_LEN_MAX = 1500;
@@ -76,7 +79,7 @@ pub const EthernetFrame = struct {
     tpid: ?u16, // tag protocol identifier
     tci: ?Tci, // tag control information
     ethertype: u16,
-    payload: []const u8,
+    payload: []u8,
 };
 
 pub const EthernetFrameView = View(EthernetFrame);
@@ -122,6 +125,26 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
 
     try validate(frame_view);
     return frame_view;
+}
+
+pub fn handle(
+    buffer: []u8,
+    device: NicApi,
+    iface: IFace,
+) !void {
+    const view = try parse(buffer);
+    // cli entry
+    const ethertype = view.get(.ethertype);
+    switch (ethertype) {
+        0x0806 => try Arp.handle(buffer, view.get(.payload), device, iface),
+        else => {
+            std.debug.print(
+                "Ethernet: packet with ethertype 0x{x:0>4} unhandled by {s} interface\n",
+                .{ ethertype, @tagName(iface) },
+            );
+            device.release(buffer);
+        },
+    }
 }
 
 const test_frame = [_]u8{
