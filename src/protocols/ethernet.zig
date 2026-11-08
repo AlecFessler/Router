@@ -177,7 +177,7 @@ test "parse() uses the 802.3 length field and excludes padding" {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.Ethernet.PcapParser;
+    const PcapParser = Router.TestFixtures.PcapParser;
     const CsvParser = Router.TestFixtures.Ethernet.CsvParser;
     const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
     const csv_file = Router.TestFixtures.Ethernet.csv_file;
@@ -194,7 +194,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.Ethernet.PcapParser;
+    const PcapParser = Router.TestFixtures.PcapParser;
     const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);

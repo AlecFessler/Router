@@ -149,7 +149,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.Arp.PcapParser;
+    const PcapParser = Router.TestFixtures.PcapParser;
     const pcap_file = Router.TestFixtures.Arp.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
