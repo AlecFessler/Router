@@ -1,5 +1,6 @@
 pub const DataStructures = @import("data_structures/data_structures.zig");
 pub const Meta = @import("meta/meta.zig");
+pub const Nic = @import("nic/nic.zig");
 pub const Protocols = @import("protocols/protocols.zig");
 pub const TestFixtures = @import("test_fixtures");
 
