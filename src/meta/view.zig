@@ -479,9 +479,10 @@ pub fn View(Base: type) type {
             }
         }
 
-        pub fn print(self: *const @This()) void {
+        pub fn print(self: *const @This(), left_pad: usize) void {
             inline for (fields) |field| {
                 const field_enum = @field(FieldEnum, field.name);
+                for (0..left_pad) |_| std.debug.print(" ", .{});
                 std.debug.print("{s}: ", .{field.name});
                 printValue(field.type, self.get(field_enum));
                 std.debug.print("\n", .{});

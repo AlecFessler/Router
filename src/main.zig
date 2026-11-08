@@ -34,7 +34,6 @@ pub fn main(init: std.process.Init) !void {
     var packet_num: usize = 1;
     while (true) {
         const packet = mock_nic.receive(iface) orelse break;
-        std.debug.print("Packet #{}\n", .{packet_num});
         Ethernet.handle(packet, mock_nic, iface) catch |err| {
             mock_nic.release(packet);
             std.debug.print("Error: {}\n", .{err});

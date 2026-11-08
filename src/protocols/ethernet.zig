@@ -54,6 +54,7 @@ const std = @import("std");
 const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
+const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
@@ -133,7 +134,7 @@ pub fn handle(
     iface: IFace,
 ) !void {
     const view = try parse(buffer);
-    // cli entry
+    Cli.enter(.ethernet, view);
     const ethertype = view.get(.ethertype);
     switch (ethertype) {
         0x0806 => try Arp.handle(buffer, view.get(.payload), device, iface),

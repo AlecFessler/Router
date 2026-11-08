@@ -13,6 +13,7 @@
 const std = @import("std");
 const Router = @import("router");
 
+const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const Mac = Router.Protocols.Ethernet.Mac;
@@ -71,7 +72,7 @@ pub fn handle(
     iface: IFace,
 ) !void {
     const view = try parse(packet);
-    // cli entry
+    Cli.enter(.arp, view);
     const opcode = view.get(.opcode);
     switch (opcode) {
         else => {

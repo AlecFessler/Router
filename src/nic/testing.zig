@@ -2,9 +2,10 @@ const std = @import("std");
 const Router = @import("router");
 
 const Api = Router.Nic.Api.Api;
+const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
-const ParsedPCAP = Router.TestFixtures.PcapParser.ParsedPCAP;
 const PcapParser = Router.TestFixtures.PcapParser;
+const ParsedPCAP = Router.TestFixtures.PcapParser.ParsedPCAP;
 
 pub const Mock = struct {
     const MAX_PACKET_SIZE = 16384;
@@ -76,9 +77,7 @@ pub const Mock = struct {
         });
         self.index += 1;
         @memcpy(buffer[0..packet.len], packet);
-
-        // cli entry
-
+        Cli.enter(.rx, buffer[0..packet.len]);
         return buffer[0..packet.len];
     }
 
@@ -95,6 +94,7 @@ pub const Mock = struct {
     fn release(ctx: *anyopaque, buffer: []u8) void {
         const self: *Mock = @ptrCast(@alignCast(ctx));
         const entry = self.take(buffer);
+        Cli.enter(.release, buffer);
         switch (entry.origin) {
             .rx_lan => std.debug.print("Released received buffer to lan interface\n", .{}),
             .rx_wan => std.debug.print("Released received buffer to wan interface\n", .{}),
@@ -107,6 +107,7 @@ pub const Mock = struct {
     fn transmit(ctx: *anyopaque, buffer: []u8) void {
         const self: *Mock = @ptrCast(@alignCast(ctx));
         const entry = self.take(buffer);
+        Cli.enter(.tx, buffer);
         const destination: IFace = switch (entry.origin) {
             .rx_lan, .tx_wan => .wan,
             .rx_wan, .tx_lan => .lan,
