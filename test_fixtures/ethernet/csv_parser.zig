@@ -1,10 +1,10 @@
 const std = @import("std");
-const router = @import("router");
+const Router = @import("router");
 
-const EthernetFrame = router.protocols.ethernet.EthernetFrame;
-const TPID = router.protocols.ethernet.TPID;
-const Mac = router.protocols.ethernet.Mac;
-const Tci = router.protocols.ethernet.Tci;
+const EthernetFrame = Router.Protocols.Ethernet.EthernetFrame;
+const TPID = Router.Protocols.Ethernet.TPID;
+const Mac = Router.Protocols.Ethernet.Mac;
+const Tci = Router.Protocols.Ethernet.Tci;
 
 fn parseMac(str: []const u8) !Mac {
     var parts = std.mem.splitScalar(u8, str, ':');

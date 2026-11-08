@@ -1,8 +1,8 @@
 const std = @import("std");
-const router = @import("router");
+const Router = @import("router");
 
-const IPv4 = router.protocols.ipv4.IPv4;
-const Mac = router.protocols.ethernet.Mac;
+const IPv4 = Router.Protocols.IPv4.IPv4;
+const Mac = Router.Protocols.Ethernet.Mac;
 
 pub const ArpTable = struct {
     pub const Entry = struct {

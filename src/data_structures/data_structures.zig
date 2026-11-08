@@ -1,1 +1,1 @@
-pub const arp_table = @import("arp_table.zig");
+pub const ArpTable = @import("arp_table.zig");

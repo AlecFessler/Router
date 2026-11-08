@@ -1,7 +1,7 @@
-pub const data_structures = @import("data_structures/data_structures.zig");
-pub const meta = @import("meta/meta.zig");
-pub const protocols = @import("protocols/protocols.zig");
-pub const test_fixtures = @import("test_fixtures");
+pub const DataStructures = @import("data_structures/data_structures.zig");
+pub const Meta = @import("meta/meta.zig");
+pub const Protocols = @import("protocols/protocols.zig");
+pub const TestFixtures = @import("test_fixtures");
 
 test {
     _ = @import("data_structures/arp_table.zig");

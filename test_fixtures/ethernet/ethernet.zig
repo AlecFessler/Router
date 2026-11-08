@@ -1,5 +1,5 @@
-pub const csv_parser = @import("csv_parser.zig");
-pub const pcap_parser = @import("../pcap_parser.zig");
+pub const CsvParser = @import("csv_parser.zig");
+pub const PcapParser = @import("../pcap_parser.zig");
 
-pub const csv = @embedFile("ethernet_test.csv");
-pub const pcap = @embedFile("ethernet_test.pcap");
+pub const csv_file = @embedFile("ethernet_test.csv");
+pub const pcap_file = @embedFile("ethernet_test.pcap");

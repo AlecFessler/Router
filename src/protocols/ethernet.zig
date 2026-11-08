@@ -51,9 +51,9 @@
 //!   - 0x86dd IPv6, Internet Protocol version 6
 
 const std = @import("std");
-const router = @import("router");
+const Router = @import("router");
 
-const View = router.meta.view.View;
+const View = Router.Meta.View.View;
 
 pub const PAYLOAD_LEN_MAX = 1500;
 pub const VALID_ETHERTYPE_MIN = 1535;
@@ -177,14 +177,14 @@ test "parse() uses the 802.3 length field and excludes padding" {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
-    const csv_parser = router.test_fixtures.ethernet.csv_parser;
-    const pcap_file = router.test_fixtures.ethernet.pcap;
-    const csv_file = router.test_fixtures.ethernet.csv;
+    const PcapParser = Router.TestFixtures.Ethernet.PcapParser;
+    const CsvParser = Router.TestFixtures.Ethernet.CsvParser;
+    const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
+    const csv_file = Router.TestFixtures.Ethernet.csv_file;
 
-    var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
-    const parsed_frames = try csv_parser.parse(csv_file, std.testing.allocator);
+    const parsed_frames = try CsvParser.parse(csv_file, std.testing.allocator);
     defer std.testing.allocator.free(parsed_frames);
 
     for (parsed_frames, 0..) |ws_frame, i| {
@@ -194,10 +194,10 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const pcap_parser = router.test_fixtures.ethernet.pcap_parser;
-    const pcap_file = router.test_fixtures.ethernet.pcap;
+    const PcapParser = Router.TestFixtures.Ethernet.PcapParser;
+    const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
 
-    var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {

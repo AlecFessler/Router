@@ -11,11 +11,11 @@
 //! An opcode of 1 indicates a request, and 2 indicates a reply.
 
 const std = @import("std");
-const router = @import("router");
+const Router = @import("router");
 
-const View = router.meta.view.View;
-const IPv4 = router.protocols.ipv4.IPv4;
-const Mac = router.protocols.ethernet.Mac;
+const View = Router.Meta.View.View;
+const IPv4 = Router.Protocols.IPv4.IPv4;
+const Mac = Router.Protocols.Ethernet.Mac;
 
 pub const OpCode = enum(u16) {
     request = 1,
@@ -129,19 +129,19 @@ test "parse() rejects invalid metadata fields" {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const pcap_parser = router.test_fixtures.arp.pcap_parser;
-    const csv_parser = router.test_fixtures.arp.csv_parser;
-    const pcap_file = router.test_fixtures.arp.pcap;
-    const csv_file = router.test_fixtures.arp.csv;
+    const PcapParser = Router.TestFixtures.PcapParser;
+    const CsvParser = Router.TestFixtures.Arp.CsvParser;
+    const pcap_file = Router.TestFixtures.Arp.pcap_file;
+    const csv_file = Router.TestFixtures.Arp.csv_file;
 
-    var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
-    const parsed_packets = try csv_parser.parse(csv_file, std.testing.allocator);
+    const parsed_packets = try CsvParser.parse(csv_file, std.testing.allocator);
     defer std.testing.allocator.free(parsed_packets);
 
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
-        const frame = try router.protocols.ethernet.parse(parsed_pcap.packet_bytes[i]);
+        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
         try std.testing.expectEqual(@as(u16, 0x0806), frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
         try std.testing.expect(view.isEqual(&ws_packet));
@@ -149,14 +149,14 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const pcap_parser = router.test_fixtures.arp.pcap_parser;
-    const pcap_file = router.test_fixtures.arp.pcap;
+    const PcapParser = Router.TestFixtures.Arp.PcapParser;
+    const pcap_file = Router.TestFixtures.Arp.pcap_file;
 
-    var parsed_pcap = try pcap_parser.parse(pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try router.protocols.ethernet.parse(packet);
+        const frame = try Router.Protocols.Ethernet.parse(packet);
         const arp_bytes = frame.get(.payload);
         var view = try parse(arp_bytes);
         var buffer: [@sizeOf(ArpPacket)]u8 = undefined;

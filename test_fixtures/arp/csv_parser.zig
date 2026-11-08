@@ -1,10 +1,10 @@
 const std = @import("std");
-const router = @import("router");
+const Router = @import("router");
 
-const ArpPacket = router.protocols.arp.ArpPacket;
-const OpCode = router.protocols.arp.OpCode;
-const Mac = router.protocols.ethernet.Mac;
-const IPv4 = router.protocols.ipv4.IPv4;
+const ArpPacket = Router.Protocols.Arp.ArpPacket;
+const OpCode = Router.Protocols.Arp.OpCode;
+const Mac = Router.Protocols.Ethernet.Mac;
+const IPv4 = Router.Protocols.IPv4.IPv4;
 
 fn unquote(str: []const u8) ![]const u8 {
     if (str.len < 2 or str[0] != '"' or str[str.len - 1] != '"')

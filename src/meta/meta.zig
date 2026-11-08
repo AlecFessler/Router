@@ -1,1 +1,1 @@
-pub const view = @import("view.zig");
+pub const View = @import("view.zig");
