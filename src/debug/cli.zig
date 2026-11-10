@@ -13,6 +13,7 @@ const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
 const Ethernet = Router.Protocols.Ethernet;
+const IPv4 = Router.Protocols.IPv4;
 
 pub const EntryPoint = enum {
     rx,
@@ -20,6 +21,7 @@ pub const EntryPoint = enum {
     release,
     ethernet,
     arp,
+    ipv4,
 };
 
 const StepTarget = union(enum) {
@@ -85,7 +87,16 @@ fn printFrame(frame: []const u8) void {
 
     const ethertype = ethernet.get(.ethertype);
     switch (ethertype) {
-        0x0806 => {
+        Ethernet.IPV4 => {
+            var ipv4 = IPv4.parse(ethernet.get(.payload)) catch |err| {
+                std.debug.print("IPv4 parse failed: {}\n", .{err});
+                return;
+            };
+            std.debug.print("IPv4:\n", .{});
+            ipv4.print(2);
+            std.debug.print("\n", .{});
+        },
+        Ethernet.ARP => {
             var arp = Arp.parse(ethernet.get(.payload)) catch |err| {
                 std.debug.print("ARP parse failed: {}\n", .{err});
                 return;
@@ -110,6 +121,7 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
         const label: []const u8 = switch (entrypoint) {
             .ethernet => "Ethernet",
             .arp => "ARP",
+            .ipv4 => "IPv4",
             else => @tagName(entrypoint),
         };
         std.debug.print("{s}:\n", .{label});
