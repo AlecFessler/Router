@@ -65,14 +65,6 @@ pub const VALID_ETHERTYPE_MIN = 1535;
 
 pub const Mac = [6]u8;
 
-// zig lays out packed structs starting from the least significant bit,
-// so correct parsing depends on the ordering of these fields being as they are
-pub const Tci = packed struct(u16) {
-    vid: u12, // VLAN identifier
-    dei: bool, // drop eligible indicator
-    pcp: u3, // priority code point
-};
-
 pub const Ethertype = enum(u16) {
     ipv4 = 0x0800,
     arp = 0x0806,
@@ -84,7 +76,10 @@ pub const EthernetFrame = struct {
     dst_mac: Mac,
     src_mac: Mac,
     tpid: ?Ethertype, // tag protocol identifier
-    tci: ?Tci, // tag control information
+    // tag control information
+    pcp: ?u3, // priority code point
+    dei: ?bool, // drop eligible indicator
+    vid: ?u12, // VLAN identifier
     ethertype: Ethertype,
     payload: []u8,
 };
@@ -92,9 +87,13 @@ pub const EthernetFrame = struct {
 pub const EthernetFrameView = View(EthernetFrame);
 
 pub fn validate(view: EthernetFrameView) !void {
-    if (view.get(.tpid) != null) {
-        // if these are not both null or set together, that's a parse() bug
-        std.debug.assert(view.get(.tci) != null);
+    if (view.get(.tpid)) |tpid| {
+        if (tpid != .tpid or view.get(.pcp) == null or
+            view.get(.dei) == null or view.get(.vid) == null)
+            return error.InvalidField;
+    } else {
+        if (view.get(.pcp) != null or view.get(.dei) != null or view.get(.vid) != null)
+            return error.InvalidField;
     }
 
     const ethertype = @intFromEnum(view.get(.ethertype));
@@ -115,11 +114,15 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     const vlan_tag_present = try reader.peekInt(u16, .big) == @intFromEnum(Ethertype.tpid);
     if (vlan_tag_present) {
         try frame_view.takeField(.tpid, &reader);
-        try frame_view.takeField(.tci, &reader);
+        try frame_view.takeField(.pcp, &reader);
+        try frame_view.takeField(.dei, &reader);
+        try frame_view.takeField(.vid, &reader);
         try frame_view.takeField(.ethertype, &reader);
     } else {
         frame_view.set(.tpid, null);
-        frame_view.set(.tci, null);
+        frame_view.set(.pcp, null);
+        frame_view.set(.dei, null);
+        frame_view.set(.vid, null);
         try frame_view.takeField(.ethertype, &reader);
     }
 
@@ -213,6 +216,23 @@ test "parse() uses the 802.3 length field and excludes padding" {
         );
         try std.testing.expectError(error.EndOfStream, parse(buffer[0 .. packet.len - 1]));
     }
+}
+
+test "parse() reads VLAN bit fields and validate() rejects partial tags" {
+    var packet = [_]u8{
+        0,    1,    2,    3,    4,    5,    6, 7, 8, 9, 10, 11,
+        0x81, 0x00, 0x60, 0x64, 0x08, 0x00,
+    };
+    var view = try parse(&packet);
+    try std.testing.expectEqual(@as(?u3, 3), view.get(.pcp));
+    try std.testing.expectEqual(@as(?bool, false), view.get(.dei));
+    try std.testing.expectEqual(@as(?u12, 100), view.get(.vid));
+
+    view.set(.pcp, null);
+    try std.testing.expectError(error.InvalidField, validate(view));
+    var without_tpid = try parse(&packet);
+    without_tpid.set(.tpid, null);
+    try std.testing.expectError(error.InvalidField, validate(without_tpid));
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {

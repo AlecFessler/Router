@@ -3,7 +3,6 @@ const Router = @import("router");
 
 const EthernetFrame = Router.Protocols.Ethernet.EthernetFrame;
 const Mac = Router.Protocols.Ethernet.Mac;
-const Tci = Router.Protocols.Ethernet.Tci;
 
 fn parseMac(str: []const u8) !Mac {
     var parts = std.mem.splitScalar(u8, str, ':');
@@ -61,23 +60,22 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]EthernetFrame {
             // trim the 0x or else parseInt errors
             frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, vlan_etype_str[2..], 16));
 
-            var tci: Tci = undefined;
             frame.tpid = .tpid;
-            tci.vid = try std.fmt.parseInt(u12, vlan_vid_str, 10);
-            tci.pcp = try std.fmt.parseInt(u3, vlan_pcp_str, 10);
+            frame.vid = try std.fmt.parseInt(u12, vlan_vid_str, 10);
+            frame.pcp = try std.fmt.parseInt(u3, vlan_pcp_str, 10);
 
             if (std.mem.eql(u8, vlan_dei_str, "True")) {
-                tci.dei = true;
+                frame.dei = true;
             } else if (std.mem.eql(u8, vlan_dei_str, "False")) {
-                tci.dei = false;
+                frame.dei = false;
             } else {
                 return error.UnexpectedFileFormat;
             }
-
-            frame.tci = tci;
         } else {
             frame.tpid = null;
-            frame.tci = null;
+            frame.pcp = null;
+            frame.dei = null;
+            frame.vid = null;
         }
 
         try frames.append(alloc, frame);

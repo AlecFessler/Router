@@ -8,25 +8,6 @@ const View = Router.Meta.View.View;
 
 pub const IPv4 = [4]u8;
 
-// This is kinda scuffed, putting unrelated bitfields into a single packed struct,
-// but it lets us use the View framework for operating on bitfields which is nice.
-pub const VersionIhl = packed struct(u8) {
-    ihl: u4, // internet header length
-    version: u4,
-};
-
-pub const DscpEcn = packed struct(u8) {
-    ecn: u2, // explicit congestion notification
-    dscp: u6, // differentiated services code point
-};
-
-pub const FlagsFragmentOffset = packed struct(u16) {
-    fragment_offset: u13,
-    more_fragments: bool,
-    dont_fragment: bool,
-    _reserved: u1 = 0,
-};
-
 pub const Protocol = enum(u8) {
     icmp = 1, // internet control message protocol
     igmp = 2, // internet group management protocol
@@ -39,11 +20,16 @@ pub const Protocol = enum(u8) {
 };
 
 pub const IPv4Packet = struct {
-    version_ihl: VersionIhl,
-    dscp_ecn: DscpEcn,
+    version: u4,
+    ihl: u4, // internet header length
+    dscp: u6, // differentiated services code point
+    ecn: u2, // explicit congestion notification
     total_length: u16,
     identification: u16,
-    flags_fragment_offset: FlagsFragmentOffset,
+    reserved: u1,
+    dont_fragment: bool,
+    more_fragments: bool,
+    fragment_offset: u13,
     ttl: u8,
     protocol: Protocol,
     header_checksum: u16,
@@ -56,23 +42,23 @@ pub const IPv4Packet = struct {
 pub const IPv4PacketView = View(IPv4Packet);
 
 pub fn validate(view: IPv4PacketView) !void {
-    const version = view.get(.version_ihl).version;
+    const version = view.get(.version);
     if (version != 4) return error.InvalidField;
 
-    const ihl: usize = view.get(.version_ihl).ihl;
+    const ihl: usize = view.get(.ihl);
     if (ihl < 5) return error.InvalidField;
 
-    const reserved = view.get(.flags_fragment_offset)._reserved;
+    const reserved = view.get(.reserved);
     if (reserved != 0) return error.InvalidField;
 
     const total_length = view.get(.total_length);
     if (total_length < ihl * 4) return error.InvalidField;
 
-    const more_fragments = view.get(.flags_fragment_offset).more_fragments;
+    const more_fragments = view.get(.more_fragments);
     const payload_bytes = total_length - (ihl * 4);
     if (more_fragments and payload_bytes % 8 != 0) return error.InvalidField;
 
-    const packet_words: [*]align(1) const u16 = @ptrCast(view.fields.version_ihl);
+    const packet_words: [*]align(1) const u16 = @ptrFromInt(@intFromPtr(view.fields.version));
     const num_words = ihl * 2;
     var sum: u32 = 0;
     for (packet_words[0..num_words]) |word| sum += std.mem.bigToNative(u16, word);
@@ -84,18 +70,23 @@ pub fn parse(buffer: []const u8) !IPv4PacketView {
     var view: IPv4PacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
-    try view.takeField(.version_ihl, &reader);
-    try view.takeField(.dscp_ecn, &reader);
+    try view.takeField(.version, &reader);
+    try view.takeField(.ihl, &reader);
+    try view.takeField(.dscp, &reader);
+    try view.takeField(.ecn, &reader);
     try view.takeField(.total_length, &reader);
     try view.takeField(.identification, &reader);
-    try view.takeField(.flags_fragment_offset, &reader);
+    try view.takeField(.reserved, &reader);
+    try view.takeField(.dont_fragment, &reader);
+    try view.takeField(.more_fragments, &reader);
+    try view.takeField(.fragment_offset, &reader);
     try view.takeField(.ttl, &reader);
     try view.takeField(.protocol, &reader);
     try view.takeField(.header_checksum, &reader);
     try view.takeField(.src, &reader);
     try view.takeField(.dst, &reader);
 
-    const header_bytes = @as(usize, view.get(.version_ihl).ihl) * 4;
+    const header_bytes = @as(usize, view.get(.ihl)) * 4;
     const options_bytes = header_bytes - 20;
     try view.takeBytes(.options, options_bytes, &reader);
 
@@ -151,15 +142,16 @@ const test_packet_with_options = [_]u8{
 test "parse() reads IPv4 fields from wire bytes" {
     const view = try parse(&test_packet);
 
-    try std.testing.expectEqualDeep(VersionIhl{ .version = 4, .ihl = 5 }, view.get(.version_ihl));
-    try std.testing.expectEqualDeep(DscpEcn{ .dscp = 0, .ecn = 0 }, view.get(.dscp_ecn));
+    try std.testing.expectEqual(@as(u4, 4), view.get(.version));
+    try std.testing.expectEqual(@as(u4, 5), view.get(.ihl));
+    try std.testing.expectEqual(@as(u6, 0), view.get(.dscp));
+    try std.testing.expectEqual(@as(u2, 0), view.get(.ecn));
     try std.testing.expectEqual(@as(u16, 24), view.get(.total_length));
     try std.testing.expectEqual(@as(u16, 0x1234), view.get(.identification));
-    try std.testing.expectEqualDeep(FlagsFragmentOffset{
-        .fragment_offset = 0,
-        .more_fragments = false,
-        .dont_fragment = true,
-    }, view.get(.flags_fragment_offset));
+    try std.testing.expectEqual(@as(u1, 0), view.get(.reserved));
+    try std.testing.expectEqual(true, view.get(.dont_fragment));
+    try std.testing.expectEqual(false, view.get(.more_fragments));
+    try std.testing.expectEqual(@as(u13, 0), view.get(.fragment_offset));
     try std.testing.expectEqual(@as(u8, 64), view.get(.ttl));
     try std.testing.expectEqual(Protocol.udp, view.get(.protocol));
     try std.testing.expectEqual(@as(u16, 0xa54d), view.get(.header_checksum));
@@ -183,13 +175,31 @@ test "parse() rejects truncated packets and accepts trailing bytes" {
 
 test "parse() reads header options according to the IHL" {
     const view = try parse(&test_packet_with_options);
-    try std.testing.expectEqual(@as(u4, 6), view.get(.version_ihl).ihl);
+    try std.testing.expectEqual(@as(u4, 6), view.get(.ihl));
     try std.testing.expectEqualSlices(u8, test_packet_with_options[20..24], view.get(.options));
     try std.testing.expectEqual(@as(usize, 0), view.get(.payload).len);
     try std.testing.expectError(
         error.EndOfStream,
         parse(test_packet_with_options[0 .. test_packet_with_options.len - 1]),
     );
+}
+
+test "parse() reads a nonzero fragment offset" {
+    var packet = test_packet;
+    packet[6] = 0x00;
+    packet[7] = 0x01;
+    packet[10] = 0xe5;
+    packet[11] = 0x4c;
+
+    var view = try parse(&packet);
+    try std.testing.expectEqual(@as(u13, 1), view.get(.fragment_offset));
+    try std.testing.expect(!view.get(.dont_fragment));
+    try std.testing.expect(!view.get(.more_fragments));
+
+    var buffer: [packet.len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try IPv4PacketView.serialize(view.copy(), &writer);
+    try std.testing.expectEqualSlices(u8, &packet, &buffer);
 }
 
 test "parse() rejects invalid metadata fields" {

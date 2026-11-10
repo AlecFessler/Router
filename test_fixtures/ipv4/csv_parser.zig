@@ -57,22 +57,16 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]IPv4Packet {
         var packet: IPv4Packet = undefined;
         const header_bytes = try parseDecimal(u8, columns[1]);
         if (header_bytes % 4 != 0) return error.UnexpectedFileFormat;
-        packet.version_ihl = .{
-            .version = try parseDecimal(u4, columns[0]),
-            .ihl = @intCast(header_bytes / 4),
-        };
-        packet.dscp_ecn = .{
-            .dscp = try parseDecimal(u6, columns[2]),
-            .ecn = try parseDecimal(u2, columns[3]),
-        };
+        packet.version = try parseDecimal(u4, columns[0]);
+        packet.ihl = @intCast(header_bytes / 4);
+        packet.dscp = try parseDecimal(u6, columns[2]);
+        packet.ecn = try parseDecimal(u2, columns[3]);
         packet.total_length = try parseDecimal(u16, columns[4]);
         packet.identification = try parseHex(u16, columns[5]);
-        packet.flags_fragment_offset = .{
-            ._reserved = @intFromBool(try parseBool(columns[6])),
-            .dont_fragment = try parseBool(columns[7]),
-            .more_fragments = try parseBool(columns[8]),
-            .fragment_offset = try parseDecimal(u13, columns[9]),
-        };
+        packet.reserved = @intFromBool(try parseBool(columns[6]));
+        packet.dont_fragment = try parseBool(columns[7]);
+        packet.more_fragments = try parseBool(columns[8]);
+        packet.fragment_offset = try parseDecimal(u13, columns[9]);
         packet.ttl = try parseDecimal(u8, columns[10]);
         packet.protocol = @enumFromInt(try parseDecimal(u8, columns[11]));
         packet.header_checksum = try parseHex(u16, columns[12]);

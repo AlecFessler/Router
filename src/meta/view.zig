@@ -15,7 +15,86 @@ fn UnderlyingType(comptime T: type) type {
     };
 }
 
+fn isBitField(comptime T: type) bool {
+    return switch (@typeInfo(UnderlyingType(T))) {
+        .int => @bitSizeOf(UnderlyingType(T)) % 8 != 0,
+        .bool => true,
+        else => false,
+    };
+}
+
+const BitInfo = struct {
+    first: bool,
+    start: usize,
+    width: usize,
+    bytes: usize,
+    offset: usize,
+    end: usize,
+};
+
+fn bitInfo(comptime Base: type, comptime index: usize) ?BitInfo {
+    @setEvalBranchQuota(10000);
+    return comptime blk: {
+        const fields = @typeInfo(Base).@"struct".fields;
+        if (!isBitField(fields[index].type)) break :blk null;
+
+        var cursor: usize = 0;
+        while (cursor < fields.len) {
+            if (!isBitField(fields[cursor].type)) {
+                cursor += 1;
+                continue;
+            }
+            const first = cursor;
+            var total: usize = 0;
+            while (cursor < fields.len and isBitField(fields[cursor].type)) {
+                total += @bitSizeOf(UnderlyingType(fields[cursor].type));
+                cursor += 1;
+                if (total % 8 == 0) break;
+            }
+            if (total % 8 != 0) @compileError("Adjacent bit fields must fill whole bytes");
+            if (total > 64) @compileError("A bit field group cannot exceed 64 bits");
+            if (index >= first and index < cursor) {
+                var start: usize = 0;
+                for (fields[first..index]) |field| {
+                    start += @bitSizeOf(UnderlyingType(field.type));
+                }
+                const width = @bitSizeOf(UnderlyingType(fields[index].type));
+                break :blk .{
+                    .first = first == index,
+                    .start = start,
+                    .width = width,
+                    .bytes = total / 8,
+                    .offset = total - start - width,
+                    .end = cursor,
+                };
+            }
+        }
+        unreachable;
+    };
+}
+
+fn readBits(bytes: [*]const u8, start: usize, width: usize) u64 {
+    var value: u64 = 0;
+    for (start..start + width) |bit| {
+        value = (value << 1) | ((bytes[bit / 8] >> @intCast(7 - bit % 8)) & 1);
+    }
+    return value;
+}
+
+fn writeBits(bytes: [*]u8, start: usize, width: usize, value: u64) void {
+    for (start..start + width) |bit| {
+        const shift: u6 = @intCast(width - 1 - (bit - start));
+        const mask: u8 = @as(u8, 1) << @intCast(7 - bit % 8);
+        if ((value >> shift) & 1 != 0) {
+            bytes[bit / 8] |= mask;
+        } else {
+            bytes[bit / 8] &= ~mask;
+        }
+    }
+}
+
 pub fn View(Base: type) type {
+    @setEvalBranchQuota(5000);
     const base_info = @typeInfo(Base).@"struct";
     const fields = base_info.fields;
     var field_names: [fields.len][:0]const u8 = undefined;
@@ -27,10 +106,7 @@ pub fn View(Base: type) type {
 
         const T = UnderlyingType(field.type);
         switch (@typeInfo(T)) {
-            .int => {
-                if (@bitSizeOf(T) % 8 != 0)
-                    @compileError("Integer fields must be whole-byte sized");
-            },
+            .int, .bool => {},
             .@"enum" => |info| {
                 if (@bitSizeOf(info.tag_type) % 8 != 0)
                     @compileError("Enum backing integers must be whole-byte sized");
@@ -57,7 +133,9 @@ pub fn View(Base: type) type {
             else => T,
         };
 
-        const ViewType = switch (@typeInfo(T)) {
+        const ViewType = if (bitInfo(Base, i)) |bit|
+            *align(1:bit.offset:bit.bytes) StorageType
+        else switch (@typeInfo(T)) {
             .pointer => T,
             else => @Pointer(
                 .one,
@@ -85,6 +163,7 @@ pub fn View(Base: type) type {
 
     return struct {
         fields: ViewFields,
+        bit_group: []u8 = undefined,
 
         pub const EqualityMode = enum {
             shallow,
@@ -99,10 +178,17 @@ pub fn View(Base: type) type {
         ) !void {
             const T = UnderlyingType(FieldType(Base, field));
             const PtrType = UnderlyingType(@FieldType(ViewFields, @tagName(field)));
+            const index = @intFromEnum(field);
 
             switch (@typeInfo(T)) {
                 .pointer => @compileError("Use takeBytes() for slices"),
                 else => {},
+            }
+
+            if (comptime bitInfo(Base, index)) |bit| {
+                if (bit.first) self.bit_group = try reader.take(bit.bytes);
+                @field(self.fields, @tagName(field)) = @ptrCast(&self.bit_group[0]);
+                return;
             }
 
             @field(self.fields, @tagName(field)) =
@@ -128,7 +214,38 @@ pub fn View(Base: type) type {
             base: Base,
             writer: *std.Io.Writer,
         ) !void {
-            inline for (fields) |field| {
+            inline for (fields, 0..) |field, index| {
+                if (comptime bitInfo(Base, index)) |bit| {
+                    if (bit.first) {
+                        var bytes: [bit.bytes]u8 = .{0} ** bit.bytes;
+                        var present: ?bool = null;
+                        inline for (fields, 0..) |group_field, group_index| {
+                            if (group_index >= index and group_index < bit.end) {
+                                const group_value = @field(base, group_field.name);
+                                const is_present = if (@typeInfo(group_field.type) == .optional)
+                                    group_value != null
+                                else
+                                    true;
+                                if (present) |previous| {
+                                    if (previous != is_present) return error.InvalidField;
+                                } else {
+                                    present = is_present;
+                                }
+                                if (is_present) {
+                                    const value = if (@typeInfo(group_field.type) == .optional)
+                                        group_value.?
+                                    else
+                                        group_value;
+                                    const raw: u64 = if (@TypeOf(value) == bool) @intFromBool(value) else value;
+                                    const info = bitInfo(Base, group_index).?;
+                                    writeBits(&bytes, info.start, info.width, raw);
+                                }
+                            }
+                        }
+                        if (present.?) try writer.writeAll(&bytes);
+                    }
+                    continue;
+                }
                 field_value: {
                     const T = UnderlyingType(field.type);
                     const storage = @field(base, field.name);
@@ -225,6 +342,11 @@ pub fn View(Base: type) type {
             else
                 storage;
 
+            if (comptime bitInfo(Base, @intFromEnum(field))) |bit| {
+                const raw = readBits(@ptrCast(ptr), bit.start, bit.width);
+                return if (T == bool) raw != 0 else @intCast(raw);
+            }
+
             switch (@typeInfo(T)) {
                 .@"enum" => |info| {
                     return @enumFromInt(std.mem.bigToNative(info.tag_type, ptr.*));
@@ -282,6 +404,12 @@ pub fn View(Base: type) type {
             else
                 value;
 
+            if (comptime bitInfo(Base, @intFromEnum(field))) |bit| {
+                const raw: u64 = if (T == bool) @intFromBool(actual_value) else actual_value;
+                writeBits(@ptrCast(ptr), bit.start, bit.width, raw);
+                return;
+            }
+
             switch (@typeInfo(T)) {
                 .@"enum" => |info| {
                     ptr.* = std.mem.nativeToBig(info.tag_type, @intFromEnum(actual_value));
@@ -328,6 +456,7 @@ pub fn View(Base: type) type {
         }
 
         pub fn compare(a: anytype, b: anytype, comptime mode: EqualityMode) bool {
+            @setEvalBranchQuota(10000);
             inline for (fields) |field| {
                 field_check: {
                     const T = UnderlyingType(field.type);
@@ -1063,4 +1192,90 @@ test "View() generated deepCopy() copies into owned slices" {
         @as(?[]const u8, null),
         copied.test_absent_slice,
     );
+}
+
+const TestBitFields = struct {
+    version: u4,
+    ihl: u4,
+    dscp: u6,
+    ecn: u2,
+    reserved: u1,
+    dont_fragment: bool,
+    more_fragments: bool,
+    fragment_offset: u13,
+};
+
+const TestBitFieldsView = View(TestBitFields);
+
+test "View() binds bit fields to wire bytes" {
+    var buffer = [_]u8{ 0x45, 0xab, 0x75, 0x12 };
+    var reader: std.Io.Reader = .fixed(&buffer);
+    var view: TestBitFieldsView = undefined;
+    try view.takeField(.version, &reader);
+    try view.takeField(.ihl, &reader);
+    try view.takeField(.dscp, &reader);
+    try view.takeField(.ecn, &reader);
+    try view.takeField(.reserved, &reader);
+    try view.takeField(.dont_fragment, &reader);
+    try view.takeField(.more_fragments, &reader);
+    try view.takeField(.fragment_offset, &reader);
+
+    try std.testing.expectEqual(*align(1:4:1) u4, @TypeOf(view.fields.version));
+    try std.testing.expectEqual(*align(1:0:1) u4, @TypeOf(view.fields.ihl));
+    try std.testing.expectEqual(*align(1:0:2) u13, @TypeOf(view.fields.fragment_offset));
+    try std.testing.expectEqual(@intFromPtr(&buffer[0]), @intFromPtr(view.fields.version));
+    try std.testing.expectEqual(@intFromPtr(&buffer[2]), @intFromPtr(view.fields.fragment_offset));
+    try std.testing.expectEqual(@as(u4, 4), view.get(.version));
+    try std.testing.expectEqual(@as(u4, 5), view.get(.ihl));
+    try std.testing.expectEqual(@as(u6, 42), view.get(.dscp));
+    try std.testing.expectEqual(@as(u2, 3), view.get(.ecn));
+    try std.testing.expectEqual(@as(u1, 0), view.get(.reserved));
+    try std.testing.expect(view.get(.dont_fragment));
+    try std.testing.expect(view.get(.more_fragments));
+    try std.testing.expectEqual(@as(u13, 0x1512), view.get(.fragment_offset));
+
+    view.set(.version, 6);
+    view.set(.fragment_offset, 0x1234);
+    try std.testing.expectEqualSlices(u8, &.{ 0x65, 0xab, 0x72, 0x34 }, &buffer);
+
+    var serialized: [buffer.len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&serialized);
+    try TestBitFieldsView.serialize(view.copy(), &writer);
+    try std.testing.expectEqualSlices(u8, &buffer, &serialized);
+}
+
+const TestOptionalBitFields = struct {
+    pcp: ?u3,
+    dei: ?bool,
+    vid: ?u12,
+};
+
+const TestOptionalBitFieldsView = View(TestOptionalBitFields);
+
+test "View() skips absent bit groups and rejects partial groups" {
+    var buffer = [_]u8{ 0x60, 0x64 };
+    var reader: std.Io.Reader = .fixed(&buffer);
+    var view: TestOptionalBitFieldsView = undefined;
+    try view.takeField(.pcp, &reader);
+    try view.takeField(.dei, &reader);
+    try view.takeField(.vid, &reader);
+    try std.testing.expectEqual(@as(?u3, 3), view.get(.pcp));
+    try std.testing.expectEqual(@as(?bool, false), view.get(.dei));
+    try std.testing.expectEqual(@as(?u12, 100), view.get(.vid));
+
+    view.set(.pcp, 5);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa0, 0x64 }, &buffer);
+
+    var serialized: [2]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&serialized);
+    try TestOptionalBitFieldsView.serialize(view.copy(), &writer);
+    try std.testing.expectEqualSlices(u8, &buffer, &serialized);
+
+    view.set(.dei, null);
+    try std.testing.expectError(error.InvalidField, TestOptionalBitFieldsView.serialize(view.copy(), &writer));
+
+    const absent = TestOptionalBitFields{ .pcp = null, .dei = null, .vid = null };
+    var empty_writer: std.Io.Writer = .fixed(&serialized);
+    try TestOptionalBitFieldsView.serialize(absent, &empty_writer);
+    try std.testing.expectEqual(@as(usize, 0), empty_writer.end);
 }
