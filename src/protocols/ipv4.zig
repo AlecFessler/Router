@@ -53,12 +53,9 @@ pub fn validate(view: IPv4PacketView) !void {
     const payload_bytes = view.get(.total_length) - (ihl * 4);
     if (more_fragments and payload_bytes % 8 != 0) return error.InvalidField;
 
-    const packet_words: [*]align(1) const u16 = @ptrFromInt(@intFromPtr(view.fields.version));
-    const num_words = ihl * 2;
-    var sum: u32 = 0;
-    for (packet_words[0..num_words]) |word| sum += std.mem.bigToNative(u16, word);
-    for (0..2) |_| sum = (sum & 0xFFFF) + (sum >> 16);
-    if (sum != 0xFFFF) return error.InvalidField;
+    var checksum = view.checksum();
+    checksum.addFields(.version, .options);
+    try checksum.validate();
 }
 
 pub fn parse(buffer: []const u8) !IPv4PacketView {
@@ -191,7 +188,6 @@ test "parse() rejects invalid metadata fields" {
         .{ .offset = 6, .value = 0xc0 }, // reserved flag set
         .{ .offset = 3, .value = 0x13 }, // total length below header length
         .{ .offset = 6, .value = 0x60 }, // more fragments with a four-byte payload
-        .{ .offset = 8, .value = 0x41 }, // checksum no longer matches
     };
 
     for (invalid_fields) |invalid| {
@@ -199,6 +195,12 @@ test "parse() rejects invalid metadata fields" {
         buffer[invalid.offset] = invalid.value;
         try std.testing.expectError(error.InvalidField, parse(&buffer));
     }
+}
+
+test "parse() rejects invalid header checksums" {
+    var buffer = test_packet;
+    buffer[8] = 0x41;
+    try std.testing.expectError(error.BadChecksum, parse(&buffer));
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {

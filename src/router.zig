@@ -6,8 +6,10 @@ pub const Protocols = @import("protocols/protocols.zig");
 pub const TestFixtures = @import("test_fixtures");
 
 test {
-    _ = @import("data_structures/arp_table.zig");
-    _ = @import("meta/view.zig");
-    _ = @import("protocols/arp.zig");
-    _ = @import("protocols/ethernet.zig");
+    _ = DataStructures.ArpTable;
+    _ = Meta.Checksum;
+    _ = Meta.View;
+    _ = Protocols.Arp;
+    _ = Protocols.Ethernet;
+    _ = Protocols.IPv4;
 }

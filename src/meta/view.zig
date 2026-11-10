@@ -1,4 +1,5 @@
 const std = @import("std");
+const Router = @import("router");
 const StructField = std.builtin.Type.StructField;
 
 fn FieldType(
@@ -43,7 +44,7 @@ fn isBitField(comptime T: type) bool {
     };
 }
 
-const BitInfo = struct {
+pub const BitInfo = struct {
     first: bool,
     start: usize,
     width: usize,
@@ -52,7 +53,7 @@ const BitInfo = struct {
     end: usize,
 };
 
-fn bitInfo(comptime Base: type, comptime index: usize) ?BitInfo {
+pub fn bitInfo(comptime Base: type, comptime index: usize) ?BitInfo {
     @setEvalBranchQuota(10000);
     return comptime blk: {
         const fields = @typeInfo(Base).@"struct".fields;
@@ -176,6 +177,9 @@ pub fn View(Base: type) type {
     const FieldEnum = std.meta.FieldEnum(Base);
 
     return struct {
+        pub const BaseType = Base;
+        pub const Field = FieldEnum;
+
         fields: ViewFields,
         bit_group: []u8 = undefined,
 
@@ -236,6 +240,29 @@ pub fn View(Base: type) type {
             }
 
             @field(self.fields, @tagName(field)) = try reader.take(len);
+        }
+
+        pub fn checksum(self: @This()) Router.Meta.Checksum.Checksum(@This()) {
+            return .{ .view = self };
+        }
+
+        pub fn wireBytes(self: *const @This(), comptime field: FieldEnum) ?[]const u8 {
+            const T = UnderlyingType(FieldType(Base, field));
+            const storage = @field(self.fields, @tagName(field));
+            const ptr = if (comptime @typeInfo(FieldType(Base, field)) == .optional)
+                storage orelse return null
+            else
+                storage;
+
+            if (comptime bitInfo(Base, @intFromEnum(field))) |bit| {
+                if (!bit.first) return &.{};
+                const bytes: [*]const u8 = @ptrCast(ptr);
+                return bytes[0..bit.bytes];
+            }
+
+            if (comptime @typeInfo(T) == .pointer) return ptr;
+            const bytes: [*]const u8 = @ptrCast(ptr);
+            return bytes[0..@sizeOf(T)];
         }
 
         pub fn serialize(
