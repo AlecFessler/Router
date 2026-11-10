@@ -56,6 +56,7 @@ const Router = @import("router");
 const Arp = Router.Protocols.Arp;
 const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
+const IPv4 = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
 
@@ -63,8 +64,6 @@ pub const PAYLOAD_LEN_MAX = 1500;
 pub const VALID_ETHERTYPE_MIN = 1535;
 
 pub const Mac = [6]u8;
-
-pub const TPID = 0x8100;
 
 // zig lays out packed structs starting from the least significant bit,
 // so correct parsing depends on the ordering of these fields being as they are
@@ -74,12 +73,19 @@ pub const Tci = packed struct(u16) {
     pcp: u3, // priority code point
 };
 
+pub const Ethertype = enum(u16) {
+    ipv4 = 0x0800,
+    arp = 0x0806,
+    tpid = 0x8100,
+    _,
+};
+
 pub const EthernetFrame = struct {
     dst_mac: Mac,
     src_mac: Mac,
-    tpid: ?u16, // tag protocol identifier
+    tpid: ?Ethertype, // tag protocol identifier
     tci: ?Tci, // tag control information
-    ethertype: u16,
+    ethertype: Ethertype,
     payload: []u8,
 };
 
@@ -91,7 +97,7 @@ pub fn validate(view: EthernetFrameView) !void {
         std.debug.assert(view.get(.tci) != null);
     }
 
-    const ethertype = view.get(.ethertype);
+    const ethertype = @intFromEnum(view.get(.ethertype));
     const is_ethernet_II_frame = ethertype > PAYLOAD_LEN_MAX;
     const ethertype_invalid = is_ethernet_II_frame and ethertype <= VALID_ETHERTYPE_MIN;
     if (ethertype_invalid) {
@@ -106,7 +112,7 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     try frame_view.takeField(.dst_mac, &reader);
     try frame_view.takeField(.src_mac, &reader);
 
-    const vlan_tag_present = try reader.peekInt(u16, .big) == TPID;
+    const vlan_tag_present = try reader.peekInt(u16, .big) == @intFromEnum(Ethertype.tpid);
     if (vlan_tag_present) {
         try frame_view.takeField(.tpid, &reader);
         try frame_view.takeField(.tci, &reader);
@@ -117,7 +123,7 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
         try frame_view.takeField(.ethertype, &reader);
     }
 
-    const ethertype = frame_view.get(.ethertype);
+    const ethertype = @intFromEnum(frame_view.get(.ethertype));
     const payload_len = if (ethertype <= PAYLOAD_LEN_MAX)
         ethertype
     else
@@ -137,12 +143,21 @@ pub fn handle(
     Cli.enter(.ethernet, view);
     const ethertype = view.get(.ethertype);
     switch (ethertype) {
-        0x0806 => try Arp.handle(buffer, view.get(.payload), device, iface),
+        .ipv4 => try IPv4.handle(buffer, view.get(.payload), device, iface),
+        .arp => try Arp.handle(buffer, view.get(.payload), device, iface),
         else => {
-            std.debug.print(
-                "Ethernet: packet with ethertype 0x{x:0>4} unhandled by {s} interface\n",
-                .{ ethertype, @tagName(iface) },
-            );
+            const name = std.enums.tagName(Ethertype, ethertype);
+            if (name) |tag| {
+                std.debug.print(
+                    "Ethernet: packet with ethertype {s} unhandled by {s} interface\n",
+                    .{ tag, @tagName(iface) },
+                );
+            } else {
+                std.debug.print(
+                    "Ethernet: packet with ethertype 0x{x:0>4} unhandled by {s} interface\n",
+                    .{ @intFromEnum(ethertype), @tagName(iface) },
+                );
+            }
             device.release(buffer);
         },
     }
@@ -190,7 +205,7 @@ test "parse() uses the 802.3 length field and excludes padding" {
         @memcpy(buffer[0..packet.len], packet);
 
         const view = try parse(&buffer);
-        try std.testing.expectEqual(@as(u16, payload.len), view.get(.ethertype));
+        try std.testing.expectEqual(@as(u16, payload.len), @intFromEnum(view.get(.ethertype)));
         try std.testing.expectEqualSlices(u8, &payload, view.get(.payload));
         try std.testing.expectEqual(
             @intFromPtr(&buffer[packet.len - payload.len]),

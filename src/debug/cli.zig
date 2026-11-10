@@ -87,7 +87,7 @@ fn printFrame(frame: []const u8) void {
 
     const ethertype = ethernet.get(.ethertype);
     switch (ethertype) {
-        Ethernet.IPV4 => {
+        .ipv4 => {
             var ipv4 = IPv4.parse(ethernet.get(.payload)) catch |err| {
                 std.debug.print("IPv4 parse failed: {}\n", .{err});
                 return;
@@ -96,7 +96,7 @@ fn printFrame(frame: []const u8) void {
             ipv4.print(2);
             std.debug.print("\n", .{});
         },
-        Ethernet.ARP => {
+        .arp => {
             var arp = Arp.parse(ethernet.get(.payload)) catch |err| {
                 std.debug.print("ARP parse failed: {}\n", .{err});
                 return;
@@ -105,7 +105,7 @@ fn printFrame(frame: []const u8) void {
             arp.print(2);
             std.debug.print("\n", .{});
         },
-        else => std.debug.print("No parser for EtherType 0x{x:0>4}\n", .{ethertype}),
+        else => std.debug.print("No parser for EtherType 0x{x:0>4}\n", .{@intFromEnum(ethertype)}),
     }
 }
 

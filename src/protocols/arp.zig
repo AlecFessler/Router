@@ -165,7 +165,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
         const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(@as(u16, 0x0806), frame.get(.ethertype));
+        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.arp, frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
         try std.testing.expect(view.isEqual(&ws_packet));
     }

@@ -2,7 +2,6 @@ const std = @import("std");
 const Router = @import("router");
 
 const EthernetFrame = Router.Protocols.Ethernet.EthernetFrame;
-const TPID = Router.Protocols.Ethernet.TPID;
 const Mac = Router.Protocols.Ethernet.Mac;
 const Tci = Router.Protocols.Ethernet.Tci;
 
@@ -45,12 +44,12 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]EthernetFrame {
 
         if (ethertype_str.len != 0) {
             // trim the 0x or else parseInt errors
-            frame.ethertype = try std.fmt.parseInt(u16, ethertype_str[2..], 16);
+            frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, ethertype_str[2..], 16));
         } else { // is IEEE 802.3 frame
             if (len_str.len == 0) {
                 return error.UnexpectedFileFormat;
             }
-            frame.ethertype = try std.fmt.parseInt(u16, len_str, 10);
+            frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, len_str, 10));
         }
 
         if (vlan_vid_str.len != 0) {
@@ -60,10 +59,10 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]EthernetFrame {
 
             // if a vlan tag is present, wireshark uses vlan.etype for the ethertype
             // trim the 0x or else parseInt errors
-            frame.ethertype = try std.fmt.parseInt(u16, vlan_etype_str[2..], 16);
+            frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, vlan_etype_str[2..], 16));
 
             var tci: Tci = undefined;
-            frame.tpid = TPID;
+            frame.tpid = .tpid;
             tci.vid = try std.fmt.parseInt(u12, vlan_vid_str, 10);
             tci.pcp = try std.fmt.parseInt(u3, vlan_pcp_str, 10);
 
