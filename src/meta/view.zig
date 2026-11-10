@@ -15,6 +15,26 @@ fn UnderlyingType(comptime T: type) type {
     };
 }
 
+fn Validation(comptime FieldT: type) type {
+    const T = UnderlyingType(FieldT);
+    return switch (@typeInfo(T)) {
+        .int => union(enum) {
+            lt: T,
+            gt: T,
+            lte: T,
+            gte: T,
+            eq: FieldT,
+        },
+        .@"enum" => union(enum) {
+            eq: FieldT,
+            any,
+        },
+        else => union(enum) {
+            eq: FieldT,
+        },
+    };
+}
+
 fn isBitField(comptime T: type) bool {
     return switch (@typeInfo(UnderlyingType(T))) {
         .int => @bitSizeOf(UnderlyingType(T)) % 8 != 0,
@@ -284,53 +304,58 @@ pub fn View(Base: type) type {
         pub fn validate(
             self: *const @This(),
             comptime field: FieldEnum,
-            expected: ?UnderlyingType(FieldType(Base, field)),
+            condition: Validation(FieldType(Base, field)),
         ) error{InvalidField}!void {
             const FieldT = FieldType(Base, field);
             const T = UnderlyingType(FieldT);
             const storage = @field(self.fields, @tagName(field));
 
-            if (@typeInfo(FieldT) == .optional) {
-                if (expected == null) {
+            if (comptime @typeInfo(FieldT) == .optional) {
+                if (condition == .eq and condition.eq == null) {
                     if (storage != null) return error.InvalidField;
                     return;
                 }
-
                 if (storage == null) return error.InvalidField;
             }
 
+            const actual: T = if (comptime @typeInfo(T) == .@"enum") blk: {
+                const ptr = if (comptime @typeInfo(FieldT) == .optional) storage.? else storage;
+                const raw = std.mem.bigToNative(@typeInfo(T).@"enum".tag_type, ptr.*);
+                break :blk std.enums.fromInt(T, raw) orelse return error.InvalidField;
+            } else if (comptime @typeInfo(FieldT) == .optional)
+                self.get(field).?
+            else
+                self.get(field);
+
+            if (condition == .eq) {
+                const value: T = if (comptime @typeInfo(FieldT) == .optional)
+                    condition.eq.?
+                else
+                    condition.eq;
+                const matches = if (comptime @typeInfo(T) == .pointer)
+                    std.mem.eql(u8, actual, value)
+                else
+                    std.meta.eql(actual, value);
+                if (!matches) return error.InvalidField;
+                return;
+            }
+
             switch (@typeInfo(T)) {
-                .@"enum" => |info| {
-                    const ptr = if (@typeInfo(FieldT) == .optional)
-                        storage.?
-                    else
-                        storage;
-
-                    const raw = std.mem.bigToNative(info.tag_type, ptr.*);
-                    const actual = std.enums.fromInt(T, raw) orelse
-                        return error.InvalidField;
-
-                    if (expected) |value| {
-                        if (actual != value) return error.InvalidField;
-                    }
+                .int => {
+                    const matches = switch (condition) {
+                        .lt => |value| actual < value,
+                        .gt => |value| actual > value,
+                        .lte => |value| actual <= value,
+                        .gte => |value| actual >= value,
+                        .eq => unreachable,
+                    };
+                    if (!matches) return error.InvalidField;
                 },
-
-                .pointer => {
-                    const value = expected orelse return error.InvalidField;
-                    const actual = if (@typeInfo(FieldT) == .optional)
-                        self.get(field).?
-                    else
-                        self.get(field);
-
-                    if (!std.mem.eql(u8, actual, value))
-                        return error.InvalidField;
+                .@"enum" => switch (condition) {
+                    .any => {},
+                    .eq => unreachable,
                 },
-
-                else => {
-                    const value = expected orelse return error.InvalidField;
-                    if (!std.meta.eql(self.get(field), value))
-                        return error.InvalidField;
-                },
+                else => unreachable,
             }
         }
 
@@ -1054,49 +1079,49 @@ test "View.validate() handles optional field presence and values" {
     var buffer = test_buffer;
     var view = parseTestBuffer(&buffer);
 
-    try view.validate(.test_int, 0x0806);
-    try view.validate(.test_enum, null);
-    try view.validate(.test_enum, .first);
-    try view.validate(.test_high_nibble, 9);
-    try view.validate(.test_low_twelve, 0xABC);
-    try view.validate(.test_array, .{ 1, 2, 3, 4 });
-    try view.validate(.test_slice, default.test_slice);
-    try view.validate(.test_optional_int, 0x8100);
-    try view.validate(.test_absent_int, null);
-    try view.validate(.test_optional_slice, default.test_optional_slice);
-    try view.validate(.test_absent_slice, null);
+    try view.validate(.test_int, .{ .eq = 0x0806 });
+    try view.validate(.test_enum, .any);
+    try view.validate(.test_enum, .{ .eq = .first });
+    try view.validate(.test_high_nibble, .{ .eq = 9 });
+    try view.validate(.test_low_twelve, .{ .eq = 0xABC });
+    try view.validate(.test_array, .{ .eq = .{ 1, 2, 3, 4 } });
+    try view.validate(.test_slice, .{ .eq = default.test_slice });
+    try view.validate(.test_optional_int, .{ .eq = 0x8100 });
+    try view.validate(.test_absent_int, .{ .eq = null });
+    try view.validate(.test_optional_slice, .{ .eq = default.test_optional_slice });
+    try view.validate(.test_absent_slice, .{ .eq = null });
 
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_int, 0x1234),
+        view.validate(.test_int, .{ .eq = 0x1234 }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_enum, .second),
+        view.validate(.test_enum, .{ .eq = .second }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_slice, &.{ 0xAA, 0xBB }),
+        view.validate(.test_slice, .{ .eq = &.{ 0xAA, 0xBB } }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_optional_int, 0x1234),
+        view.validate(.test_optional_int, .{ .eq = 0x1234 }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_optional_int, null),
+        view.validate(.test_optional_int, .{ .eq = null }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_absent_int, 0x8100),
+        view.validate(.test_absent_int, .{ .eq = 0x8100 }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_optional_slice, &.{ 0x11, 0x22 }),
+        view.validate(.test_optional_slice, .{ .eq = &.{ 0x11, 0x22 } }),
     );
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_absent_slice, &.{0x11}),
+        view.validate(.test_absent_slice, .{ .eq = &.{0x11} }),
     );
 
     buffer[2] = 0xFF;
@@ -1104,8 +1129,41 @@ test "View.validate() handles optional field presence and values" {
 
     try std.testing.expectError(
         error.InvalidField,
-        view.validate(.test_enum, null),
+        view.validate(.test_enum, .any),
     );
+}
+
+test "View.validate() compares integer fields at boundaries" {
+    var buffer = test_buffer;
+    var view = parseTestBuffer(&buffer);
+
+    try view.validate(.test_int, .{ .lt = 0x0807 });
+    try view.validate(.test_int, .{ .lte = 0x0806 });
+    try view.validate(.test_int, .{ .gt = 0x0805 });
+    try view.validate(.test_int, .{ .gte = 0x0806 });
+    try view.validate(.test_high_nibble, .{ .gte = 9 });
+    try view.validate(.test_optional_int, .{ .gte = 0x8100 });
+
+    try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .lt = 0x0806 }));
+    try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .lte = 0x0805 }));
+    try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .gt = 0x0806 }));
+    try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .gte = 0x0807 }));
+    try std.testing.expectError(error.InvalidField, view.validate(.test_absent_int, .{ .gte = 0 }));
+}
+
+test "View.validate() checks enum values with any" {
+    const OptionalEnum = struct { value: ?TestEnum };
+    const OptionalEnumView = View(OptionalEnum);
+    var buffer = [_]u8{ 0xAB, 0xCD };
+    var reader: std.Io.Reader = .fixed(&buffer);
+    var view: OptionalEnumView = undefined;
+    try view.takeField(.value, &reader);
+
+    try view.validate(.value, .any);
+    try std.testing.expectError(error.InvalidField, view.validate(.value, .{ .eq = .second }));
+    view.set(.value, null);
+    try view.validate(.value, .{ .eq = null });
+    try std.testing.expectError(error.InvalidField, view.validate(.value, .any));
 }
 
 test "View() generated copy() copies non-owned slices" {

@@ -42,20 +42,15 @@ pub const IPv4Packet = struct {
 pub const IPv4PacketView = View(IPv4Packet);
 
 pub fn validate(view: IPv4PacketView) !void {
-    const version = view.get(.version);
-    if (version != 4) return error.InvalidField;
+    try view.validate(.version, .{ .eq = 4 });
+    try view.validate(.ihl, .{ .gte = 5 });
+    try view.validate(.reserved, .{ .eq = 0 });
 
     const ihl: usize = view.get(.ihl);
-    if (ihl < 5) return error.InvalidField;
-
-    const reserved = view.get(.reserved);
-    if (reserved != 0) return error.InvalidField;
-
-    const total_length = view.get(.total_length);
-    if (total_length < ihl * 4) return error.InvalidField;
+    try view.validate(.total_length, .{ .gte = @intCast(ihl * 4) });
 
     const more_fragments = view.get(.more_fragments);
-    const payload_bytes = total_length - (ihl * 4);
+    const payload_bytes = view.get(.total_length) - (ihl * 4);
     if (more_fragments and payload_bytes % 8 != 0) return error.InvalidField;
 
     const packet_words: [*]align(1) const u16 = @ptrFromInt(@intFromPtr(view.fields.version));
@@ -72,6 +67,7 @@ pub fn parse(buffer: []const u8) !IPv4PacketView {
 
     try view.takeFields(.version, .dst, &reader);
 
+    try view.validate(.ihl, .{ .gte = 5 });
     const header_bytes = @as(usize, view.get(.ihl)) * 4;
     const options_bytes = header_bytes - 20;
     try view.takeBytes(.options, options_bytes, &reader);
@@ -191,6 +187,7 @@ test "parse() reads a nonzero fragment offset" {
 test "parse() rejects invalid metadata fields" {
     const invalid_fields = [_]struct { offset: usize, value: u8 }{
         .{ .offset = 0, .value = 0x65 }, // version 6
+        .{ .offset = 0, .value = 0x44 }, // IHL below five words
         .{ .offset = 6, .value = 0xc0 }, // reserved flag set
         .{ .offset = 3, .value = 0x13 }, // total length below header length
         .{ .offset = 6, .value = 0x60 }, // more fragments with a four-byte payload

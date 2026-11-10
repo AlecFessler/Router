@@ -40,11 +40,11 @@ pub const ArpPacket = struct {
 pub const ArpPacketView = View(ArpPacket);
 
 pub fn validate(view: ArpPacketView) !void {
-    try view.validate(.hardware_type, 1);
-    try view.validate(.protocol_type, 0x0800);
-    try view.validate(.hardware_size, 6);
-    try view.validate(.protocol_size, 4);
-    try view.validate(.opcode, null);
+    try view.validate(.hardware_type, .{ .eq = 1 });
+    try view.validate(.protocol_type, .{ .eq = 0x0800 });
+    try view.validate(.hardware_size, .{ .eq = 6 });
+    try view.validate(.protocol_size, .{ .eq = 4 });
+    try view.validate(.opcode, .any);
 }
 
 pub fn parse(buffer: []const u8) !ArpPacketView {

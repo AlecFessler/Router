@@ -87,9 +87,9 @@ pub const EthernetFrame = struct {
 pub const EthernetFrameView = View(EthernetFrame);
 
 pub fn validate(view: EthernetFrameView) !void {
-    if (view.get(.tpid)) |tpid| {
-        if (tpid != .tpid or view.get(.pcp) == null or
-            view.get(.dei) == null or view.get(.vid) == null)
+    if (view.get(.tpid) != null) {
+        try view.validate(.tpid, .{ .eq = .tpid });
+        if (view.get(.pcp) == null or view.get(.dei) == null or view.get(.vid) == null)
             return error.InvalidField;
     } else {
         if (view.get(.pcp) != null or view.get(.dei) != null or view.get(.vid) != null)
