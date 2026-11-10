@@ -119,10 +119,18 @@ pub fn handle(
     const protocol = view.get(.protocol);
     switch (protocol) {
         else => {
-            std.debug.print(
-                "IPv4: packet with protocol: {s} unhandled by {s} interface\n",
-                .{ @tagName(protocol), @tagName(iface) },
-            );
+            const name = std.enums.tagName(Protocol, protocol);
+            if (name) |tag| {
+                std.debug.print(
+                    "IPv4: packet with protocol: {s} unhandled by {s} interface\n",
+                    .{ tag, @tagName(iface) },
+                );
+            } else {
+                std.debug.print(
+                    "IPv4: packet with protocol: {} unhandled by {s} interface\n",
+                    .{ @intFromEnum(protocol), @tagName(iface) },
+                );
+            }
             device.release(buffer);
         },
     }
