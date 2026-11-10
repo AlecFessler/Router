@@ -111,12 +111,6 @@ pub fn View(Base: type) type {
                 if (@bitSizeOf(info.tag_type) % 8 != 0)
                     @compileError("Enum backing integers must be whole-byte sized");
             },
-            .@"struct" => |info| {
-                if (info.layout != .@"packed")
-                    @compileError("Only packed structs are supported");
-                if (@bitSizeOf(T) % 8 != 0)
-                    @compileError("Packed structs must be whole-byte sized");
-            },
             .array => |info| {
                 if (info.child != u8)
                     @compileError("Only byte arrays are supported");
@@ -275,10 +269,6 @@ pub fn View(Base: type) type {
                         .@"enum" => |info| {
                             try writer.writeInt(info.tag_type, @intFromEnum(value), .big);
                         },
-                        .@"struct" => {
-                            const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
-                            try writer.writeInt(IntType, @bitCast(value), .big);
-                        },
                         .array => {
                             try writer.writeAll(&value);
                         },
@@ -377,15 +367,6 @@ pub fn View(Base: type) type {
                     return ptr.*;
                 },
 
-                .@"struct" => |info| {
-                    if (info.layout == .@"packed") {
-                        const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
-                        const bits: IntType = @bitCast(ptr.*);
-                        return @bitCast(std.mem.bigToNative(IntType, bits));
-                    }
-                    return ptr.*;
-                },
-
                 else => {
                     return ptr.*;
                 },
@@ -436,16 +417,6 @@ pub fn View(Base: type) type {
                 .pointer => |info| {
                     if (info.size == .slice) {
                         @field(self.fields, @tagName(field)) = actual_value;
-                    } else {
-                        ptr.* = actual_value;
-                    }
-                },
-
-                .@"struct" => |info| {
-                    if (info.layout == .@"packed") {
-                        const IntType = std.meta.Int(.unsigned, @bitSizeOf(T));
-                        const bits: IntType = @bitCast(actual_value);
-                        ptr.* = @bitCast(std.mem.nativeToBig(IntType, bits));
                     } else {
                         ptr.* = actual_value;
                     }
@@ -540,19 +511,6 @@ pub fn View(Base: type) type {
                 .int => std.debug.print("0x{x}", .{value}),
                 .bool => std.debug.print("{}", .{value}),
                 .@"enum" => std.debug.print("{s}", .{@tagName(value)}),
-                .@"struct" => |info| {
-                    std.debug.print("{{ ", .{});
-                    inline for (info.fields, 0..) |field, i| {
-                        if (i != 0) std.debug.print(", ", .{});
-                        std.debug.print("{s}: ", .{field.name});
-                        const field_value = @field(value, field.name);
-                        switch (@typeInfo(field.type)) {
-                            .int => std.debug.print("{}", .{field_value}),
-                            else => printValue(field.type, field_value),
-                        }
-                    }
-                    std.debug.print(" }}", .{});
-                },
                 .array => |info| {
                     switch (info.len) {
                         4 => {
@@ -692,12 +650,6 @@ pub fn View(Base: type) type {
     };
 }
 
-const TestPackedStruct = packed struct {
-    field1: u12 = 0xABC,
-    field2: bool = true,
-    field3: u3 = 4,
-};
-
 const TestEnum = enum(u16) {
     first = 0xABCD,
     second = 0x1234,
@@ -706,7 +658,8 @@ const TestEnum = enum(u16) {
 const TestBase = struct {
     test_int: u16 = 0x0806,
     test_enum: TestEnum = .first,
-    test_packed_struct: TestPackedStruct = .{},
+    test_high_nibble: u4 = 9,
+    test_low_twelve: u12 = 0xABC,
     test_array: [4]u8 = .{ 1, 2, 3, 4 },
     test_slice: []const u8 = &.{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF },
     test_optional_int: ?u16 = 0x8100,
@@ -759,8 +712,12 @@ test "View() generates a struct with the expected field types" {
         @TypeOf(test_view.fields.test_enum),
     );
     try std.testing.expectEqual(
-        *align(1) TestPackedStruct,
-        @TypeOf(test_view.fields.test_packed_struct),
+        *align(1:12:2) u4,
+        @TypeOf(test_view.fields.test_high_nibble),
+    );
+    try std.testing.expectEqual(
+        *align(1:0:2) u12,
+        @TypeOf(test_view.fields.test_low_twelve),
     );
     try std.testing.expectEqual(
         *align(1) [4]u8,
@@ -795,7 +752,8 @@ test "View.takeField() binds fields to the wire buffer" {
 
     try view.takeField(.test_int, &reader);
     try view.takeField(.test_enum, &reader);
-    try view.takeField(.test_packed_struct, &reader);
+    try view.takeField(.test_high_nibble, &reader);
+    try view.takeField(.test_low_twelve, &reader);
     try view.takeField(.test_array, &reader);
 
     try std.testing.expectEqual(
@@ -808,7 +766,7 @@ test "View.takeField() binds fields to the wire buffer" {
     );
     try std.testing.expectEqual(
         @intFromPtr(&buffer[4]),
-        @intFromPtr(view.fields.test_packed_struct),
+        @intFromPtr(view.fields.test_high_nibble),
     );
     try std.testing.expectEqual(
         @intFromPtr(&buffer[6]),
@@ -817,7 +775,8 @@ test "View.takeField() binds fields to the wire buffer" {
 
     try std.testing.expectEqual(@as(u16, 0x0806), view.get(.test_int));
     try std.testing.expectEqual(TestEnum.first, view.get(.test_enum));
-    try std.testing.expectEqualDeep(TestPackedStruct{}, view.get(.test_packed_struct));
+    try std.testing.expectEqual(@as(u4, 9), view.get(.test_high_nibble));
+    try std.testing.expectEqual(@as(u12, 0xABC), view.get(.test_low_twelve));
     try std.testing.expectEqualDeep([4]u8{ 1, 2, 3, 4 }, view.get(.test_array));
 
     var optional_reader: std.Io.Reader = .fixed(buffer[16..]);
@@ -944,10 +903,8 @@ test "View.get() reads all field types correctly" {
         expected.test_enum,
         view.get(.test_enum),
     );
-    try std.testing.expectEqualDeep(
-        expected.test_packed_struct,
-        view.get(.test_packed_struct),
-    );
+    try std.testing.expectEqual(expected.test_high_nibble, view.get(.test_high_nibble));
+    try std.testing.expectEqual(expected.test_low_twelve, view.get(.test_low_twelve));
     try std.testing.expectEqualDeep(
         expected.test_array,
         view.get(.test_array),
@@ -983,7 +940,8 @@ test "View.set() writes all field types correctly" {
 
     view.set(.test_int, expected.test_int);
     view.set(.test_enum, expected.test_enum);
-    view.set(.test_packed_struct, expected.test_packed_struct);
+    view.set(.test_high_nibble, expected.test_high_nibble);
+    view.set(.test_low_twelve, expected.test_low_twelve);
     view.set(.test_array, expected.test_array);
     view.set(.test_slice, expected.test_slice);
     view.set(.test_optional_int, expected.test_optional_int);
@@ -1099,7 +1057,8 @@ test "View.validate() handles optional field presence and values" {
     try view.validate(.test_int, 0x0806);
     try view.validate(.test_enum, null);
     try view.validate(.test_enum, .first);
-    try view.validate(.test_packed_struct, .{});
+    try view.validate(.test_high_nibble, 9);
+    try view.validate(.test_low_twelve, 0xABC);
     try view.validate(.test_array, .{ 1, 2, 3, 4 });
     try view.validate(.test_slice, default.test_slice);
     try view.validate(.test_optional_int, 0x8100);
