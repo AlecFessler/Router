@@ -51,15 +51,7 @@ pub fn parse(buffer: []const u8) !ArpPacketView {
     var view: ArpPacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
-    try view.takeField(.hardware_type, &reader);
-    try view.takeField(.protocol_type, &reader);
-    try view.takeField(.hardware_size, &reader);
-    try view.takeField(.protocol_size, &reader);
-    try view.takeField(.opcode, &reader);
-    try view.takeField(.sender_mac, &reader);
-    try view.takeField(.sender_ip, &reader);
-    try view.takeField(.target_mac, &reader);
-    try view.takeField(.target_ip, &reader);
+    try view.takeFields(.hardware_type, .target_ip, &reader);
 
     try validate(view);
     return view;

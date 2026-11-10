@@ -113,11 +113,7 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
 
     const vlan_tag_present = try reader.peekInt(u16, .big) == @intFromEnum(Ethertype.tpid);
     if (vlan_tag_present) {
-        try frame_view.takeField(.tpid, &reader);
-        try frame_view.takeField(.pcp, &reader);
-        try frame_view.takeField(.dei, &reader);
-        try frame_view.takeField(.vid, &reader);
-        try frame_view.takeField(.ethertype, &reader);
+        try frame_view.takeFields(.tpid, .ethertype, &reader);
     } else {
         frame_view.set(.tpid, null);
         frame_view.set(.pcp, null);

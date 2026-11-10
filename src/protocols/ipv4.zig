@@ -70,21 +70,7 @@ pub fn parse(buffer: []const u8) !IPv4PacketView {
     var view: IPv4PacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
-    try view.takeField(.version, &reader);
-    try view.takeField(.ihl, &reader);
-    try view.takeField(.dscp, &reader);
-    try view.takeField(.ecn, &reader);
-    try view.takeField(.total_length, &reader);
-    try view.takeField(.identification, &reader);
-    try view.takeField(.reserved, &reader);
-    try view.takeField(.dont_fragment, &reader);
-    try view.takeField(.more_fragments, &reader);
-    try view.takeField(.fragment_offset, &reader);
-    try view.takeField(.ttl, &reader);
-    try view.takeField(.protocol, &reader);
-    try view.takeField(.header_checksum, &reader);
-    try view.takeField(.src, &reader);
-    try view.takeField(.dst, &reader);
+    try view.takeFields(.version, .dst, &reader);
 
     const header_bytes = @as(usize, view.get(.ihl)) * 4;
     const options_bytes = header_bytes - 20;

@@ -195,6 +195,20 @@ pub fn View(Base: type) type {
                 @ptrCast(try reader.takeArray(@sizeOf(@typeInfo(PtrType).pointer.child)));
         }
 
+        pub fn takeFields(
+            self: *@This(),
+            comptime start: FieldEnum,
+            comptime inclusive_end: FieldEnum,
+            reader: *std.Io.Reader,
+        ) !void {
+            if (@intFromEnum(start) > @intFromEnum(inclusive_end))
+                @compileError("takeFields() start must not follow its end");
+
+            inline for (@as(usize, @intFromEnum(start))..@as(usize, @intFromEnum(inclusive_end)) + 1) |index| {
+                try self.takeField(@enumFromInt(index), reader);
+            }
+        }
+
         pub fn takeBytes(
             self: *@This(),
             comptime field: FieldEnum,
@@ -722,10 +736,7 @@ fn parseTestBuffer(buffer: []u8) TestView {
     var output: TestView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
-    output.takeField(.test_int, &reader) catch unreachable;
-    output.takeField(.test_enum, &reader) catch unreachable;
-    output.takeField(.test_packed_struct, &reader) catch unreachable;
-    output.takeField(.test_array, &reader) catch unreachable;
+    output.takeFields(.test_int, .test_array, &reader) catch unreachable;
     output.takeBytes(.test_slice, default.test_slice.len, &reader) catch unreachable;
     output.takeField(.test_optional_int, &reader) catch unreachable;
     output.fields.test_absent_int = null;
@@ -1211,14 +1222,7 @@ test "View() binds bit fields to wire bytes" {
     var buffer = [_]u8{ 0x45, 0xab, 0x75, 0x12 };
     var reader: std.Io.Reader = .fixed(&buffer);
     var view: TestBitFieldsView = undefined;
-    try view.takeField(.version, &reader);
-    try view.takeField(.ihl, &reader);
-    try view.takeField(.dscp, &reader);
-    try view.takeField(.ecn, &reader);
-    try view.takeField(.reserved, &reader);
-    try view.takeField(.dont_fragment, &reader);
-    try view.takeField(.more_fragments, &reader);
-    try view.takeField(.fragment_offset, &reader);
+    try view.takeFields(.version, .fragment_offset, &reader);
 
     try std.testing.expectEqual(*align(1:4:1) u4, @TypeOf(view.fields.version));
     try std.testing.expectEqual(*align(1:0:1) u4, @TypeOf(view.fields.ihl));
@@ -1256,9 +1260,7 @@ test "View() skips absent bit groups and rejects partial groups" {
     var buffer = [_]u8{ 0x60, 0x64 };
     var reader: std.Io.Reader = .fixed(&buffer);
     var view: TestOptionalBitFieldsView = undefined;
-    try view.takeField(.pcp, &reader);
-    try view.takeField(.dei, &reader);
-    try view.takeField(.vid, &reader);
+    try view.takeFields(.pcp, .vid, &reader);
     try std.testing.expectEqual(@as(?u3, 3), view.get(.pcp));
     try std.testing.expectEqual(@as(?bool, false), view.get(.dei));
     try std.testing.expectEqual(@as(?u12, 100), view.get(.vid));
