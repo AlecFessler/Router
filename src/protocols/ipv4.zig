@@ -120,8 +120,8 @@ pub fn handle(
     switch (protocol) {
         else => {
             std.debug.print(
-                "IPv4: packet with protocol: {} unhandled by {s} interface\n",
-                .{ protocol, @tagName(iface) },
+                "IPv4: packet with protocol: {s} unhandled by {s} interface\n",
+                .{ @tagName(protocol), @tagName(iface) },
             );
             device.release(buffer);
         },
@@ -214,7 +214,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
         const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(@as(u16, 0x0800), frame.get(.ethertype));
+        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
         try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet));
     }
@@ -229,7 +229,7 @@ test "parse() then serialize() returns the original bytes" {
 
     for (parsed_pcap.packet_bytes) |packet| {
         const frame = try Router.Protocols.Ethernet.parse(packet);
-        try std.testing.expectEqual(@as(u16, 0x0800), frame.get(.ethertype));
+        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
         const ipv4_bytes = frame.get(.payload);
         var view = try parse(ipv4_bytes);
         const parsed_len = view.get(.total_length);
