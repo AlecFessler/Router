@@ -4,6 +4,7 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
 const NicApi = Router.Nic.Api.Api;
+const Udp = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
 
 pub const IPv4 = [4]u8;
@@ -79,8 +80,8 @@ pub fn parse(buffer: []const u8) !IPv4PacketView {
 }
 
 pub fn handle(
-    buffer: []u8,
-    packet: []u8,
+    buffer: []u8, // the full ethernet frame
+    packet: []u8, // the ethernet frame payload
     device: NicApi,
     iface: IFace,
 ) !void {
@@ -88,6 +89,7 @@ pub fn handle(
     Cli.enter(.ipv4, view);
     const protocol = view.get(.protocol);
     switch (protocol) {
+        .udp => try Udp.handle(buffer, view.get(.payload), device, iface, view),
         else => {
             const name = std.enums.tagName(Protocol, protocol);
             if (name) |tag| {

@@ -14,6 +14,7 @@ const Router = @import("router");
 const Arp = Router.Protocols.Arp;
 const Ethernet = Router.Protocols.Ethernet;
 const IPv4 = Router.Protocols.IPv4;
+const Udp = Router.Protocols.Udp;
 
 pub const EntryPoint = enum {
     rx,
@@ -22,6 +23,7 @@ pub const EntryPoint = enum {
     ethernet,
     arp,
     ipv4,
+    udp,
 };
 
 const StepTarget = union(enum) {
@@ -95,6 +97,20 @@ fn printFrame(frame: []const u8) void {
             std.debug.print("IPv4:\n", .{});
             ipv4.print(2);
             std.debug.print("\n", .{});
+
+            const protocol = ipv4.get(.protocol);
+            switch (protocol) {
+                .udp => {
+                    var udp = Udp.parse(ipv4.get(.payload), ipv4) catch |err| {
+                        std.debug.print("UDP parse failed: {}\n", .{err});
+                        return;
+                    };
+                    std.debug.print("UDP:\n", .{});
+                    udp.print(2);
+                    std.debug.print("\n", .{});
+                },
+                else => std.debug.print("No parser for IP protocol {}\n", .{@intFromEnum(protocol)}),
+            }
         },
         .arp => {
             var arp = Arp.parse(ethernet.get(.payload)) catch |err| {
@@ -122,6 +138,7 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
             .ethernet => "Ethernet",
             .arp => "ARP",
             .ipv4 => "IPv4",
+            .udp => "UDP",
             else => @tagName(entrypoint),
         };
         std.debug.print("{s}:\n", .{label});
