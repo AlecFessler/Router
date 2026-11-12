@@ -13,6 +13,7 @@ const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
 const Ethernet = Router.Protocols.Ethernet;
+const ICMPv4 = Router.Protocols.ICMPv4;
 const IPv4 = Router.Protocols.IPv4;
 const Tcp = Router.Protocols.Tcp;
 const Udp = Router.Protocols.Udp;
@@ -23,6 +24,7 @@ pub const EntryPoint = enum {
     release,
     ethernet,
     arp,
+    icmpv4,
     ipv4,
     tcp,
     udp,
@@ -102,6 +104,15 @@ fn printFrame(frame: []const u8) void {
 
             const protocol = ipv4.get(.protocol);
             switch (protocol) {
+                .icmp => {
+                    var icmpv4 = ICMPv4.parse(ipv4.get(.payload)) catch |err| {
+                        std.debug.print("ICMPv4 parse failed: {}\n", .{err});
+                        return;
+                    };
+                    std.debug.print("ICMPv4:\n", .{});
+                    icmpv4.print(2);
+                    std.debug.print("\n", .{});
+                },
                 .tcp => {
                     var tcp = Tcp.parse(ipv4.get(.payload), ipv4) catch |err| {
                         std.debug.print("TCP parse failed: {}\n", .{err});
@@ -148,6 +159,7 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
         const label: []const u8 = switch (entrypoint) {
             .ethernet => "Ethernet",
             .arp => "ARP",
+            .icmpv4 => "ICMPv4",
             .ipv4 => "IPv4",
             .tcp => "TCP",
             .udp => "UDP",

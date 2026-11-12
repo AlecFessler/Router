@@ -11,6 +11,7 @@ test {
     _ = Meta.View;
     _ = Protocols.Arp;
     _ = Protocols.Ethernet;
+    _ = Protocols.ICMPv4;
     _ = Protocols.IPv4;
     _ = Protocols.Tcp;
     _ = Protocols.Udp;
