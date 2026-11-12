@@ -4,6 +4,7 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
 const NicApi = Router.Nic.Api.Api;
+const Tcp = Router.Protocols.Tcp;
 const Udp = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
 
@@ -89,6 +90,7 @@ pub fn handle(
     Cli.enter(.ipv4, view);
     const protocol = view.get(.protocol);
     switch (protocol) {
+        .tcp => try Tcp.handle(buffer, view.get(.payload), device, iface, view),
         .udp => try Udp.handle(buffer, view.get(.payload), device, iface, view),
         else => {
             const name = std.enums.tagName(Protocol, protocol);

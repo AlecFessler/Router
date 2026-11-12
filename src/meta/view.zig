@@ -6,6 +6,7 @@ fn FieldType(
     comptime Base: type,
     comptime field: std.meta.FieldEnum(Base),
 ) type {
+    @setEvalBranchQuota(10000);
     return @FieldType(Base, @tagName(field));
 }
 

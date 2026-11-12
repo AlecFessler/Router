@@ -14,6 +14,7 @@ const Router = @import("router");
 const Arp = Router.Protocols.Arp;
 const Ethernet = Router.Protocols.Ethernet;
 const IPv4 = Router.Protocols.IPv4;
+const Tcp = Router.Protocols.Tcp;
 const Udp = Router.Protocols.Udp;
 
 pub const EntryPoint = enum {
@@ -23,6 +24,7 @@ pub const EntryPoint = enum {
     ethernet,
     arp,
     ipv4,
+    tcp,
     udp,
 };
 
@@ -100,6 +102,15 @@ fn printFrame(frame: []const u8) void {
 
             const protocol = ipv4.get(.protocol);
             switch (protocol) {
+                .tcp => {
+                    var tcp = Tcp.parse(ipv4.get(.payload), ipv4) catch |err| {
+                        std.debug.print("TCP parse failed: {}\n", .{err});
+                        return;
+                    };
+                    std.debug.print("TCP:\n", .{});
+                    tcp.print(2);
+                    std.debug.print("\n", .{});
+                },
                 .udp => {
                     var udp = Udp.parse(ipv4.get(.payload), ipv4) catch |err| {
                         std.debug.print("UDP parse failed: {}\n", .{err});
@@ -138,6 +149,7 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
             .ethernet => "Ethernet",
             .arp => "ARP",
             .ipv4 => "IPv4",
+            .tcp => "TCP",
             .udp => "UDP",
             else => @tagName(entrypoint),
         };

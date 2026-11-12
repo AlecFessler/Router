@@ -12,5 +12,6 @@ test {
     _ = Protocols.Arp;
     _ = Protocols.Ethernet;
     _ = Protocols.IPv4;
+    _ = Protocols.Tcp;
     _ = Protocols.Udp;
 }
