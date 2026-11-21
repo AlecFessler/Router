@@ -4,7 +4,6 @@ const Router = @import("router");
 const Ethernet = Router.Protocols.Ethernet;
 const IFace = Router.Nic.Api.IFace;
 const Mock = Router.Nic.Testing.Mock;
-const pcap_file = Router.TestFixtures.WanCaptures.first_wan_sample;
 
 pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -27,6 +26,11 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
+    const pcap_file = switch (iface) {
+        .wan => Router.TestFixtures.WanCaptures.isp_to_router,
+        // Captured from the Google router's WAN port, so this is already-NATed traffic.
+        .lan => Router.TestFixtures.WanCaptures.router_to_isp,
+    };
     var mock = try Mock.init(pcap_file, init.gpa);
     defer mock.deinit();
     const mock_nic = mock.api();
