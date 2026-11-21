@@ -563,7 +563,13 @@ pub fn View(Base: type) type {
                 },
                 .int => std.debug.print("0x{x}", .{value}),
                 .bool => std.debug.print("{}", .{value}),
-                .@"enum" => std.debug.print("{s}", .{@tagName(value)}),
+                .@"enum" => {
+                    if (std.enums.tagName(T, value)) |name| {
+                        std.debug.print("{s}", .{name});
+                    } else {
+                        std.debug.print("0x{x}", .{@intFromEnum(value)});
+                    }
+                },
                 .array => |info| {
                     switch (info.len) {
                         4 => {

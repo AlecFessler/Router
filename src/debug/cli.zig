@@ -82,6 +82,26 @@ fn readLine(buffer: []u8) ?[]const u8 {
     return std.mem.trim(u8, buffer[0..len], " \t\r");
 }
 
+fn printVlanTags(tags: []const u8) void {
+    if (tags.len == 0) return;
+    if (tags.len % 4 != 0) {
+        std.debug.print("VLAN tag stack has {} bytes (expected a multiple of 4)\n", .{tags.len});
+        return;
+    }
+
+    std.debug.print("VLAN tag stack ({} tags):\n", .{tags.len / 4});
+    for (0..tags.len / 4) |index| {
+        const bytes = tags[index * 4 ..][0..4];
+        var reader: std.Io.Reader = .fixed(bytes);
+        var tag = Ethernet.parseVlanTag(&reader) catch |err| {
+            std.debug.print("  tag #{}: parse failed: {}\n", .{ index + 1, err });
+            continue;
+        };
+        std.debug.print("  tag #{}:\n", .{index + 1});
+        tag.print(4);
+    }
+}
+
 fn printFrame(frame: []const u8) void {
     var ethernet = Ethernet.parse(frame) catch |err| {
         std.debug.print("Ethernet parse failed: {}\n", .{err});
@@ -89,6 +109,7 @@ fn printFrame(frame: []const u8) void {
     };
     std.debug.print("Ethernet:\n", .{});
     ethernet.print(2);
+    printVlanTags(ethernet.get(.vlan_tags));
     std.debug.print("\n", .{});
 
     const ethertype = ethernet.get(.ethertype);
@@ -167,6 +188,9 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
         };
         std.debug.print("{s}:\n", .{label});
         view.print(2);
+        if (comptime T == Ethernet.EthernetFrameView) {
+            if (entrypoint == .ethernet) printVlanTags(view.get(.vlan_tags));
+        }
         std.debug.print("\n", .{});
     } else {
         @compileError("Cli.enter expects a byte slice or a protocol View");
