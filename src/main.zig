@@ -4,7 +4,7 @@ const Router = @import("router");
 const Ethernet = Router.Protocols.Ethernet;
 const IFace = Router.Nic.Api.IFace;
 const Mock = Router.Nic.Testing.Mock;
-const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
+const pcap_file = Router.TestFixtures.WanCaptures.first_wan_sample;
 
 pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
