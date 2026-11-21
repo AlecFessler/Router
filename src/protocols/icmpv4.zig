@@ -8,7 +8,7 @@ const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
 
-pub const TypeField = enum(u8) {
+pub const MsgType = enum(u8) {
     echo_reply = 0,
     destination_unreachable = 3,
     redirect = 5,
@@ -19,7 +19,7 @@ pub const TypeField = enum(u8) {
 };
 
 pub const ICMPv4Packet = struct {
-    type_field: TypeField,
+    msg_type: MsgType,
     code: u8,
     checksum: u16,
     payload: []u8,
@@ -30,14 +30,14 @@ pub const ICMPv4PacketView = View(ICMPv4Packet);
 pub fn validate(view: ICMPv4PacketView) !void {
     if (view.get(.checksum) == 0) return;
     var checksum = view.checksum();
-    checksum.addFields(.type_field, .payload);
+    checksum.addFields(.msg_type, .payload);
     try checksum.validate();
 }
 
 pub fn parse(buffer: []const u8) !ICMPv4PacketView {
     var view: ICMPv4PacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
-    try view.takeFields(.type_field, .checksum, &reader);
+    try view.takeFields(.msg_type, .checksum, &reader);
     try view.takeBytes(.payload, reader.bufferedLen(), &reader);
     try validate(view);
     return view;
@@ -51,10 +51,10 @@ pub fn handle(
 ) !void {
     const view = try parse(packet);
     Cli.enter(.icmpv4, view);
-    const type_field = view.get(.type_field);
-    switch (type_field) {
+    const msg_type = view.get(.msg_type);
+    switch (msg_type) {
         else => {
-            const name = std.enums.tagName(TypeField, type_field);
+            const name = std.enums.tagName(MsgType, msg_type);
             if (name) |tag| {
                 std.debug.print(
                     "ICMPv4: packet with type: {s} unhandled by {s} interface\n",
@@ -63,7 +63,7 @@ pub fn handle(
             } else {
                 std.debug.print(
                     "ICMPv4: packet with type: {} unhandled by {s} interface\n",
-                    .{ @intFromEnum(type_field), @tagName(iface) },
+                    .{ @intFromEnum(msg_type), @tagName(iface) },
                 );
             }
             device.release(buffer);
@@ -75,7 +75,7 @@ const test_packet = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 0x61,
 
 test "parse() reads ICMPv4 fields from wire bytes" {
     const view = try parse(&test_packet);
-    try std.testing.expectEqual(TypeField.echo_request, view.get(.type_field));
+    try std.testing.expectEqual(MsgType.echo_request, view.get(.msg_type));
     try std.testing.expectEqual(@as(u8, 0), view.get(.code));
     try std.testing.expectEqual(@as(u16, 0x2168), view.get(.checksum));
     try std.testing.expectEqualSlices(u8, test_packet[4..], view.get(.payload));
