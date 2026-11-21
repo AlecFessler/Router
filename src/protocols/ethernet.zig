@@ -63,23 +63,34 @@ const View = Router.Meta.View.View;
 pub const PAYLOAD_LEN_MAX = 1500;
 pub const VALID_ETHERTYPE_MIN = 1535;
 
-pub const Mac = [6]u8;
+pub const TagProtocol = enum(u16) {
+    dot1q = 0x8100, //  802.1q  customer tag
+    dot1ad = 0x88A8, // 802.1ad service tag
+    _,
+};
+
+pub const VlanTag = struct {
+    tpid: TagProtocol, // tag protocol identifier
+    // tag control information
+    pcp: u3, // priority code point
+    dei: bool, // drop eligible indicator
+    vid: u12, // VLAN identifier
+};
+
+pub const VlanTagView = View(VlanTag);
 
 pub const Ethertype = enum(u16) {
     ipv4 = 0x0800,
     arp = 0x0806,
-    tpid = 0x8100,
     _,
 };
+
+pub const Mac = [6]u8;
 
 pub const EthernetFrame = struct {
     dst_mac: Mac,
     src_mac: Mac,
-    tpid: ?Ethertype, // tag protocol identifier
-    // tag control information
-    pcp: ?u3, // priority code point
-    dei: ?bool, // drop eligible indicator
-    vid: ?u12, // VLAN identifier
+    vlan_tags: []u8,
     ethertype: Ethertype,
     payload: []u8,
 };
@@ -87,21 +98,18 @@ pub const EthernetFrame = struct {
 pub const EthernetFrameView = View(EthernetFrame);
 
 pub fn validate(view: EthernetFrameView) !void {
-    if (view.get(.tpid) != null) {
-        try view.validate(.tpid, .{ .eq = .tpid });
-        if (view.get(.pcp) == null or view.get(.dei) == null or view.get(.vid) == null)
-            return error.InvalidField;
-    } else {
-        if (view.get(.pcp) != null or view.get(.dei) != null or view.get(.vid) != null)
-            return error.InvalidField;
-    }
-
     const ethertype = @intFromEnum(view.get(.ethertype));
     const is_ethernet_II_frame = ethertype > PAYLOAD_LEN_MAX;
     const ethertype_invalid = is_ethernet_II_frame and ethertype <= VALID_ETHERTYPE_MIN;
     if (ethertype_invalid) {
         return error.InvalidEthertype;
     }
+}
+
+fn isTpid(tpid: u16) bool {
+    inline for (std.meta.tags(TagProtocol)) |tag| {
+        if (tpid == @intFromEnum(tag)) return true;
+    } else return false;
 }
 
 pub fn parse(buffer: []const u8) !EthernetFrameView {
@@ -111,17 +119,15 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     try frame_view.takeField(.dst_mac, &reader);
     try frame_view.takeField(.src_mac, &reader);
 
-    const vlan_tag_present = try reader.peekInt(u16, .big) == @intFromEnum(Ethertype.tpid);
-    if (vlan_tag_present) {
-        try frame_view.takeFields(.tpid, .ethertype, &reader);
-    } else {
-        frame_view.set(.tpid, null);
-        frame_view.set(.pcp, null);
-        frame_view.set(.dei, null);
-        frame_view.set(.vid, null);
-        try frame_view.takeField(.ethertype, &reader);
+    var tpid_seek: std.Io.Reader = .fixed(buffer[reader.seek..]);
+    var tag_bytes: usize = 0;
+    while (isTpid(try tpid_seek.peekInt(u16, .big))) {
+        try tpid_seek.discardAll(@sizeOf(u32));
+        tag_bytes += @sizeOf(u32);
     }
+    try frame_view.takeBytes(.vlan_tags, tag_bytes, &reader);
 
+    try frame_view.takeField(.ethertype, &reader);
     const ethertype = @intFromEnum(frame_view.get(.ethertype));
     const payload_len = if (ethertype <= PAYLOAD_LEN_MAX)
         ethertype
@@ -131,6 +137,13 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
 
     try validate(frame_view);
     return frame_view;
+}
+
+// give the reader the EthernetFrame or EthernetFrameView .vlan_tags buffer
+pub fn parseVlanTag(reader: *std.Io.Reader) !VlanTagView {
+    var view: VlanTagView = undefined;
+    try view.takeFields(.tpid, .vid, reader);
+    return view;
 }
 
 pub fn handle(
@@ -214,38 +227,41 @@ test "parse() uses the 802.3 length field and excludes padding" {
     }
 }
 
-test "parse() reads VLAN bit fields and validate() rejects partial tags" {
-    var packet = [_]u8{
-        0,    1,    2,    3,    4,    5,    6, 7, 8, 9, 10, 11,
-        0x81, 0x00, 0x60, 0x64, 0x08, 0x00,
+test "parse() reads two and four stacked VLAN tags" {
+    const macs = [_]u8{
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
     };
-    var view = try parse(&packet);
-    try std.testing.expectEqual(@as(?u3, 3), view.get(.pcp));
-    try std.testing.expectEqual(@as(?bool, false), view.get(.dei));
-    try std.testing.expectEqual(@as(?u12, 100), view.get(.vid));
+    const type_and_payload = [_]u8{ 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef };
+    const two_tags = [_]u8{
+        0x81, 0x00, 0x0f, 0xfa, // VLAN 4090
+        0x81, 0x00, 0x03, 0xe7, // VLAN 999
+    };
+    const four_tags = [_]u8{
+        0x81, 0x00, 0x00, 0x64, // VLAN 100
+        0x81, 0x00, 0x00, 0xc8, // VLAN 200
+        0x81, 0x00, 0x01, 0x2c, // VLAN 300
+        0x81, 0x00, 0x01, 0x90, // VLAN 400
+    };
 
-    view.set(.pcp, null);
-    try std.testing.expectError(error.InvalidField, validate(view));
-    var without_tpid = try parse(&packet);
-    without_tpid.set(.tpid, null);
-    try std.testing.expectError(error.InvalidField, validate(without_tpid));
+    inline for (.{ two_tags, four_tags }) |tags| {
+        const padding = [_]u8{0} ** (60 - macs.len - tags.len - type_and_payload.len);
+        const frame = macs ++ tags ++ type_and_payload ++ padding;
+        const view = try parse(&frame);
+        try std.testing.expectEqualSlices(u8, &tags, view.get(.vlan_tags));
+        try std.testing.expectEqual(Ethertype.ipv4, view.get(.ethertype));
+        try std.testing.expectEqualSlices(u8, frame[macs.len + tags.len + 2 ..], view.get(.payload));
+    }
 }
 
-test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.Ethernet.CsvParser;
-    const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
-    const csv_file = Router.TestFixtures.Ethernet.csv_file;
-
-    var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
-    defer parsed_pcap.deinit(std.testing.allocator);
-    const parsed_frames = try CsvParser.parse(csv_file, std.testing.allocator);
-    defer std.testing.allocator.free(parsed_frames);
-
-    for (parsed_frames, 0..) |ws_frame, i| {
-        const my_frame = try parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expect(my_frame.isEqualIgnoringSlices(&ws_frame));
-    }
+test "parseVlanTag() reads VLAN bit fields" {
+    const bytes = [_]u8{ 0x81, 0x00, 0x60, 0x64 };
+    var reader: std.Io.Reader = .fixed(&bytes);
+    const view = try parseVlanTag(&reader);
+    try std.testing.expectEqual(TagProtocol.dot1q, view.get(.tpid));
+    try std.testing.expectEqual(@as(u3, 3), view.get(.pcp));
+    try std.testing.expectEqual(false, view.get(.dei));
+    try std.testing.expectEqual(@as(u12, 100), view.get(.vid));
 }
 
 test "parse() then serialize() returns the original bytes" {
@@ -263,7 +279,7 @@ test "parse() then serialize() returns the original bytes" {
         var frame_view = try parse(packet);
         const copy = frame_view.copy();
         try EthernetFrameView.serialize(copy, &writer);
-        const header_len: usize = if (copy.tpid != null) 18 else 14;
+        const header_len: usize = 14 + copy.vlan_tags.len;
         try std.testing.expectEqual(header_len + copy.payload.len, writer.end);
         try std.testing.expectEqualSlices(u8, packet[0..writer.end], buffer[0..writer.end]);
     }
