@@ -12,10 +12,15 @@ const std = @import("std");
 const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
+const DHCPv4 = Router.Protocols.DHCPv4;
+const DestinationUnreachable = @import("../protocols/icmpv4/destination_unreachable.zig");
 const Ethernet = Router.Protocols.Ethernet;
+const Echo = @import("../protocols/icmpv4/echo.zig");
 const ICMPv4 = Router.Protocols.ICMPv4;
 const IPv4 = Router.Protocols.IPv4;
+const ParameterProblem = @import("../protocols/icmpv4/parameter_problem.zig");
 const Tcp = Router.Protocols.Tcp;
+const TimeExceeded = @import("../protocols/icmpv4/time_exceeded.zig");
 const Udp = Router.Protocols.Udp;
 
 pub const EntryPoint = enum {
@@ -24,7 +29,12 @@ pub const EntryPoint = enum {
     release,
     ethernet,
     arp,
+    dhcpv4,
     icmpv4,
+    echo,
+    destination_unreachable,
+    time_exceeded,
+    parameter_problem,
     ipv4,
     tcp,
     udp,
@@ -102,6 +112,20 @@ fn printVlanTags(tags: []const u8) void {
     }
 }
 
+fn printChild(comptime Packet: type, comptime Parser: type, name: []const u8, bytes: []const u8) void {
+    if (comptime @typeInfo(Packet).@"struct".fields.len == 0) {
+        std.debug.print("{s} parser not implemented\n", .{name});
+    } else {
+        var view = Parser.parse(bytes) catch |err| {
+            std.debug.print("{s} parse failed: {}\n", .{ name, err });
+            return;
+        };
+        std.debug.print("{s}:\n", .{name});
+        view.print(2);
+        std.debug.print("\n", .{});
+    }
+}
+
 fn printFrame(frame: []const u8) void {
     var ethernet = Ethernet.parse(frame) catch |err| {
         std.debug.print("Ethernet parse failed: {}\n", .{err});
@@ -133,6 +157,19 @@ fn printFrame(frame: []const u8) void {
                     std.debug.print("ICMPv4:\n", .{});
                     icmpv4.print(2);
                     std.debug.print("\n", .{});
+
+                    const message = icmpv4.get(.payload);
+                    switch (icmpv4.get(.msg_type)) {
+                        .echo_request, .echo_reply =>
+                            printChild(Echo.EchoMsg, Echo, "Echo", message),
+                        .destination_unreachable =>
+                            printChild(DestinationUnreachable.DestinationUnreachableMsg, DestinationUnreachable, "Destination Unreachable", message),
+                        .time_exceeded =>
+                            printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
+                        .parameter_problem =>
+                            printChild(ParameterProblem.ParameterProblemMsg, ParameterProblem, "Parameter Problem", message),
+                        else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.msg_type))}),
+                    }
                 },
                 .tcp => {
                     var tcp = Tcp.parse(ipv4.get(.payload), ipv4) catch |err| {
@@ -151,6 +188,16 @@ fn printFrame(frame: []const u8) void {
                     std.debug.print("UDP:\n", .{});
                     udp.print(2);
                     std.debug.print("\n", .{});
+
+                    const src_port = udp.get(.src_port);
+                    const dst_port = udp.get(.dst_port);
+                    if ((src_port == 67 and dst_port == 68) or
+                        (src_port == 68 and dst_port == 67))
+                    {
+                        printChild(DHCPv4.DHCPv4Packet, DHCPv4, "DHCPv4", udp.get(.payload));
+                    } else {
+                        std.debug.print("No parser for UDP ports {} -> {}\n", .{ src_port, dst_port });
+                    }
                 },
                 else => std.debug.print("No parser for IP protocol {}\n", .{@intFromEnum(protocol)}),
             }
@@ -180,7 +227,12 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
         const label: []const u8 = switch (entrypoint) {
             .ethernet => "Ethernet",
             .arp => "ARP",
+            .dhcpv4 => "DHCPv4",
             .icmpv4 => "ICMPv4",
+            .echo => "Echo",
+            .destination_unreachable => "Destination Unreachable",
+            .time_exceeded => "Time Exceeded",
+            .parameter_problem => "Parameter Problem",
             .ipv4 => "IPv4",
             .tcp => "TCP",
             .udp => "UDP",
