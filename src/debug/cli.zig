@@ -16,6 +16,7 @@ const DHCPv4 = Router.Protocols.DHCPv4;
 const DestinationUnreachable = @import("../protocols/icmpv4/destination_unreachable.zig");
 const Ethernet = Router.Protocols.Ethernet;
 const Echo = @import("../protocols/icmpv4/echo.zig");
+const Format = Router.Meta.Format;
 const ICMPv4 = Router.Protocols.ICMPv4;
 const IPv4 = Router.Protocols.IPv4;
 const ParameterProblem = @import("../protocols/icmpv4/parameter_problem.zig");
@@ -158,11 +159,7 @@ fn printDhcpOptions(options: []const u8) void {
                 std.debug.print("  {s}: {} seconds\n", .{ @tagName(tag), duration.toSeconds() });
             },
             .message_type => |message_type| {
-                if (std.enums.tagName(DHCPv4.MessageType, message_type)) |name| {
-                    std.debug.print("  message_type: {s}\n", .{name});
-                } else {
-                    std.debug.print("  message_type: {}\n", .{@intFromEnum(message_type)});
-                }
+                std.debug.print("  message_type: {f}\n", .{Format.enumLabel(message_type)});
             },
             .parameter_request_list => |codes| {
                 std.debug.print("  parameter_request_list:\n", .{});

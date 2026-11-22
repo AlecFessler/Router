@@ -55,6 +55,7 @@ const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
 const Cli = Router.Debug.Cli;
+const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
@@ -158,18 +159,10 @@ pub fn handle(
         .ipv4 => try IPv4.handle(buffer, view.get(.payload), device, iface),
         .arp => try Arp.handle(buffer, view.get(.payload), device, iface),
         else => {
-            const name = std.enums.tagName(Ethertype, ethertype);
-            if (name) |tag| {
-                std.debug.print(
-                    "Ethernet: packet with ethertype {s} unhandled by {s} interface\n",
-                    .{ tag, @tagName(iface) },
-                );
-            } else {
-                std.debug.print(
-                    "Ethernet: packet with ethertype 0x{x:0>4} unhandled by {s} interface\n",
-                    .{ @intFromEnum(ethertype), @tagName(iface) },
-                );
-            }
+            std.debug.print(
+                "Ethernet: packet with ethertype {f} unhandled by {s} interface\n",
+                .{ Format.enumLabel(ethertype), @tagName(iface) },
+            );
             device.release(buffer);
         },
     }

@@ -2,6 +2,7 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
@@ -54,18 +55,10 @@ pub fn handle(
     const msg_type = view.get(.msg_type);
     switch (msg_type) {
         else => {
-            const name = std.enums.tagName(MsgType, msg_type);
-            if (name) |tag| {
-                std.debug.print(
-                    "ICMPv4: packet with type: {s} unhandled by {s} interface\n",
-                    .{ tag, @tagName(iface) },
-                );
-            } else {
-                std.debug.print(
-                    "ICMPv4: packet with type: {} unhandled by {s} interface\n",
-                    .{ @intFromEnum(msg_type), @tagName(iface) },
-                );
-            }
+            std.debug.print(
+                "ICMPv4: packet with type: {f} unhandled by {s} interface\n",
+                .{ Format.enumLabel(msg_type), @tagName(iface) },
+            );
             device.release(buffer);
         },
     }

@@ -2,6 +2,7 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const ICMPv4 = Router.Protocols.ICMPv4;
 const NicApi = Router.Nic.Api.Api;
@@ -95,18 +96,10 @@ pub fn handle(
         .tcp => try Tcp.handle(buffer, view.get(.payload), device, iface, view),
         .udp => try Udp.handle(buffer, view.get(.payload), device, iface, view),
         else => {
-            const name = std.enums.tagName(Protocol, protocol);
-            if (name) |tag| {
-                std.debug.print(
-                    "IPv4: packet with protocol: {s} unhandled by {s} interface\n",
-                    .{ tag, @tagName(iface) },
-                );
-            } else {
-                std.debug.print(
-                    "IPv4: packet with protocol: {} unhandled by {s} interface\n",
-                    .{ @intFromEnum(protocol), @tagName(iface) },
-                );
-            }
+            std.debug.print(
+                "IPv4: packet with protocol: {f} unhandled by {s} interface\n",
+                .{ Format.enumLabel(protocol), @tagName(iface) },
+            );
             device.release(buffer);
         },
     }
