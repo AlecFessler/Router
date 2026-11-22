@@ -26,11 +26,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    const pcap_file = switch (iface) {
-        .wan => Router.TestFixtures.WanCaptures.isp_to_router,
-        // Captured from the Google router's WAN port, so this is already-NATed traffic.
-        .lan => Router.TestFixtures.WanCaptures.router_to_isp,
-    };
+    const pcap_file = Router.TestFixtures.DHCPv4.pcap_file;
     var mock = try Mock.init(pcap_file, init.gpa);
     defer mock.deinit();
     const mock_nic = mock.api();

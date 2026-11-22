@@ -3,8 +3,15 @@ const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
+const IPv4 = Router.Protocols.IPv4.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
+
+pub var g_wan_lease: DHCPv4Lease = .{};
+
+pub const DHCPv4Lease = struct {
+    ip: IPv4,
+};
 
 pub const DHCPv4Packet = struct {};
 
