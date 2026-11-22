@@ -1,4 +1,5 @@
 .zig-cache/
 zig-out/
+tools/__pycache__/
 test_fixtures/**/*.csv
 test_fixtures/**/*.pcap

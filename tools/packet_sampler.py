@@ -13,10 +13,12 @@ Ctrl+C stops capture and writes a final checkpoint.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import getpass
 import json
 import os
 import shlex
+import signal
 import shutil
 import struct
 import subprocess
@@ -160,8 +162,10 @@ class Collector:
             f"Seen {self.total_seen} | kept {self.total_kept} | "
             f"classes {len(self.buckets)} | pcap {self.bytes_retained / 1048576:.1f} MiB",
             f"Output: {self.args.output / 'samples.pcap'}",
-            "Class                                      seen    kept",
         ]
+        if getattr(self, "status_line", None):
+            rows.append(self.status_line)
+        rows.append("Class                                      seen    kept")
         extra_rows = 1 + bool(self.suppressed_classes)
         capacity = max(0, height - len(rows) - extra_rows - 1)
         classes = sorted(self.buckets.items(), key=lambda item: (item[1].seen, item[0]))
@@ -198,6 +202,7 @@ class Collector:
                 for key, bucket in sorted(self.buckets.items())
             },
         }
+        manifest.update(getattr(self, "extra_manifest", {}))
         target = self.args.output / "manifest.json"
         temporary = target.with_name(target.name + ".tmp")
         temporary.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -225,15 +230,30 @@ def process(stream, args) -> Collector:
     for name in FIELDS:
         command.extend(("-e", name))
     tshark_log = (args.output / "tshark.log").open("wb")
-    try:
-        tshark = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=tshark_log, bufsize=0
-        )
-    except BaseException:
-        tshark_log.close()
-        collector.close()
-        raise
+    tshark = None
+    batch_count = 0
+
+    def stop_tshark(graceful: bool) -> None:
+        nonlocal tshark, batch_count
+        if tshark is None:
+            return
+        proc = tshark
+        tshark = None
+        batch_count = 0
+        if graceful:
+            proc.stdin.close()
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        if graceful and proc.returncode != 0:
+            raise RuntimeError(f"TShark exited with status {proc.returncode}; see {args.output / 'tshark.log'}")
+
+    completed = False
     try:
         while True:
             record_header = read_exact(stream, 16)
@@ -246,8 +266,13 @@ def process(stream, args) -> Collector:
             if payload is None:
                 raise ValueError("pcap stream ended before packet data")
             record = record_header + payload
+            if tshark is None:
+                tshark = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=tshark_log, bufsize=0,
+                )
             try:
-                tshark.stdin.write(record if collector.total_seen else header + record)
+                tshark.stdin.write(record if batch_count else header + record)
                 tshark.stdin.flush()
             except BrokenPipeError as exc:
                 raise RuntimeError("TShark stopped reading the pcap stream") from exc
@@ -258,21 +283,23 @@ def process(stream, args) -> Collector:
             if len(parts) != len(FIELDS):
                 raise ValueError(f"unexpected TShark field count: {len(parts)}")
             values = dict(zip(FIELDS, parts))
-            collector.add(classify(values), int(values["frame.number"]), record)
+            collector.add(classify(values), collector.total_seen + 1, record)
+            batch_count += 1
+            if batch_count >= args.decoder_batch_packets:
+                stop_tshark(graceful=True)
+        stop_tshark(graceful=True)
+        completed = True
     finally:
-        tshark.stdin.close()
         try:
-            tshark.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            tshark.terminate()
-            tshark.wait(timeout=5)
-        tshark_log.close()
-        collector.close()
-    if tshark.returncode != 0:
-        raise RuntimeError(f"TShark exited with status {tshark.returncode}")
+            if not completed:
+                stop_tshark(graceful=False)
+        finally:
+            tshark_log.close()
+            collector.close()
     return collector
 
 
+@contextmanager
 def live_stream(args):
     remote = [
         "sudo",
@@ -307,12 +334,16 @@ def live_stream(args):
             stderr=capture_log, bufsize=0
         )
         terminated_by_us = False
+        interrupted = False
         try:
             password = getpass.getpass(f"{args.host} sudo password: ")
             ssh.stdin.write((password + "\n").encode())
             ssh.stdin.close()
             del password
             yield ssh.stdout
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         finally:
             if ssh.poll() is None:
                 terminated_by_us = True
@@ -322,7 +353,7 @@ def live_stream(args):
             except subprocess.TimeoutExpired:
                 ssh.kill()
                 ssh.wait()
-        if ssh.returncode != 0 and not (terminated_by_us and ssh.returncode == -15):
+        if ssh.returncode != 0 and not (terminated_by_us or interrupted):
             raise RuntimeError(
                 f"SSH/capture exited with status {ssh.returncode}; "
                 f"see {args.output / 'capture.log'}"
@@ -356,6 +387,8 @@ def main() -> int:
     parser.add_argument("--max-classes", type=int, default=256)
     parser.add_argument("--max-total-mib", type=int, default=512)
     parser.add_argument("--max-packet-bytes", type=int, default=262144)
+    parser.add_argument("--decoder-batch-packets", type=int, default=50000,
+                        help="restart TShark after this many packets to bound its memory")
     parser.add_argument("--checkpoint-seconds", type=int, default=60)
     parser.add_argument("--refresh-seconds", type=float, default=2.0)
     args = parser.parse_args()
@@ -365,6 +398,7 @@ def main() -> int:
             args.max_classes,
             args.max_total_mib,
             args.max_packet_bytes,
+            args.decoder_batch_packets,
             args.checkpoint_seconds,
             args.refresh_seconds,
         )
@@ -383,20 +417,18 @@ def main() -> int:
     if not sys.stderr.isatty():
         print(f"samples: {args.output}", file=sys.stderr)
 
+    def interrupt_once(signum, frame):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    previous_sigint = signal.signal(signal.SIGINT, interrupt_once)
     try:
         if args.pcap:
             with args.pcap.open("rb") as stream:
                 collector = process(stream, args)
         else:
-            source = live_stream(args)
-            stream = next(source)
-            try:
+            with live_stream(args) as stream:
                 collector = process(stream, args)
-            finally:
-                try:
-                    next(source)
-                except StopIteration:
-                    pass
     except KeyboardInterrupt:
         if not sys.stderr.isatty():
             print("stopped; final checkpoint saved", file=sys.stderr)
@@ -404,6 +436,8 @@ def main() -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
     if not sys.stderr.isatty():
         print(
             f"done: {collector.total_seen} packets, {len(collector.buckets)} classes",
