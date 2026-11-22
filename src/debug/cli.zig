@@ -19,7 +19,6 @@ const Echo = @import("../protocols/icmpv4/echo.zig");
 const Format = Router.Meta.Format;
 const ICMPv4 = Router.Protocols.ICMPv4;
 const IPv4 = Router.Protocols.IPv4;
-const ParameterProblem = @import("../protocols/icmpv4/parameter_problem.zig");
 const Tcp = Router.Protocols.Tcp;
 const TimeExceeded = @import("../protocols/icmpv4/time_exceeded.zig");
 const Udp = Router.Protocols.Udp;
@@ -35,7 +34,6 @@ pub const EntryPoint = enum {
     echo,
     destination_unreachable,
     time_exceeded,
-    parameter_problem,
     ipv4,
     tcp,
     udp,
@@ -241,12 +239,11 @@ fn printFrame(frame: []const u8) void {
                     std.debug.print("\n", .{});
 
                     const message = icmpv4.get(.payload);
-                    switch (icmpv4.get(.msg_type)) {
+                    switch (icmpv4.get(.message_type)) {
                         .echo_request, .echo_reply => printChild(Echo.EchoMsg, Echo, "Echo", message),
                         .destination_unreachable => printChild(DestinationUnreachable.DestinationUnreachableMsg, DestinationUnreachable, "Destination Unreachable", message),
                         .time_exceeded => printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
-                        .parameter_problem => printChild(ParameterProblem.ParameterProblemMsg, ParameterProblem, "Parameter Problem", message),
-                        else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.msg_type))}),
+                        else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.message_type))}),
                     }
                 },
                 .tcp => {
@@ -310,7 +307,6 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
             .echo => "Echo",
             .destination_unreachable => "Destination Unreachable",
             .time_exceeded => "Time Exceeded",
-            .parameter_problem => "Parameter Problem",
             .ipv4 => "IPv4",
             .tcp => "TCP",
             .udp => "UDP",

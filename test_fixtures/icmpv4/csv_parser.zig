@@ -37,7 +37,7 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]ICMPv4Packet {
 
         _ = try parseDecimal(usize, columns[0]);
         try packets.append(alloc, .{
-            .msg_type = @enumFromInt(try parseDecimal(u8, columns[1])),
+            .message_type = @enumFromInt(try parseDecimal(u8, columns[1])),
             .code = try parseDecimal(u8, columns[2]),
             .checksum = try parseHex(columns[3]),
             .payload = undefined,
