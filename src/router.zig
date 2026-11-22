@@ -10,6 +10,7 @@ test {
     _ = Meta.Checksum;
     _ = Meta.View;
     _ = Protocols.Arp;
+    _ = Protocols.DHCPv4;
     _ = Protocols.Ethernet;
     _ = Protocols.ICMPv4;
     _ = Protocols.IPv4;

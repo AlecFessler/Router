@@ -6,4 +6,5 @@ pub const IPv4 = @import("ipv4/ipv4.zig");
 pub const PcapParser = @import("pcap_parser.zig");
 pub const Tcp = @import("tcp/tcp.zig");
 pub const Udp = @import("udp/udp.zig");
+pub const Utils = @import("utils.zig");
 pub const WanCaptures = @import("wan_captures/wan_captures.zig");

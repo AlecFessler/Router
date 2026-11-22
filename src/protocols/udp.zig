@@ -2,6 +2,7 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const DHCPv4 = Router.Protocols.DHCPv4;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
@@ -46,17 +47,28 @@ pub fn handle(
 ) !void {
     const view = try parse(packet, ip_view);
     Cli.enter(.udp, view);
-    const dst_port = view.get(.dst_port);
-    switch (dst_port) {
-        // in general, check if the router is the recipient ip, if not,
-        // forward the packet, if yes, check if the router has a service
-        // that listens on that port (such as dns or dhcp)
-        else => {
-            std.debug.print(
-                "UDP: packet with dst port: {} unhandled by {s} interface\n",
-                .{ dst_port, @tagName(iface) },
-            );
-            device.release(buffer);
+    switch (iface) {
+        .wan => {
+            if (view.get(.src_port) == 67 and view.get(.dst_port) == 68) {
+                try DHCPv4.handle(buffer, view.get(.payload), device, iface);
+            } else {
+                std.debug.print(
+                    "UDP: packet unhandled by {s} interface\n",
+                    .{@tagName(iface)},
+                );
+                device.release(buffer);
+            }
+        },
+        .lan => {
+            if (view.get(.src_port) == 68 and view.get(.dst_port) == 67) {
+                try DHCPv4.handle(buffer, view.get(.payload), device, iface);
+            } else {
+                std.debug.print(
+                    "UDP: packet unhandled by {s} interface\n",
+                    .{@tagName(iface)},
+                );
+                device.release(buffer);
+            }
         },
     }
 }

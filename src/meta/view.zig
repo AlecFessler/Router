@@ -25,6 +25,7 @@ fn Validation(comptime FieldT: type) type {
             gt: T,
             lte: T,
             gte: T,
+            multiple_of: T,
             eq: FieldT,
         },
         .@"enum" => union(enum) {
@@ -375,6 +376,7 @@ pub fn View(Base: type) type {
                         .gt => |value| actual > value,
                         .lte => |value| actual <= value,
                         .gte => |value| actual >= value,
+                        .multiple_of => |value| value != 0 and @rem(actual, value) == 0,
                         .eq => unreachable,
                     };
                     if (!matches) return error.InvalidField;
@@ -552,11 +554,11 @@ pub fn View(Base: type) type {
             return compare(self, other, .ignore_slices);
         }
 
-        fn printValue(comptime T: type, value: T) void {
+        fn printValue(comptime T: type, value: T, left_pad: usize) void {
             switch (@typeInfo(T)) {
                 .optional => |info| {
                     if (value) |present| {
-                        printValue(info.child, present);
+                        printValue(info.child, present, left_pad);
                     } else {
                         std.debug.print("null", .{});
                     }
@@ -620,9 +622,22 @@ pub fn View(Base: type) type {
                             }
                         },
                         else => {
-                            inline for (0..info.len) |i| {
-                                if (i != 0) std.debug.print(" ", .{});
-                                std.debug.print("{x:0>2}", .{value[i]});
+                            if (info.child == u8 and info.len >= 32) {
+                                for (value, 0..) |byte, i| {
+                                    if (i % 16 == 0) {
+                                        std.debug.print("\n", .{});
+                                        for (0..left_pad + 2) |_| std.debug.print(" ", .{});
+                                        std.debug.print("{x:0>4}: ", .{i});
+                                    } else {
+                                        std.debug.print(" ", .{});
+                                    }
+                                    std.debug.print("{x:0>2}", .{byte});
+                                }
+                            } else {
+                                inline for (0..info.len) |i| {
+                                    if (i != 0) std.debug.print(" ", .{});
+                                    std.debug.print("{x:0>2}", .{value[i]});
+                                }
                             }
                         },
                     }
@@ -644,7 +659,7 @@ pub fn View(Base: type) type {
                 const field_enum = @field(FieldEnum, field.name);
                 for (0..left_pad) |_| std.debug.print(" ", .{});
                 std.debug.print("{s}: ", .{field.name});
-                printValue(field.type, self.get(field_enum));
+                printValue(field.type, self.get(field_enum), left_pad);
                 std.debug.print("\n", .{});
             }
         }
@@ -1175,13 +1190,17 @@ test "View.validate() compares integer fields at boundaries" {
     try view.validate(.test_int, .{ .lte = 0x0806 });
     try view.validate(.test_int, .{ .gt = 0x0805 });
     try view.validate(.test_int, .{ .gte = 0x0806 });
+    try view.validate(.test_int, .{ .multiple_of = 2 });
     try view.validate(.test_high_nibble, .{ .gte = 9 });
+    try view.validate(.test_high_nibble, .{ .multiple_of = 3 });
     try view.validate(.test_optional_int, .{ .gte = 0x8100 });
 
     try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .lt = 0x0806 }));
     try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .lte = 0x0805 }));
     try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .gt = 0x0806 }));
     try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .gte = 0x0807 }));
+    try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .multiple_of = 4 }));
+    try std.testing.expectError(error.InvalidField, view.validate(.test_int, .{ .multiple_of = 0 }));
     try std.testing.expectError(error.InvalidField, view.validate(.test_absent_int, .{ .gte = 0 }));
 }
 

@@ -112,6 +112,91 @@ fn printVlanTags(tags: []const u8) void {
     }
 }
 
+fn printDhcpIp(ip: IPv4.IPv4) void {
+    std.debug.print("{}.{}.{}.{}", .{ ip[0], ip[1], ip[2], ip[3] });
+}
+
+fn printDhcpOptions(options: []const u8) void {
+    var reader: std.Io.Reader = .fixed(options);
+    std.debug.print("DHCPv4 options:\n", .{});
+    while (true) {
+        const offset = reader.seek;
+        const option = DHCPv4.parseOption(&reader) catch |err| {
+            std.debug.print("  parse failed at byte {}: {}\n", .{ offset, err });
+            return;
+        } orelse break;
+
+        switch (option) {
+            inline .subnet_mask, .broadcast_address, .requested_ip_address, .server_id => |ip, tag| {
+                std.debug.print("  {s}: ", .{@tagName(tag)});
+                printDhcpIp(ip);
+                std.debug.print("\n", .{});
+            },
+            inline .router, .dns_servers => |addresses, tag| {
+                std.debug.print("  {s}: ", .{@tagName(tag)});
+                for (addresses, 0..) |ip, i| {
+                    if (i != 0) std.debug.print(", ", .{});
+                    printDhcpIp(ip);
+                }
+                std.debug.print("\n", .{});
+            },
+            inline .host_name, .domain_name => |name, tag| {
+                std.debug.print("  {s}: {s}\n", .{ @tagName(tag), name });
+            },
+            .interface_mtu => |mtu| std.debug.print("  interface_mtu: {} bytes\n", .{mtu}),
+            .static_route => |routes| {
+                std.debug.print("  static_route:\n", .{});
+                for (routes) |route| {
+                    std.debug.print("    ", .{});
+                    printDhcpIp(route.destination);
+                    std.debug.print(" via ", .{});
+                    printDhcpIp(route.router);
+                    std.debug.print("\n", .{});
+                }
+            },
+            inline .lease_time, .renewal_time, .rebinding_time => |duration, tag| {
+                std.debug.print("  {s}: {} seconds\n", .{ @tagName(tag), duration.toSeconds() });
+            },
+            .message_type => |message_type| {
+                if (std.enums.tagName(DHCPv4.MessageType, message_type)) |name| {
+                    std.debug.print("  message_type: {s}\n", .{name});
+                } else {
+                    std.debug.print("  message_type: {}\n", .{@intFromEnum(message_type)});
+                }
+            },
+            .parameter_request_list => |codes| {
+                std.debug.print("  parameter_request_list:\n", .{});
+                for (codes) |code| {
+                    const name = std.enums.tagName(DHCPv4.OptionType, code) orelse "unknown";
+                    std.debug.print("    {} {s}\n", .{ @intFromEnum(code), name });
+                }
+            },
+            .max_message_size => |size| std.debug.print("  max_message_size: {} bytes\n", .{size}),
+            .client_id => |bytes| {
+                std.debug.print("  client_id: ", .{});
+                for (bytes) |byte| std.debug.print("{x:0>2}", .{byte});
+                std.debug.print("\n", .{});
+            },
+            inline .domain_search, .classless_static_route => |bytes, tag| {
+                std.debug.print("  {s} (encoded): ", .{@tagName(tag)});
+                for (bytes) |byte| std.debug.print("{x:0>2}", .{byte});
+                std.debug.print("\n", .{});
+            },
+        }
+    }
+}
+
+fn printDhcpPacket(bytes: []const u8) void {
+    var view = DHCPv4.parse(bytes) catch |err| {
+        std.debug.print("DHCPv4 parse failed: {}\n", .{err});
+        return;
+    };
+    std.debug.print("DHCPv4:\n", .{});
+    view.print(2);
+    printDhcpOptions(view.get(.options));
+    std.debug.print("\n", .{});
+}
+
 fn printChild(comptime Packet: type, comptime Parser: type, name: []const u8, bytes: []const u8) void {
     if (comptime @typeInfo(Packet).@"struct".fields.len == 0) {
         std.debug.print("{s} parser not implemented\n", .{name});
@@ -160,14 +245,10 @@ fn printFrame(frame: []const u8) void {
 
                     const message = icmpv4.get(.payload);
                     switch (icmpv4.get(.msg_type)) {
-                        .echo_request, .echo_reply =>
-                            printChild(Echo.EchoMsg, Echo, "Echo", message),
-                        .destination_unreachable =>
-                            printChild(DestinationUnreachable.DestinationUnreachableMsg, DestinationUnreachable, "Destination Unreachable", message),
-                        .time_exceeded =>
-                            printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
-                        .parameter_problem =>
-                            printChild(ParameterProblem.ParameterProblemMsg, ParameterProblem, "Parameter Problem", message),
+                        .echo_request, .echo_reply => printChild(Echo.EchoMsg, Echo, "Echo", message),
+                        .destination_unreachable => printChild(DestinationUnreachable.DestinationUnreachableMsg, DestinationUnreachable, "Destination Unreachable", message),
+                        .time_exceeded => printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
+                        .parameter_problem => printChild(ParameterProblem.ParameterProblemMsg, ParameterProblem, "Parameter Problem", message),
                         else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.msg_type))}),
                     }
                 },
@@ -194,7 +275,7 @@ fn printFrame(frame: []const u8) void {
                     if ((src_port == 67 and dst_port == 68) or
                         (src_port == 68 and dst_port == 67))
                     {
-                        printChild(DHCPv4.DHCPv4Packet, DHCPv4, "DHCPv4", udp.get(.payload));
+                        printDhcpPacket(udp.get(.payload));
                     } else {
                         std.debug.print("No parser for UDP ports {} -> {}\n", .{ src_port, dst_port });
                     }
@@ -242,6 +323,9 @@ fn printData(entrypoint: EntryPoint, data: anytype) void {
         view.print(2);
         if (comptime T == Ethernet.EthernetFrameView) {
             if (entrypoint == .ethernet) printVlanTags(view.get(.vlan_tags));
+        }
+        if (comptime T == DHCPv4.DHCPv4PacketView) {
+            if (entrypoint == .dhcpv4) printDhcpOptions(view.get(.options));
         }
         std.debug.print("\n", .{});
     } else {
