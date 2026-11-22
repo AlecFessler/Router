@@ -18,7 +18,7 @@ pub const MessageType = enum(u8) {
 };
 
 pub const ICMPv4Packet = struct {
-    msg_type: MessageType,
+    message_type: MessageType,
     code: u8,
     checksum: u16,
     payload: []u8,
@@ -29,14 +29,14 @@ pub const ICMPv4PacketView = View(ICMPv4Packet);
 pub fn validate(view: ICMPv4PacketView) !void {
     if (view.get(.checksum) == 0) return;
     var checksum = view.checksum();
-    checksum.addFields(.msg_type, .payload);
+    checksum.addFields(.message_type, .payload);
     try checksum.validate();
 }
 
 pub fn parse(buffer: []const u8) !ICMPv4PacketView {
     var view: ICMPv4PacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
-    try view.takeFields(.msg_type, .checksum, &reader);
+    try view.takeFields(.message_type, .checksum, &reader);
     try view.takeBytes(.payload, reader.bufferedLen(), &reader);
     try validate(view);
     return view;
@@ -50,12 +50,12 @@ pub fn handle(
 ) !void {
     const view = try parse(packet);
     Cli.enter(.icmpv4, view);
-    const msg_type = view.get(.msg_type);
-    switch (msg_type) {
+    const message_type = view.get(.message_type);
+    switch (message_type) {
         else => {
             std.debug.print(
                 "ICMPv4: packet with type: {f} unhandled by {s} interface\n",
-                .{ Format.enumLabel(msg_type), @tagName(iface) },
+                .{ Format.enumLabel(message_type), @tagName(iface) },
             );
             device.release(buffer);
         },
@@ -66,7 +66,7 @@ const test_packet = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 0x61,
 
 test "parse() reads ICMPv4 fields from wire bytes" {
     const view = try parse(&test_packet);
-    try std.testing.expectEqual(MessageType.echo_request, view.get(.msg_type));
+    try std.testing.expectEqual(MessageType.echo_request, view.get(.message_type));
     try std.testing.expectEqual(@as(u8, 0), view.get(.code));
     try std.testing.expectEqual(@as(u16, 0x2168), view.get(.checksum));
     try std.testing.expectEqualSlices(u8, test_packet[4..], view.get(.payload));
