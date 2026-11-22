@@ -1,3 +1,3 @@
-const DestinationUnreachable = @import("destination_unreachable.zig");
-const Echo = @import("echo.zig");
-const TimeExceeded = @import("time_exceeded.zig");
+pub const DestinationUnreachable = @import("destination_unreachable.zig");
+pub const Echo = @import("echo.zig");
+pub const TimeExceeded = @import("time_exceeded.zig");

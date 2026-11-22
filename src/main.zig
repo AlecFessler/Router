@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    const pcap_file = Router.TestFixtures.DHCPv4.pcap_file;
+    const pcap_file = Router.TestFixtures.ICMPv4.message_types_pcap_file;
     var mock = try Mock.init(pcap_file, init.gpa);
     defer mock.deinit();
     const mock_nic = mock.api();

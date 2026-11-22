@@ -2,11 +2,14 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const DestinationUnreachable = Router.Protocols.ICMPv4Messages.DestinationUnreachable;
+const Echo = Router.Protocols.ICMPv4Messages.Echo;
 const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const NicApi = Router.Nic.Api.Api;
+const TimeExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded;
 const View = Router.Meta.View.View;
 
 pub const MessageType = enum(u8) {
@@ -44,7 +47,7 @@ pub fn parse(buffer: []const u8) !ICMPv4PacketView {
 
 pub fn handle(
     buffer: []u8, // the full ethernet frame
-    packet: []u8, // the ipv4 payload
+    packet: []u8,
     device: NicApi,
     iface: IFace,
 ) !void {
@@ -52,6 +55,15 @@ pub fn handle(
     Cli.enter(.icmpv4, view);
     const message_type = view.get(.message_type);
     switch (message_type) {
+        //.echo_reply, .echo_request => {
+        //    try Echo.handle(buffer, view, device, iface);
+        //},
+        //.destination_unreachable => {
+        //    try DestinationUnreachable.handle(buffer, view, device, iface);
+        //},
+        //.time_exceeded => {
+        //    try TimeExceeded.handle(buffer, view, device, iface);
+        //},
         else => {
             std.debug.print(
                 "ICMPv4: packet with type: {f} unhandled by {s} interface\n",

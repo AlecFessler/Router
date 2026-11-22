@@ -2,6 +2,8 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const Format = Router.Meta.Format;
+const ICMPv4PacketView = Router.Protocols.ICMPv4.ICMPv4PacketView;
 const IFace = Router.Nic.Api.IFace;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
@@ -20,12 +22,14 @@ pub fn parse(buffer: []const u8) !TimeExceeddedMsgView {
 
 pub fn handle(
     buffer: []u8, // the full ethernet frame
-    packet: []u8,
+    icmpv4_view: ICMPv4PacketView,
     device: NicApi,
     iface: IFace,
 ) !void {
-    _ = iface;
-    const view = try parse(packet);
+    const view = try parse(icmpv4_view.get(.payload));
     Cli.enter(.time_exceeded, view);
+    std.debug.print("ICMPv4: packet with type {f} code {} unhandled by {s} interface\n", .{
+        Format.enumLabel(icmpv4_view.get(.message_type)), icmpv4_view.get(.code), @tagName(iface),
+    });
     device.release(buffer);
 }
