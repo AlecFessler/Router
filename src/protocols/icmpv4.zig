@@ -12,10 +12,8 @@ const View = Router.Meta.View.View;
 pub const MessageType = enum(u8) {
     echo_reply = 0,
     destination_unreachable = 3,
-    redirect = 5,
     echo_request = 8,
     time_exceeded = 11,
-    parameter_problem = 12,
     _,
 };
 
