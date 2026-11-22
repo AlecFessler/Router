@@ -9,7 +9,7 @@ const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
 
-pub const MsgType = enum(u8) {
+pub const MessageType = enum(u8) {
     echo_reply = 0,
     destination_unreachable = 3,
     redirect = 5,
@@ -20,7 +20,7 @@ pub const MsgType = enum(u8) {
 };
 
 pub const ICMPv4Packet = struct {
-    msg_type: MsgType,
+    msg_type: MessageType,
     code: u8,
     checksum: u16,
     payload: []u8,
@@ -68,7 +68,7 @@ const test_packet = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 0x61,
 
 test "parse() reads ICMPv4 fields from wire bytes" {
     const view = try parse(&test_packet);
-    try std.testing.expectEqual(MsgType.echo_request, view.get(.msg_type));
+    try std.testing.expectEqual(MessageType.echo_request, view.get(.msg_type));
     try std.testing.expectEqual(@as(u8, 0), view.get(.code));
     try std.testing.expectEqual(@as(u16, 0x2168), view.get(.checksum));
     try std.testing.expectEqualSlices(u8, test_packet[4..], view.get(.payload));
