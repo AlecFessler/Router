@@ -256,6 +256,37 @@ test "parseVlanTag() reads VLAN bit fields" {
     try std.testing.expectEqual(@as(u12, 100), view.get(.vid));
 }
 
+test "parse() on captured frames matches Wireshark's Ethernet fields" {
+    const PcapParser = Router.TestFixtures.PcapParser;
+    const CsvParser = Router.TestFixtures.Ethernet.CsvParser;
+    var parsed_pcap = try PcapParser.parse(Router.TestFixtures.Ethernet.pcap_file, std.testing.allocator);
+    defer parsed_pcap.deinit(std.testing.allocator);
+    const parsed_frames = try CsvParser.parse(Router.TestFixtures.Ethernet.csv_file, std.testing.allocator);
+    defer std.testing.allocator.free(parsed_frames);
+
+    try std.testing.expectEqual(parsed_pcap.packet_bytes.len, parsed_frames.len);
+    for (parsed_frames, parsed_pcap.packet_bytes, 0..) |expected, packet, i| {
+        try std.testing.expectEqual(i + 1, expected.number);
+        const view = try parse(packet);
+        try std.testing.expectEqualDeep(expected.dst_mac, view.get(.dst_mac));
+        try std.testing.expectEqualDeep(expected.src_mac, view.get(.src_mac));
+        try std.testing.expectEqual(expected.ethertype, view.get(.ethertype));
+
+        const tags = view.get(.vlan_tags);
+        if (expected.vlan) |vlan| {
+            try std.testing.expectEqual(@as(usize, 4), tags.len);
+            var reader: std.Io.Reader = .fixed(tags);
+            const tag = try parseVlanTag(&reader);
+            try std.testing.expectEqual(vlan.tpid, tag.get(.tpid));
+            try std.testing.expectEqual(vlan.pcp, tag.get(.pcp));
+            try std.testing.expectEqual(vlan.dei, tag.get(.dei));
+            try std.testing.expectEqual(vlan.vid, tag.get(.vid));
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), tags.len);
+        }
+    }
+}
+
 test "parse() then serialize() returns the original bytes" {
     const PcapParser = Router.TestFixtures.PcapParser;
     const pcap_file = Router.TestFixtures.Ethernet.pcap_file;

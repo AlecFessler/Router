@@ -86,6 +86,26 @@ test "parse() rejects nonzero echo code and non-echo message type" {
     try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&packet)));
 }
 
+test "parse() on captured echo frames matches Wireshark's fields" {
+    const PcapParser = Router.TestFixtures.PcapParser;
+    const CsvParser = Router.TestFixtures.ICMPv4.EchoCsvParser;
+    var parsed_pcap = try PcapParser.parse(Router.TestFixtures.ICMPv4.pcap_file, std.testing.allocator);
+    defer parsed_pcap.deinit(std.testing.allocator);
+    const rows = try CsvParser.parse(Router.TestFixtures.ICMPv4.echo_csv_file, std.testing.allocator);
+    defer std.testing.allocator.free(rows);
+
+    try std.testing.expectEqual(parsed_pcap.packet_bytes.len, rows.len);
+    for (rows) |expected| {
+        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[expected.frame_number - 1]);
+        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
+        const icmpv4_view = try Router.Protocols.ICMPv4.parse(ip_view.get(.payload));
+        try std.testing.expectEqual(expected.message_type, icmpv4_view.get(.message_type));
+        const view = try parse(icmpv4_view);
+        try std.testing.expectEqual(expected.identifier, view.get(.identifier));
+        try std.testing.expectEqual(expected.sequence_number, view.get(.sequence_number));
+    }
+}
+
 test "parse() then serialize() returns captured echo message bytes" {
     const PcapParser = Router.TestFixtures.PcapParser;
     const pcap_file = Router.TestFixtures.ICMPv4.pcap_file;

@@ -1,85 +1,64 @@
 const std = @import("std");
 const Router = @import("router");
 
-const EthernetFrame = Router.Protocols.Ethernet.EthernetFrame;
-const Mac = Router.Protocols.Ethernet.Mac;
+const Ethernet = Router.Protocols.Ethernet;
+const Mac = Ethernet.Mac;
+
+pub const Frame = struct {
+    number: usize,
+    dst_mac: Mac,
+    src_mac: Mac,
+    ethertype: Ethernet.Ethertype,
+    vlan: ?Ethernet.VlanTag,
+};
 
 fn parseMac(str: []const u8) !Mac {
     var parts = std.mem.splitScalar(u8, str, ':');
     var mac: Mac = undefined;
     for (&mac) |*byte| {
-        const hex = parts.next() orelse return error.InvalidMac;
-        byte.* = try std.fmt.parseInt(u8, hex, 16);
+        byte.* = try std.fmt.parseInt(u8, parts.next() orelse return error.InvalidMac, 16);
     }
+    if (parts.next() != null) return error.InvalidMac;
     return mac;
 }
 
-pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]EthernetFrame {
-    var reader: std.Io.Reader = .fixed(file);
+fn parseHex(str: []const u8) !u16 {
+    if (!std.mem.startsWith(u8, str, "0x")) return error.UnexpectedFileFormat;
+    return std.fmt.parseInt(u16, str[2..], 16);
+}
 
-    var frames: std.ArrayList(EthernetFrame) = .empty;
+pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]Frame {
+    var frames: std.ArrayList(Frame) = .empty;
     defer frames.deinit(alloc);
 
-    _ = try reader.takeDelimiter('\n') orelse return error.UnexpectedFileFormat; // skip header line
+    var lines = std.mem.splitScalar(u8, file, '\n');
+    _ = lines.next() orelse return error.UnexpectedFileFormat;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var columns: [9][]const u8 = undefined;
+        var parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, line, "\r"), ',');
+        for (&columns) |*column| column.* = parts.next() orelse return error.UnexpectedFileFormat;
+        if (parts.next() != null) return error.UnexpectedFileFormat;
 
-    while (true) {
-        const row = try reader.takeDelimiter('\n') orelse break;
-        var row_reader: std.Io.Reader = .fixed(row);
-
-        _ = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat; // skip the frame number
-        const dst_mac_str = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat;
-        const src_mac_str = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat;
-        const ethertype_str = try row_reader.takeDelimiter(',') orelse return error.UnexpecetedFileFormat;
-        const len_str = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat;
-        const vlan_vid_str = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat;
-        const vlan_pcp_str = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat;
-        const vlan_dei_str = try row_reader.takeDelimiter(',') orelse return error.UnexpectedFileFormat;
-        const vlan_etype_str = row_reader.buffer[row_reader.seek..row_reader.end];
-
-        var frame: EthernetFrame = undefined;
-
-        frame.dst_mac = try parseMac(dst_mac_str);
-        frame.src_mac = try parseMac(src_mac_str);
-
-        if (ethertype_str.len != 0) {
-            // trim the 0x or else parseInt errors
-            frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, ethertype_str[2..], 16));
-        } else { // is IEEE 802.3 frame
-            if (len_str.len == 0) {
-                return error.UnexpectedFileFormat;
-            }
-            frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, len_str, 10));
-        }
-
-        if (vlan_vid_str.len != 0) {
-            if (vlan_pcp_str.len == 0 or vlan_dei_str.len == 0 or vlan_etype_str.len == 0) {
-                return error.UnexpectedFileFormat;
-            }
-
-            // if a vlan tag is present, wireshark uses vlan.etype for the ethertype
-            // trim the 0x or else parseInt errors
-            frame.ethertype = @enumFromInt(try std.fmt.parseInt(u16, vlan_etype_str[2..], 16));
-
-            frame.tpid = .tpid;
-            frame.vid = try std.fmt.parseInt(u12, vlan_vid_str, 10);
-            frame.pcp = try std.fmt.parseInt(u3, vlan_pcp_str, 10);
-
-            if (std.mem.eql(u8, vlan_dei_str, "True")) {
-                frame.dei = true;
-            } else if (std.mem.eql(u8, vlan_dei_str, "False")) {
-                frame.dei = false;
-            } else {
-                return error.UnexpectedFileFormat;
-            }
-        } else {
-            frame.tpid = null;
-            frame.pcp = null;
-            frame.dei = null;
-            frame.vid = null;
-        }
-
-        try frames.append(alloc, frame);
+        const has_vlan = columns[5].len != 0;
+        const type_text = if (has_vlan) columns[8] else columns[3];
+        const raw_type: u16 = if (type_text.len != 0)
+            try parseHex(type_text)
+        else
+            try std.fmt.parseInt(u16, columns[4], 10);
+        const vlan: ?Ethernet.VlanTag = if (has_vlan) .{
+            .tpid = @enumFromInt(try parseHex(columns[3])),
+            .pcp = try std.fmt.parseInt(u3, columns[6], 10),
+            .dei = if (std.mem.eql(u8, columns[7], "True")) true else if (std.mem.eql(u8, columns[7], "False")) false else return error.UnexpectedFileFormat,
+            .vid = try std.fmt.parseInt(u12, columns[5], 10),
+        } else null;
+        try frames.append(alloc, .{
+            .number = try std.fmt.parseInt(usize, columns[0], 10),
+            .dst_mac = try parseMac(columns[1]),
+            .src_mac = try parseMac(columns[2]),
+            .ethertype = @enumFromInt(raw_type),
+            .vlan = vlan,
+        });
     }
-
-    return try frames.toOwnedSlice(alloc);
+    return frames.toOwnedSlice(alloc);
 }
