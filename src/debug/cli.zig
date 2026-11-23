@@ -9,6 +9,7 @@
 //!    Keep a clear "No parser" message for unmatched values.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
@@ -354,6 +355,7 @@ fn shouldPause(entrypoint: EntryPoint, ptr: usize) bool {
 }
 
 pub fn enter(entrypoint: EntryPoint, data: anytype) void {
+    if (builtin.is_test or builtin.mode != .Debug) return;
     const ptr = dataPointer(data);
     if (entrypoint == .rx) {
         rx_count += 1;

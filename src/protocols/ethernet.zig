@@ -156,7 +156,7 @@ pub fn handle(
     const ethertype = view.get(.ethertype);
     switch (ethertype) {
         .ipv4 => try IPv4.handle(buffer, view.get(.payload), device, iface),
-        .arp => try Arp.handle(buffer, view.get(.payload), device, iface),
+        .arp => try Arp.handle(buffer, view.get(.payload), view, device, iface),
         else => {
             std.debug.print(
                 "Ethernet: packet with ethertype {f} unhandled by {s} interface\n",

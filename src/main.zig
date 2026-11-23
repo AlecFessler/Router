@@ -32,8 +32,14 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    State.arp_table = try Tables.ArpTable.ArpTable.init(init.gpa, init.io, ARP_CAPACITY, ARP_TTL);
-    defer State.arp_table.deinit(init.gpa);
+    State.lan_ip = .{ 192, 168, 86, 1 };
+    State.lan_subnet_mask = .{ 255, 255, 255, 0 };
+
+    State.lan_arp_table = try Tables.ArpTable.ArpTable.init(init.gpa, init.io, ARP_CAPACITY, ARP_TTL);
+    defer State.lan_arp_table.deinit(init.gpa);
+
+    State.wan_arp_table = try Tables.ArpTable.ArpTable.init(init.gpa, init.io, ARP_CAPACITY, ARP_TTL);
+    defer State.wan_arp_table.deinit(init.gpa);
 
     State.dhcp_table = blk: {
         var ip_pool: Tables.DhcpTable.DhcpTable.IpPool = .empty;
