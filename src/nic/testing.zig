@@ -4,6 +4,7 @@ const Router = @import("router");
 const Api = Router.Nic.Api.Api;
 const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
+const Mac = Router.Protocols.Ethernet.Mac;
 const PcapParser = Router.TestFixtures.PcapParser;
 const ParsedPCAP = Router.TestFixtures.PcapParser.ParsedPCAP;
 
@@ -27,6 +28,7 @@ pub const Mock = struct {
             .vtable = &.{
                 .receive = receive,
                 .nextTxBuffer = nextTxBuffer,
+                .macAddress = macAddress,
                 .release = release,
                 .transmit = transmit,
             },
@@ -89,6 +91,14 @@ pub const Mock = struct {
             .wan => .tx_wan,
         });
         return buffer;
+    }
+
+    fn macAddress(ctx: *anyopaque, iface: IFace) Mac {
+        _ = ctx;
+        return switch (iface) {
+            .lan => .{ 0x02, 0, 0, 0, 0, 1 },
+            .wan => .{ 0x02, 0, 0, 0, 0, 2 },
+        };
     }
 
     fn release(ctx: *anyopaque, buffer: []u8) void {

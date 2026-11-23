@@ -1,3 +1,5 @@
+const Mac = @import("../protocols/ethernet.zig").Mac;
+
 pub const IFace = enum {
     lan,
     wan,
@@ -10,6 +12,7 @@ pub const Api = struct {
     pub const VTable = struct {
         receive: *const fn (ctx: *anyopaque, iface: IFace) ?[]u8,
         nextTxBuffer: *const fn (ctx: *anyopaque, iface: IFace) []u8,
+        macAddress: *const fn (ctx: *anyopaque, iface: IFace) Mac,
         release: *const fn (ctx: *anyopaque, buffer: []u8) void,
         transmit: *const fn (ctx: *anyopaque, buffer: []u8) void,
     };
@@ -20,6 +23,10 @@ pub const Api = struct {
 
     pub fn nextTxBuffer(self: Api, iface: IFace) []u8 {
         return self.vtable.nextTxBuffer(self.ptr, iface);
+    }
+
+    pub fn macAddress(self: Api, iface: IFace) Mac {
+        return self.vtable.macAddress(self.ptr, iface);
     }
 
     pub fn release(self: Api, buffer: []u8) void {
