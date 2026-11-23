@@ -17,4 +17,5 @@ test {
     _ = Protocols.Udp;
     _ = Tables.ArpTable;
     _ = Tables.DhcpTable;
+    _ = Tables.NatTable;
 }
