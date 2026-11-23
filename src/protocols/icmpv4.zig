@@ -61,9 +61,9 @@ pub fn handle(
         .echo_reply, .echo_request => {
             try Echo.handle(buffer, view, device, iface);
         },
-        //.destination_unreachable => {
-        //    try DestinationUnreachable.handle(buffer, view, device, iface);
-        //},
+        .destination_unreachable => {
+            try DestinationUnreachable.handle(buffer, view, device, iface);
+        },
         //.time_exceeded => {
         //    try TimeExceeded.handle(buffer, view, device, iface);
         //},

@@ -216,6 +216,17 @@ fn printEcho(icmpv4: ICMPv4.ICMPv4PacketView) void {
     std.debug.print("\n", .{});
 }
 
+fn printDestinationUnreachable(icmpv4: ICMPv4.ICMPv4PacketView) void {
+    var view = DestinationUnreachable.parse(icmpv4) catch |err| {
+        std.debug.print("Destination Unreachable parse failed: {}\n", .{err});
+        return;
+    };
+    const code: DestinationUnreachable.Code = @enumFromInt(icmpv4.get(.code));
+    std.debug.print("Destination Unreachable ({f}):\n", .{Format.enumLabel(code)});
+    view.print(2);
+    std.debug.print("\n", .{});
+}
+
 fn printFrame(frame: []const u8) void {
     var ethernet = Ethernet.parse(frame) catch |err| {
         std.debug.print("Ethernet parse failed: {}\n", .{err});
@@ -251,7 +262,7 @@ fn printFrame(frame: []const u8) void {
                     const message = icmpv4.get(.payload);
                     switch (icmpv4.get(.message_type)) {
                         .echo_request, .echo_reply => printEcho(icmpv4),
-                        .destination_unreachable => printChild(DestinationUnreachable.DestinationUnreachableMsg, DestinationUnreachable, "Destination Unreachable", message),
+                        .destination_unreachable => printDestinationUnreachable(icmpv4),
                         .time_exceeded => printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
                         else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.message_type))}),
                     }
