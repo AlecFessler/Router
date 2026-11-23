@@ -64,9 +64,9 @@ pub fn handle(
         .destination_unreachable => {
             try DestinationUnreachable.handle(buffer, view, device, iface);
         },
-        //.time_exceeded => {
-        //    try TimeExceeded.handle(buffer, view, device, iface);
-        //},
+        .time_exceeded => {
+            try TimeExceeded.handle(buffer, view, device, iface);
+        },
         else => {
             std.debug.print(
                 "ICMPv4: packet with type: {f} unhandled by {s} interface\n",

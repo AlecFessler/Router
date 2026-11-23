@@ -14,6 +14,7 @@ test {
     _ = Protocols.ICMPv4;
     _ = Protocols.ICMPv4Messages.DestinationUnreachable;
     _ = Protocols.ICMPv4Messages.Echo;
+    _ = Protocols.ICMPv4Messages.TimeExceeded;
     _ = Protocols.IPv4;
     _ = Protocols.Tcp;
     _ = Protocols.Udp;

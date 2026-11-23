@@ -192,20 +192,6 @@ fn printDhcpPacket(bytes: []const u8) void {
     std.debug.print("\n", .{});
 }
 
-fn printChild(comptime Packet: type, comptime Parser: type, name: []const u8, bytes: []const u8) void {
-    if (comptime @typeInfo(Packet).@"struct".fields.len == 0) {
-        std.debug.print("{s} parser not implemented\n", .{name});
-    } else {
-        var view = Parser.parse(bytes) catch |err| {
-            std.debug.print("{s} parse failed: {}\n", .{ name, err });
-            return;
-        };
-        std.debug.print("{s}:\n", .{name});
-        view.print(2);
-        std.debug.print("\n", .{});
-    }
-}
-
 fn printEcho(icmpv4: ICMPv4.ICMPv4PacketView) void {
     var view = Echo.parse(icmpv4) catch |err| {
         std.debug.print("Echo parse failed: {}\n", .{err});
@@ -223,6 +209,17 @@ fn printDestinationUnreachable(icmpv4: ICMPv4.ICMPv4PacketView) void {
     };
     const code: DestinationUnreachable.Code = @enumFromInt(icmpv4.get(.code));
     std.debug.print("Destination Unreachable ({f}):\n", .{Format.enumLabel(code)});
+    view.print(2);
+    std.debug.print("\n", .{});
+}
+
+fn printTimeExceeded(icmpv4: ICMPv4.ICMPv4PacketView) void {
+    var view = TimeExceeded.parse(icmpv4) catch |err| {
+        std.debug.print("Time Exceeded parse failed: {}\n", .{err});
+        return;
+    };
+    const code: TimeExceeded.Code = @enumFromInt(icmpv4.get(.code));
+    std.debug.print("Time Exceeded ({f}):\n", .{Format.enumLabel(code)});
     view.print(2);
     std.debug.print("\n", .{});
 }
@@ -259,11 +256,10 @@ fn printFrame(frame: []const u8) void {
                     icmpv4.print(2);
                     std.debug.print("\n", .{});
 
-                    const message = icmpv4.get(.payload);
                     switch (icmpv4.get(.message_type)) {
                         .echo_request, .echo_reply => printEcho(icmpv4),
                         .destination_unreachable => printDestinationUnreachable(icmpv4),
-                        .time_exceeded => printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
+                        .time_exceeded => printTimeExceeded(icmpv4),
                         else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.message_type))}),
                     }
                 },
