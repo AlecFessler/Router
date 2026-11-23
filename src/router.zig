@@ -16,4 +16,5 @@ test {
     _ = Protocols.Tcp;
     _ = Protocols.Udp;
     _ = Tables.ArpTable;
+    _ = Tables.DhcpTable;
 }
