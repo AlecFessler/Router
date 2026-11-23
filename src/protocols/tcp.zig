@@ -5,7 +5,10 @@ const Cli = Router.Debug.Cli;
 const IFace = Router.Nic.Api.IFace;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const NicApi = Router.Nic.Api.Api;
+const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const View = Router.Meta.View.View;
+
+var port_allocator: PortAllocator = .{};
 
 pub const TcpPacket = struct {
     src_port: u16,

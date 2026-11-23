@@ -9,8 +9,11 @@ const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const NicApi = Router.Nic.Api.Api;
+const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const TimeExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded;
 const View = Router.Meta.View.View;
+
+var port_allocator: PortAllocator = .{};
 
 pub const MessageType = enum(u8) {
     echo_reply = 0,
