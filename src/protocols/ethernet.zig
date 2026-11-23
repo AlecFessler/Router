@@ -117,8 +117,7 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     var frame_view: EthernetFrameView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
-    try frame_view.takeField(.dst_mac, &reader);
-    try frame_view.takeField(.src_mac, &reader);
+    try frame_view.takeFields(.dst_mac, .src_mac, &reader);
 
     var tpid_seek: std.Io.Reader = .fixed(buffer[reader.seek..]);
     var tag_bytes: usize = 0;

@@ -149,8 +149,7 @@ pub fn parseOption(reader: *std.Io.Reader) !?OptionValue {
         }
 
         var view: OptionView = undefined;
-        try view.takeField(.code, reader);
-        try view.takeField(.len, reader);
+        try view.takeFields(.code, .len, reader);
         try view.takeBytes(.data, view.get(.len), reader);
 
         const data = view.get(.data);
