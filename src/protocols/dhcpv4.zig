@@ -9,10 +9,14 @@ const Mac = Router.Protocols.Ethernet.Mac;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
 
-pub var g_wan_lease: DHCPv4Lease = .{};
-
 pub const DHCPv4Lease = struct {
     ip: IPv4,
+    subnet_mask: IPv4,
+    router: IPv4,
+    server_id: IPv4,
+    renewal_deadline: std.Io.Timestamp,
+    rebinding_deadline: std.Io.Timestamp,
+    expiration_deadline: std.Io.Timestamp,
 };
 
 pub const Op = enum(u8) {
