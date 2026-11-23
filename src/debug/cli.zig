@@ -206,6 +206,16 @@ fn printChild(comptime Packet: type, comptime Parser: type, name: []const u8, by
     }
 }
 
+fn printEcho(icmpv4: ICMPv4.ICMPv4PacketView) void {
+    var view = Echo.parse(icmpv4) catch |err| {
+        std.debug.print("Echo parse failed: {}\n", .{err});
+        return;
+    };
+    std.debug.print("Echo:\n", .{});
+    view.print(2);
+    std.debug.print("\n", .{});
+}
+
 fn printFrame(frame: []const u8) void {
     var ethernet = Ethernet.parse(frame) catch |err| {
         std.debug.print("Ethernet parse failed: {}\n", .{err});
@@ -240,7 +250,7 @@ fn printFrame(frame: []const u8) void {
 
                     const message = icmpv4.get(.payload);
                     switch (icmpv4.get(.message_type)) {
-                        .echo_request, .echo_reply => printChild(Echo.EchoMsg, Echo, "Echo", message),
+                        .echo_request, .echo_reply => printEcho(icmpv4),
                         .destination_unreachable => printChild(DestinationUnreachable.DestinationUnreachableMsg, DestinationUnreachable, "Destination Unreachable", message),
                         .time_exceeded => printChild(TimeExceeded.TimeExceeddedMsg, TimeExceeded, "Time Exceeded", message),
                         else => std.debug.print("No parser for ICMPv4 type {}\n", .{@intFromEnum(icmpv4.get(.message_type))}),

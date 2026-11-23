@@ -12,6 +12,7 @@ test {
     _ = Protocols.DHCPv4;
     _ = Protocols.Ethernet;
     _ = Protocols.ICMPv4;
+    _ = Protocols.ICMPv4Messages.Echo;
     _ = Protocols.IPv4;
     _ = Protocols.Tcp;
     _ = Protocols.Udp;

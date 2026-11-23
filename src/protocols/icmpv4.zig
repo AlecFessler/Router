@@ -58,9 +58,9 @@ pub fn handle(
     Cli.enter(.icmpv4, view);
     const message_type = view.get(.message_type);
     switch (message_type) {
-        //.echo_reply, .echo_request => {
-        //    try Echo.handle(buffer, view, device, iface);
-        //},
+        .echo_reply, .echo_request => {
+            try Echo.handle(buffer, view, device, iface);
+        },
         //.destination_unreachable => {
         //    try DestinationUnreachable.handle(buffer, view, device, iface);
         //},

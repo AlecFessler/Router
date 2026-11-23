@@ -2,22 +2,34 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
-const Format = Router.Meta.Format;
 const ICMPv4PacketView = Router.Protocols.ICMPv4.ICMPv4PacketView;
 const IFace = Router.Nic.Api.IFace;
 const NicApi = Router.Nic.Api.Api;
 const View = Router.Meta.View.View;
 
-pub const EchoMsg = struct {};
+pub const EchoMsg = struct {
+    identifier: u16,
+    sequence_number: u16,
+    data: []u8,
+};
 
 pub const EchoMsgView = View(EchoMsg);
 
-pub fn validate(view: EchoMsgView) !void {
-    _ = view;
+pub fn validate(icmpv4_view: ICMPv4PacketView) !void {
+    switch (icmpv4_view.get(.message_type)) {
+        .echo_request, .echo_reply => {},
+        else => return error.InvalidField,
+    }
+    try icmpv4_view.validate(.code, .{ .eq = 0 });
 }
 
-pub fn parse(buffer: []const u8) !EchoMsgView {
-    _ = buffer;
+pub fn parse(icmpv4_view: ICMPv4PacketView) !EchoMsgView {
+    var view: EchoMsgView = undefined;
+    var reader: std.Io.Reader = .fixed(icmpv4_view.get(.payload));
+    try view.takeFields(.identifier, .sequence_number, &reader);
+    try view.takeBytes(.data, reader.bufferedLen(), &reader);
+    try validate(icmpv4_view);
+    return view;
 }
 
 pub fn handle(
@@ -26,10 +38,78 @@ pub fn handle(
     device: NicApi,
     iface: IFace,
 ) !void {
-    const view = try parse(icmpv4_view.get(.payload));
+    const view = try parse(icmpv4_view);
     Cli.enter(.echo, view);
-    std.debug.print("ICMPv4: packet with type {f} code {} unhandled by {s} interface\n", .{
-        Format.enumLabel(icmpv4_view.get(.message_type)), icmpv4_view.get(.code), @tagName(iface),
-    });
+    switch (icmpv4_view.get(.message_type)) {
+        .echo_request => std.debug.print("ICMPv4 echo request unhandled by {s} interface\n", .{@tagName(iface)}),
+        .echo_reply => std.debug.print("ICMPv4 echo reply unhandled by {s} interface\n", .{@tagName(iface)}),
+        else => unreachable,
+    }
     device.release(buffer);
+}
+
+const test_request = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 'a', 'b', 'c' };
+const test_reply = [_]u8{ 0x00, 0x00, 0x29, 0x68, 0x12, 0x34, 0x00, 0x01, 'a', 'b', 'c' };
+
+test "parse() reads echo request and reply fields" {
+    const ICMPv4 = Router.Protocols.ICMPv4;
+    inline for (.{ test_request, test_reply }) |packet| {
+        const icmpv4_view = try ICMPv4.parse(&packet);
+        const view = try parse(icmpv4_view);
+        try std.testing.expectEqual(@as(u16, 0x1234), view.get(.identifier));
+        try std.testing.expectEqual(@as(u16, 1), view.get(.sequence_number));
+        try std.testing.expectEqualSlices(u8, "abc", view.get(.data));
+    }
+}
+
+test "parse() accepts empty data and rejects truncated echo fields" {
+    const ICMPv4 = Router.Protocols.ICMPv4;
+    const packet = [_]u8{ 0x08, 0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01 };
+    for (0..4) |body_len| {
+        const icmpv4_view = try ICMPv4.parse(packet[0 .. 4 + body_len]);
+        try std.testing.expectError(error.EndOfStream, parse(icmpv4_view));
+    }
+    const icmpv4_view = try ICMPv4.parse(&packet);
+    const view = try parse(icmpv4_view);
+    try std.testing.expectEqual(@as(usize, 0), view.get(.data).len);
+}
+
+test "parse() rejects nonzero echo code and non-echo message type" {
+    const ICMPv4 = Router.Protocols.ICMPv4;
+    var packet = test_request;
+    packet[1] = 1;
+    packet[2] = 0;
+    packet[3] = 0;
+    try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&packet)));
+    packet[0] = 3;
+    packet[1] = 0;
+    try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&packet)));
+}
+
+test "parse() then serialize() returns captured echo message bytes" {
+    const PcapParser = Router.TestFixtures.PcapParser;
+    const pcap_file = Router.TestFixtures.ICMPv4.pcap_file;
+    var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
+    defer parsed_pcap.deinit(std.testing.allocator);
+
+    var echo_count: usize = 0;
+    for (parsed_pcap.packet_bytes) |packet| {
+        const frame = try Router.Protocols.Ethernet.parse(packet);
+        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
+        const icmpv4_view = try Router.Protocols.ICMPv4.parse(ip_view.get(.payload));
+        switch (icmpv4_view.get(.message_type)) {
+            .echo_request, .echo_reply => {},
+            else => continue,
+        }
+        echo_count += 1;
+        var view = try parse(icmpv4_view);
+        const message = icmpv4_view.get(.payload);
+        const buffer = try std.testing.allocator.alloc(u8, message.len);
+        defer std.testing.allocator.free(buffer);
+        var writer: std.Io.Writer = .fixed(buffer);
+        try EchoMsgView.serialize(view.copy(), &writer);
+        try std.testing.expectEqual(message.len, writer.end);
+        try std.testing.expectEqualSlices(u8, message, buffer);
+    }
+    try std.testing.expect(echo_count > 0);
 }
