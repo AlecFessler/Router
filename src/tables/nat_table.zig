@@ -47,7 +47,6 @@ pub const PortAllocator = struct {
     }
 };
 
-// There is intended to be one global NAT table
 pub const NatTable = struct {
     pub const Key = struct {
         protocol: Protocol,
@@ -60,17 +59,31 @@ pub const NatTable = struct {
         deadline: std.Io.Timestamp,
     };
 
+    const Mapping = struct {
+        entry: Entry,
+        port_allocator: *PortAllocator,
+    };
+
     io: std.Io,
-    inside: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
+    capacity: usize,
+    inside: std.AutoArrayHashMapUnmanaged(Key, Mapping) = .empty,
     outside: std.AutoHashMapUnmanaged(Key, Key) = .empty,
 
-    pub fn init(io: std.Io) NatTable {
-        return .{
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, capacity: u32) !NatTable {
+        var table: NatTable = .{
             .io = io,
+            .capacity = capacity,
         };
+        errdefer table.deinit(alloc);
+        try table.inside.ensureTotalCapacity(alloc, capacity);
+        try table.outside.ensureTotalCapacity(alloc, capacity);
+        return table;
     }
 
     pub fn deinit(self: *NatTable, alloc: std.mem.Allocator) void {
+        for (self.inside.values()) |mapping| {
+            mapping.port_allocator.release(mapping.entry.outside.port);
+        }
         self.inside.deinit(alloc);
         self.outside.deinit(alloc);
     }
@@ -79,32 +92,15 @@ pub const NatTable = struct {
         return deadline.durationTo(now).toNanoseconds() >= 0;
     }
 
-    pub fn reclaimExpired(self: *NatTable, protocol: Protocol, port_allocator: *PortAllocator) void {
-        const now = std.Io.Timestamp.now(self.io, .boot);
-        var index: usize = 0;
-        while (index < self.inside.count()) {
-            const entry = self.inside.values()[index];
-            if (entry.outside.protocol != protocol or !isExpired(entry.deadline, now)) {
-                index += 1;
-                continue;
-            }
-            self.inside.swapRemoveAt(index);
-            const reverse_removed = self.outside.remove(entry.outside);
-            std.debug.assert(reverse_removed);
-            port_allocator.release(entry.outside.port);
-        }
-    }
-
     pub fn inboundLookup(
         self: *NatTable,
-        port_allocator: *PortAllocator,
         key: Key,
     ) ?struct { Key, Entry } {
         const inside_key = self.outside.get(key) orelse return null;
-        const entry = self.inside.get(inside_key) orelse unreachable;
+        const entry = (self.inside.get(inside_key) orelse unreachable).entry;
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (isExpired(entry.deadline, now)) {
-            self.remove(port_allocator, inside_key);
+            self.remove(inside_key);
             return null;
         }
         return .{ inside_key, entry };
@@ -112,13 +108,12 @@ pub const NatTable = struct {
 
     pub fn outboundLookup(
         self: *NatTable,
-        port_allocator: *PortAllocator,
         key: Key,
     ) ?Entry {
-        const entry = self.inside.get(key) orelse return null;
+        const entry = (self.inside.get(key) orelse return null).entry;
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (isExpired(entry.deadline, now)) {
-            self.remove(port_allocator, key);
+            self.remove(key);
             return null;
         }
         return entry;
@@ -126,7 +121,6 @@ pub const NatTable = struct {
 
     pub fn insert(
         self: *NatTable,
-        alloc: std.mem.Allocator,
         port_allocator: *PortAllocator,
         key: Key,
         outside_ip: IPv4,
@@ -134,15 +128,26 @@ pub const NatTable = struct {
     ) !Entry {
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (self.inside.get(key)) |existing| {
-            if (!isExpired(existing.deadline, now)) return error.InsideKeyInUse;
-            self.remove(port_allocator, key);
+            if (!isExpired(existing.entry.deadline, now)) return error.InsideKeyInUse;
+            self.remove(key);
         }
 
-        try self.inside.ensureUnusedCapacity(alloc, 1);
-        try self.outside.ensureUnusedCapacity(alloc, 1);
+        if (self.inside.count() == self.capacity) {
+            for (self.inside.keys(), self.inside.values()) |inside_key, mapping| {
+                if (!isExpired(mapping.entry.deadline, now)) continue;
+                self.remove(inside_key);
+                break;
+            } else return error.NoCapacity;
+        }
+
         const outside_port = port_allocator.allocate(key.port) catch |err| switch (err) {
             error.NoPortsAvailable => blk: {
-                self.reclaimExpired(key.protocol, port_allocator);
+                for (self.inside.keys(), self.inside.values()) |inside_key, mapping| {
+                    if (mapping.entry.outside.protocol != key.protocol or
+                        !isExpired(mapping.entry.deadline, now)) continue;
+                    self.remove(inside_key);
+                    break;
+                } else return error.NoPortsAvailable;
                 break :blk try port_allocator.allocate(key.port);
             },
         };
@@ -151,68 +156,66 @@ pub const NatTable = struct {
             .deadline = now.addDuration(duration),
         };
         std.debug.assert(!self.outside.contains(entry.outside));
-        self.inside.putAssumeCapacityNoClobber(key, entry);
+        self.inside.putAssumeCapacityNoClobber(key, .{
+            .entry = entry,
+            .port_allocator = port_allocator,
+        });
         self.outside.putAssumeCapacityNoClobber(entry.outside, key);
         return entry;
     }
 
     pub fn refresh(
         self: *NatTable,
-        port_allocator: *PortAllocator,
         key: Key,
         duration: std.Io.Duration,
     ) !void {
         const now = std.Io.Timestamp.now(self.io, .boot);
         const entry = self.inside.getPtr(key) orelse return error.NotFound;
-        if (isExpired(entry.deadline, now)) {
-            self.remove(port_allocator, key);
+        if (isExpired(entry.entry.deadline, now)) {
+            self.remove(key);
             return error.NotFound;
         }
-        entry.deadline = now.addDuration(duration);
+        entry.entry.deadline = now.addDuration(duration);
     }
 
-    pub fn remove(
-        self: *NatTable,
-        port_allocator: *PortAllocator,
-        key: Key,
-    ) void {
+    pub fn remove(self: *NatTable, key: Key) void {
         const removed = self.inside.fetchSwapRemove(key) orelse return;
-        const reverse_removed = self.outside.remove(removed.value.outside);
+        const reverse_removed = self.outside.remove(removed.value.entry.outside);
         std.debug.assert(reverse_removed);
-        port_allocator.release(removed.value.outside.port);
+        removed.value.port_allocator.release(removed.value.entry.outside.port);
     }
 };
 
 test "NAT mappings resolve in both directions, refresh, and release their port" {
     const alloc = std.testing.allocator;
-    var table = NatTable.init(std.testing.io);
+    var table = try NatTable.init(alloc, std.testing.io, 8);
     defer table.deinit(alloc);
     var port_allocator: PortAllocator = .{};
     const inside: NatTable.Key = .{ .protocol = .tcp, .ip = .{ 192, 168, 1, 10 }, .port = 50000 };
     const outside_ip: IPv4 = .{ 203, 0, 113, 5 };
 
-    const entry = try table.insert(alloc, &port_allocator, inside, outside_ip, .fromSeconds(60));
+    const entry = try table.insert(&port_allocator, inside, outside_ip, .fromSeconds(60));
     try std.testing.expectEqualDeep(outside_ip, entry.outside.ip);
     try std.testing.expectEqual(inside.port, entry.outside.port);
     try std.testing.expect(port_allocator.isAllocated(entry.outside.port));
-    try std.testing.expectEqualDeep(entry, table.outboundLookup(&port_allocator, inside).?);
-    const inbound = table.inboundLookup(&port_allocator, entry.outside).?;
+    try std.testing.expectEqualDeep(entry, table.outboundLookup(inside).?);
+    const inbound = table.inboundLookup(entry.outside).?;
     try std.testing.expectEqualDeep(inside, inbound[0]);
     try std.testing.expectEqualDeep(entry, inbound[1]);
 
-    try table.refresh(&port_allocator, inside, .fromSeconds(120));
-    try std.testing.expect(table.outboundLookup(&port_allocator, inside).?.deadline.toNanoseconds() > entry.deadline.toNanoseconds());
+    try table.refresh(inside, .fromSeconds(120));
+    try std.testing.expect(table.outboundLookup(inside).?.deadline.toNanoseconds() > entry.deadline.toNanoseconds());
 
-    table.remove(&port_allocator, inside);
+    table.remove(inside);
     try std.testing.expect(!port_allocator.isAllocated(entry.outside.port));
-    try std.testing.expect(table.outboundLookup(&port_allocator, inside) == null);
-    try std.testing.expect(table.inboundLookup(&port_allocator, entry.outside) == null);
-    try std.testing.expectError(error.NotFound, table.refresh(&port_allocator, inside, .fromSeconds(60)));
+    try std.testing.expect(table.outboundLookup(inside) == null);
+    try std.testing.expect(table.inboundLookup(entry.outside) == null);
+    try std.testing.expectError(error.NotFound, table.refresh(inside, .fromSeconds(60)));
 }
 
 test "NAT insert uses another occupied port and keeps protocol spaces separate" {
     const alloc = std.testing.allocator;
-    var table = NatTable.init(std.testing.io);
+    var table = try NatTable.init(alloc, std.testing.io, 8);
     defer table.deinit(alloc);
     var tcp_port_allocator: PortAllocator = .{};
     var udp_port_allocator: PortAllocator = .{};
@@ -220,27 +223,27 @@ test "NAT insert uses another occupied port and keeps protocol spaces separate" 
     const inside_a: NatTable.Key = .{ .protocol = .tcp, .ip = .{ 192, 168, 1, 10 }, .port = 50000 };
     const inside_b: NatTable.Key = .{ .protocol = .tcp, .ip = .{ 192, 168, 1, 11 }, .port = 50000 };
 
-    const first = try table.insert(alloc, &tcp_port_allocator, inside_a, outside_ip, .fromSeconds(60));
-    try std.testing.expectError(error.InsideKeyInUse, table.insert(alloc, &tcp_port_allocator, inside_a, outside_ip, .fromSeconds(60)));
-    const second = try table.insert(alloc, &tcp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
+    const first = try table.insert(&tcp_port_allocator, inside_a, outside_ip, .fromSeconds(60));
+    try std.testing.expectError(error.InsideKeyInUse, table.insert(&tcp_port_allocator, inside_a, outside_ip, .fromSeconds(60)));
+    const second = try table.insert(&tcp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
     try std.testing.expect(first.outside.port != second.outside.port);
-    try std.testing.expectEqualDeep(inside_b, table.inboundLookup(&tcp_port_allocator, second.outside).?[0]);
+    try std.testing.expectEqualDeep(inside_b, table.inboundLookup(second.outside).?[0]);
 
     const udp_inside: NatTable.Key = .{ .protocol = .udp, .ip = inside_a.ip, .port = inside_a.port };
-    const udp_entry = try table.insert(alloc, &udp_port_allocator, udp_inside, outside_ip, .fromSeconds(60));
+    const udp_entry = try table.insert(&udp_port_allocator, udp_inside, outside_ip, .fromSeconds(60));
     try std.testing.expectEqual(first.outside.port, udp_entry.outside.port);
     try std.testing.expectEqual(@as(usize, 3), table.inside.count());
     try std.testing.expectEqual(@as(usize, 3), table.outside.count());
 
-    table.remove(&tcp_port_allocator, inside_a);
+    table.remove(inside_a);
     try std.testing.expect(!tcp_port_allocator.isAllocated(first.outside.port));
     try std.testing.expect(udp_port_allocator.isAllocated(udp_entry.outside.port));
-    try std.testing.expect(table.inboundLookup(&udp_port_allocator, udp_entry.outside) != null);
+    try std.testing.expect(table.inboundLookup(udp_entry.outside) != null);
 }
 
-test "NAT lookup and protocol sweep release expired ports" {
+test "NAT lookups release expired ports and insertion reuses expired capacity" {
     const alloc = std.testing.allocator;
-    var table = NatTable.init(std.testing.io);
+    var table = try NatTable.init(alloc, std.testing.io, 2);
     defer table.deinit(alloc);
     var udp_port_allocator: PortAllocator = .{};
     var tcp_port_allocator: PortAllocator = .{};
@@ -250,42 +253,58 @@ test "NAT lookup and protocol sweep release expired ports" {
     const inside_c: NatTable.Key = .{ .protocol = .udp, .ip = .{ 192, 168, 1, 12 }, .port = 50002 };
     const tcp_inside: NatTable.Key = .{ .protocol = .tcp, .ip = .{ 192, 168, 1, 13 }, .port = 50003 };
 
-    const expired = try table.insert(alloc, &udp_port_allocator, inside_a, outside_ip, .zero);
-    try std.testing.expect(table.inboundLookup(&udp_port_allocator, expired.outside) == null);
+    const expired = try table.insert(&udp_port_allocator, inside_a, outside_ip, .zero);
+    try std.testing.expect(table.inboundLookup(expired.outside) == null);
     try std.testing.expect(!udp_port_allocator.isAllocated(expired.outside.port));
     try std.testing.expectEqual(@as(usize, 0), table.inside.count());
 
-    const expired_a = try table.insert(alloc, &udp_port_allocator, inside_a, outside_ip, .zero);
-    const live = try table.insert(alloc, &udp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
-    const expired_c = try table.insert(alloc, &udp_port_allocator, inside_c, outside_ip, .zero);
-    const expired_tcp = try table.insert(alloc, &tcp_port_allocator, tcp_inside, outside_ip, .zero);
-    table.reclaimExpired(.udp, &udp_port_allocator);
-    try std.testing.expect(!udp_port_allocator.isAllocated(expired_a.outside.port));
-    try std.testing.expect(!udp_port_allocator.isAllocated(expired_c.outside.port));
-    try std.testing.expect(udp_port_allocator.isAllocated(live.outside.port));
-    try std.testing.expect(tcp_port_allocator.isAllocated(expired_tcp.outside.port));
-    try std.testing.expectEqual(@as(usize, 2), table.inside.count());
-
-    table.reclaimExpired(.tcp, &tcp_port_allocator);
+    const live = try table.insert(&udp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
+    const expired_tcp = try table.insert(&tcp_port_allocator, tcp_inside, outside_ip, .zero);
+    const replacement = try table.insert(&udp_port_allocator, inside_c, outside_ip, .fromSeconds(60));
     try std.testing.expect(!tcp_port_allocator.isAllocated(expired_tcp.outside.port));
-    try std.testing.expectEqual(@as(usize, 1), table.inside.count());
-    try std.testing.expectEqual(@as(usize, 1), table.outside.count());
+    try std.testing.expect(udp_port_allocator.isAllocated(live.outside.port));
+    try std.testing.expect(udp_port_allocator.isAllocated(replacement.outside.port));
+    try std.testing.expectEqual(@as(usize, 2), table.inside.count());
+    try std.testing.expect(table.outboundLookup(tcp_inside) == null);
+    try std.testing.expect(table.inboundLookup(live.outside) != null);
+    try std.testing.expect(table.inboundLookup(replacement.outside) != null);
+
+    try std.testing.expectError(error.NoCapacity, table.insert(&tcp_port_allocator, tcp_inside, outside_ip, .fromSeconds(60)));
+    try std.testing.expectEqual(@as(usize, 2), table.outside.count());
 }
 
-test "NAT insert leaves port free when map allocation fails" {
-    var table = NatTable.init(std.testing.io);
-    var port_allocator: PortAllocator = .{};
+test "NAT initialization fails without storage" {
     var bytes: [0]u8 = .{};
     var fixed = std.heap.FixedBufferAllocator.init(&bytes);
     const alloc = fixed.allocator();
-    defer table.deinit(alloc);
-    const inside: NatTable.Key = .{ .protocol = .icmp, .ip = .{ 192, 168, 1, 10 }, .port = 1234 };
-    const outside_ip: IPv4 = .{ 203, 0, 113, 5 };
+    try std.testing.expectError(error.OutOfMemory, NatTable.init(alloc, std.testing.io, 1));
+}
 
-    try std.testing.expectError(error.OutOfMemory, table.insert(alloc, &port_allocator, inside, outside_ip, .fromSeconds(60)));
+test "NAT deinit releases ports held by live mappings" {
+    const alloc = std.testing.allocator;
+    var table = try NatTable.init(alloc, std.testing.io, 1);
+    var port_allocator: PortAllocator = .{};
+    const inside: NatTable.Key = .{ .protocol = .icmp, .ip = .{ 192, 168, 1, 10 }, .port = 1234 };
+    _ = try table.insert(&port_allocator, inside, .{ 203, 0, 113, 5 }, .fromSeconds(60));
+    try std.testing.expect(port_allocator.isAllocated(inside.port));
+    table.deinit(alloc);
     try std.testing.expect(!port_allocator.isAllocated(inside.port));
-    try std.testing.expectEqual(@as(usize, 0), table.inside.count());
-    try std.testing.expectEqual(@as(usize, 0), table.outside.count());
+}
+
+test "NAT expired mapping gives its port to a new mapping at capacity" {
+    const alloc = std.testing.allocator;
+    var table = try NatTable.init(alloc, std.testing.io, 1);
+    defer table.deinit(alloc);
+    var port_allocator: PortAllocator = .{};
+    const outside_ip: IPv4 = .{ 203, 0, 113, 5 };
+    const old_key: NatTable.Key = .{ .protocol = .udp, .ip = .{ 192, 168, 1, 10 }, .port = 50000 };
+    const new_key: NatTable.Key = .{ .protocol = .udp, .ip = .{ 192, 168, 1, 11 }, .port = 50000 };
+
+    const old_entry = try table.insert(&port_allocator, old_key, outside_ip, .zero);
+    const new_entry = try table.insert(&port_allocator, new_key, outside_ip, .fromSeconds(60));
+    try std.testing.expectEqual(old_entry.outside.port, new_entry.outside.port);
+    try std.testing.expect(table.outboundLookup(old_key) == null);
+    try std.testing.expectEqualDeep(new_key, table.inboundLookup(new_entry.outside).?[0]);
 }
 
 test "PortAllocator reuses a released preferred port" {
