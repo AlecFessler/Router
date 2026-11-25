@@ -8,6 +8,7 @@ const NicApi = Router.Nic.Api.Api;
 const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const View = Router.Meta.View.View;
 
+const nat_table = Router.State.nat_table;
 var port_allocator: PortAllocator = .{};
 
 pub const TcpPacket = struct {
@@ -66,6 +67,22 @@ pub fn handle(
 ) !void {
     const view = try parse(packet, ip_view);
     Cli.enter(.tcp, view);
+    switch (iface) {
+        .lan => {
+            // determine if packet needs transferred on wan tx buffer
+            // or if its for another lan device
+
+            // for outbound packets, look up (protocol, LAN IP, LAN port)
+            // and replace the source IP and port
+        },
+        .wan => {
+            // drop packet if its not for a lan device
+            // determine which lan device the packet needs forwarded to
+
+            // look up (protocol, WAN IP, WAN port)
+            // and restore the destination LAN IP and port
+        },
+    }
     std.debug.print(
         "TCP: packet unhandled by {s} interface\n",
         .{@tagName(iface)},
