@@ -5,6 +5,25 @@ const ViewModule = Router.Meta.View;
 const View = ViewModule.View;
 const IPv4 = Router.Protocols.IPv4;
 
+/// Unfolded sum of network-order 16-bit words.
+pub fn checksumContribution(bytes: []const u8) u64 {
+    std.debug.assert(bytes.len % 2 == 0);
+    var sum: u64 = 0;
+    for (0..bytes.len / 2) |i| {
+        sum += (@as(u16, bytes[i * 2]) << 8) | bytes[i * 2 + 1];
+    }
+    return sum;
+}
+
+/// RFC 1624: HC' = ~(~HC + ~m + m'), extended to several 16-bit words.
+pub fn update(old_checksum: u16, old_sum: u64, new_sum: u64, word_count: usize) u16 {
+    std.debug.assert(old_sum <= @as(u64, word_count) * 0xffff);
+    var sum: u64 = @as(u16, ~old_checksum) +
+        (@as(u64, word_count) * 0xffff - old_sum) + new_sum;
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return ~@as(u16, @intCast(sum));
+}
+
 fn rangeIsByteAligned(comptime V: type, comptime start: V.Field, comptime inclusive_end: V.Field) bool {
     if (@intFromEnum(start) > @intFromEnum(inclusive_end)) return false;
     const first = ViewModule.bitInfo(V.BaseType, @intFromEnum(start));

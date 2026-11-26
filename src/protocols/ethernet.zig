@@ -55,11 +55,15 @@ const Router = @import("router");
 
 const Arp = Router.Protocols.Arp;
 const Cli = Router.Debug.Cli;
+const CsvParser = EthernetFixtures.CsvParser;
+const EthernetFixtures = Router.TestFixtures.Ethernet;
 const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
 
 pub const PAYLOAD_LEN_MAX = 1500;
 pub const VALID_ETHERTYPE_MIN = 1535;
@@ -147,7 +151,7 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     var view = try parse(buffer);
     Cli.enter(.ethernet, view);
@@ -256,11 +260,9 @@ test "parseVlanTag() reads VLAN bit fields" {
 }
 
 test "parse() on captured frames matches Wireshark's Ethernet fields" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.Ethernet.CsvParser;
-    var parsed_pcap = try PcapParser.parse(Router.TestFixtures.Ethernet.pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(EthernetFixtures.pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
-    const parsed_frames = try CsvParser.parse(Router.TestFixtures.Ethernet.csv_file, std.testing.allocator);
+    const parsed_frames = try CsvParser.parse(EthernetFixtures.csv_file, std.testing.allocator);
     defer std.testing.allocator.free(parsed_frames);
 
     try std.testing.expectEqual(parsed_pcap.packet_bytes.len, parsed_frames.len);
@@ -287,8 +289,7 @@ test "parse() on captured frames matches Wireshark's Ethernet fields" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.Ethernet.pcap_file;
+    const pcap_file = EthernetFixtures.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);

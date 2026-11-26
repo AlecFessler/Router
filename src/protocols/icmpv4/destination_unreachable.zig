@@ -2,11 +2,18 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const CsvParser = ICMPv4Fixtures.DestinationUnreachableCsvParser;
+const Ethernet = Router.Protocols.Ethernet;
 const Format = Router.Meta.Format;
+const ICMPv4 = Router.Protocols.ICMPv4;
+const ICMPv4Fixtures = Router.TestFixtures.ICMPv4;
 const ICMPv4PacketView = Router.Protocols.ICMPv4.ICMPv4PacketView;
 const IFace = Router.Nic.Api.IFace;
+const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
 
 pub const Code = enum(u8) {
     host_unreachable = 1,
@@ -42,7 +49,7 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     const icmpv4_view = views.getView(.icmpv4);
     const view = try parse(icmpv4_view.*);
@@ -69,8 +76,7 @@ pub fn handle(
 }
 
 test "parse() reads destination unreachable messages from the WAN capture" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.ICMPv4.message_types_pcap_file;
+    const pcap_file = ICMPv4Fixtures.message_types_pcap_file;
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
@@ -80,10 +86,10 @@ test "parse() reads destination unreachable messages from the WAN capture" {
         .{ .frame_number = 4394, .code = .fragmentation_needed, .mtu = 1253 },
     };
     for (samples) |sample| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[sample.frame_number - 1]);
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        const icmpv4_view = try Router.Protocols.ICMPv4.parse(ip_view.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.ICMPv4.MessageType.destination_unreachable, icmpv4_view.get(.message_type));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[sample.frame_number - 1]);
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        const icmpv4_view = try ICMPv4.parse(ip_view.get(.payload));
+        try std.testing.expectEqual(ICMPv4.MessageType.destination_unreachable, icmpv4_view.get(.message_type));
         try std.testing.expectEqual(sample.code, @as(Code, @enumFromInt(icmpv4_view.get(.code))));
 
         var view = try parse(icmpv4_view);
@@ -102,19 +108,17 @@ test "parse() reads destination unreachable messages from the WAN capture" {
 }
 
 test "parse() on captured destination unreachable frames matches Wireshark's fields" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.ICMPv4.DestinationUnreachableCsvParser;
-    var parsed_pcap = try PcapParser.parse(Router.TestFixtures.ICMPv4.message_types_pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(ICMPv4Fixtures.message_types_pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
-    const rows = try CsvParser.parse(Router.TestFixtures.ICMPv4.destination_unreachable_csv_file, std.testing.allocator);
+    const rows = try CsvParser.parse(ICMPv4Fixtures.destination_unreachable_csv_file, std.testing.allocator);
     defer std.testing.allocator.free(rows);
 
     try std.testing.expect(rows.len > 0);
     for (rows) |expected| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[expected.frame_number - 1]);
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        const icmpv4_view = try Router.Protocols.ICMPv4.parse(ip_view.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.ICMPv4.MessageType.destination_unreachable, icmpv4_view.get(.message_type));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[expected.frame_number - 1]);
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        const icmpv4_view = try ICMPv4.parse(ip_view.get(.payload));
+        try std.testing.expectEqual(ICMPv4.MessageType.destination_unreachable, icmpv4_view.get(.message_type));
         try std.testing.expectEqual(expected.code, @as(Code, @enumFromInt(icmpv4_view.get(.code))));
         const view = try parse(icmpv4_view);
         try std.testing.expectEqual(expected.reserved, view.get(.reserved));
@@ -124,21 +128,21 @@ test "parse() on captured destination unreachable frames matches Wireshark's fie
 
 test "parse() accepts an unrecognized code and rejects truncated messages" {
     const packet = [_]u8{ 3, 250, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
-    const icmpv4_view = try Router.Protocols.ICMPv4.parse(&packet);
+    const icmpv4_view = try ICMPv4.parse(&packet);
     const code: Code = @enumFromInt(icmpv4_view.get(.code));
     try std.testing.expectEqual(@as(u8, 250), @intFromEnum(code));
     _ = try parse(icmpv4_view);
 
     for (0..4) |body_len| {
-        const short_view = try Router.Protocols.ICMPv4.parse(packet[0 .. 4 + body_len]);
+        const short_view = try ICMPv4.parse(packet[0 .. 4 + body_len]);
         try std.testing.expectError(error.EndOfStream, parse(short_view));
     }
-    const no_quote = try Router.Protocols.ICMPv4.parse(packet[0..8]);
+    const no_quote = try ICMPv4.parse(packet[0..8]);
     try std.testing.expectError(error.InvalidField, parse(no_quote));
 }
 
 test "parse() rejects a different ICMPv4 message type" {
     const packet = [_]u8{ 8, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
-    const icmpv4_view = try Router.Protocols.ICMPv4.parse(&packet);
+    const icmpv4_view = try ICMPv4.parse(&packet);
     try std.testing.expectError(error.InvalidField, parse(icmpv4_view));
 }

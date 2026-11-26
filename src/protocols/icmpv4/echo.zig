@@ -2,10 +2,17 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const CsvParser = ICMPv4Fixtures.EchoCsvParser;
+const Ethernet = Router.Protocols.Ethernet;
+const ICMPv4 = Router.Protocols.ICMPv4;
+const ICMPv4Fixtures = Router.TestFixtures.ICMPv4;
 const ICMPv4PacketView = Router.Protocols.ICMPv4.ICMPv4PacketView;
 const IFace = Router.Nic.Api.IFace;
+const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
 
 pub const EchoMsg = struct {
     identifier: u16,
@@ -36,7 +43,7 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     const icmpv4_view = views.getView(.icmpv4);
     const view = try parse(icmpv4_view.*);
@@ -53,7 +60,6 @@ const test_request = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 'a',
 const test_reply = [_]u8{ 0x00, 0x00, 0x29, 0x68, 0x12, 0x34, 0x00, 0x01, 'a', 'b', 'c' };
 
 test "parse() reads echo request and reply fields" {
-    const ICMPv4 = Router.Protocols.ICMPv4;
     inline for (.{ test_request, test_reply }) |packet| {
         const icmpv4_view = try ICMPv4.parse(&packet);
         const view = try parse(icmpv4_view);
@@ -64,7 +70,6 @@ test "parse() reads echo request and reply fields" {
 }
 
 test "parse() accepts empty data and rejects truncated echo fields" {
-    const ICMPv4 = Router.Protocols.ICMPv4;
     const packet = [_]u8{ 0x08, 0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01 };
     for (0..4) |body_len| {
         const icmpv4_view = try ICMPv4.parse(packet[0 .. 4 + body_len]);
@@ -76,7 +81,6 @@ test "parse() accepts empty data and rejects truncated echo fields" {
 }
 
 test "parse() rejects nonzero echo code and non-echo message type" {
-    const ICMPv4 = Router.Protocols.ICMPv4;
     var packet = test_request;
     packet[1] = 1;
     packet[2] = 0;
@@ -88,18 +92,16 @@ test "parse() rejects nonzero echo code and non-echo message type" {
 }
 
 test "parse() on captured echo frames matches Wireshark's fields" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.ICMPv4.EchoCsvParser;
-    var parsed_pcap = try PcapParser.parse(Router.TestFixtures.ICMPv4.pcap_file, std.testing.allocator);
+    var parsed_pcap = try PcapParser.parse(ICMPv4Fixtures.pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
-    const rows = try CsvParser.parse(Router.TestFixtures.ICMPv4.echo_csv_file, std.testing.allocator);
+    const rows = try CsvParser.parse(ICMPv4Fixtures.echo_csv_file, std.testing.allocator);
     defer std.testing.allocator.free(rows);
 
     try std.testing.expectEqual(parsed_pcap.packet_bytes.len, rows.len);
     for (rows) |expected| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[expected.frame_number - 1]);
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        const icmpv4_view = try Router.Protocols.ICMPv4.parse(ip_view.get(.payload));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[expected.frame_number - 1]);
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        const icmpv4_view = try ICMPv4.parse(ip_view.get(.payload));
         try std.testing.expectEqual(expected.message_type, icmpv4_view.get(.message_type));
         const view = try parse(icmpv4_view);
         try std.testing.expectEqual(expected.identifier, view.get(.identifier));
@@ -108,16 +110,15 @@ test "parse() on captured echo frames matches Wireshark's fields" {
 }
 
 test "parse() then serialize() returns captured echo message bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.ICMPv4.pcap_file;
+    const pcap_file = ICMPv4Fixtures.pcap_file;
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     var echo_count: usize = 0;
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try Router.Protocols.Ethernet.parse(packet);
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        const icmpv4_view = try Router.Protocols.ICMPv4.parse(ip_view.get(.payload));
+        const frame = try Ethernet.parse(packet);
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        const icmpv4_view = try ICMPv4.parse(ip_view.get(.payload));
         switch (icmpv4_view.get(.message_type)) {
             .echo_request, .echo_reply => {},
             else => continue,

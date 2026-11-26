@@ -2,13 +2,22 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const CsvParser = IPv4Fixtures.CsvParser;
+const Ethernet = Router.Protocols.Ethernet;
 const Format = Router.Meta.Format;
-const IFace = Router.Nic.Api.IFace;
 const ICMPv4 = Router.Protocols.ICMPv4;
+const IFace = Router.Nic.Api.IFace;
+const IPv4Fixtures = Router.TestFixtures.IPv4;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
 const Tcp = Router.Protocols.Tcp;
 const Udp = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
+
+const lan_ip = &Router.State.lan_ip;
+const lan_subnet_mask = &Router.State.lan_subnet_mask;
+const wan_lease = &Router.State.wan_lease;
 
 pub const IPv4 = [4]u8;
 
@@ -86,7 +95,7 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     const packet = views.getView(.ethernet).get(.payload);
     var view = try parse(packet);
@@ -105,6 +114,65 @@ pub fn handle(
             device.release(buffer);
         },
     }
+}
+
+pub const DstClass = enum {
+    local, // router's LAN or leased WAN IP
+    broadcast, // 255.255.255.255 or this LAN's directed broadcast
+    multicast, // 224.0.0.0/4
+    lan, // another address on the LAN subnet
+    wan, // everything else
+};
+
+pub fn classifyDestination(dst: IPv4) DstClass {
+    const dst_bits: u32 = @bitCast(dst);
+    const lan_bits: u32 = @bitCast(lan_ip.*);
+    const mask_bits: u32 = @bitCast(lan_subnet_mask.*);
+
+    if (dst_bits == 0xffff_ffff) return .broadcast;
+    // /31 and /32 networks have no directed broadcast address.
+    if (@popCount(~mask_bits) >= 2 and
+        dst_bits == ((lan_bits & mask_bits) | ~mask_bits)) return .broadcast;
+
+    if (dst[0] >= 224 and dst[0] <= 239) return .multicast;
+
+    if (dst_bits == lan_bits) return .local;
+    if (wan_lease.*) |lease| {
+        const wan_bits: u32 = @bitCast(lease.ip);
+        if (dst_bits == wan_bits) return .local;
+    }
+
+    if ((dst_bits & mask_bits) == (lan_bits & mask_bits)) return .lan;
+    return .wan;
+}
+
+test "classifyDestination distinguishes local, LAN, WAN, broadcast, and multicast destinations" {
+    lan_ip.* = .{ 192, 168, 86, 1 };
+    lan_subnet_mask.* = .{ 255, 255, 255, 0 };
+    wan_lease.* = null;
+
+    try std.testing.expectEqual(DstClass.local, classifyDestination(.{ 192, 168, 86, 1 }));
+    try std.testing.expectEqual(DstClass.lan, classifyDestination(.{ 192, 168, 86, 42 }));
+    try std.testing.expectEqual(DstClass.broadcast, classifyDestination(.{ 192, 168, 86, 255 }));
+    try std.testing.expectEqual(DstClass.broadcast, classifyDestination(.{ 255, 255, 255, 255 }));
+    try std.testing.expectEqual(DstClass.multicast, classifyDestination(.{ 224, 0, 0, 251 }));
+    try std.testing.expectEqual(DstClass.multicast, classifyDestination(.{ 239, 255, 255, 250 }));
+    try std.testing.expectEqual(DstClass.wan, classifyDestination(.{ 8, 8, 8, 8 }));
+
+    const now = std.Io.Timestamp.now(std.testing.io, .boot);
+    wan_lease.* = .{
+        .ip = .{ 136, 48, 33, 52 },
+        .subnet_mask = .{ 255, 255, 240, 0 },
+        .router = .{ 136, 48, 32, 1 },
+        .server_id = .{ 136, 48, 32, 1 },
+        .renewal_deadline = now,
+        .rebinding_deadline = now,
+        .expiration_deadline = now,
+    };
+    defer wan_lease.* = null;
+
+    try std.testing.expectEqual(DstClass.local, classifyDestination(.{ 136, 48, 33, 52 }));
+    try std.testing.expectEqual(DstClass.wan, classifyDestination(.{ 136, 48, 32, 1 }));
 }
 
 const test_packet = [_]u8{
@@ -205,10 +273,8 @@ test "parse() rejects invalid header checksums" {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.IPv4.CsvParser;
-    const pcap_file = Router.TestFixtures.IPv4.pcap_file;
-    const csv_file = Router.TestFixtures.IPv4.csv_file;
+    const pcap_file = IPv4Fixtures.pcap_file;
+    const csv_file = IPv4Fixtures.csv_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
@@ -217,23 +283,22 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
         try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet));
     }
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.IPv4.pcap_file;
+    const pcap_file = IPv4Fixtures.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try Router.Protocols.Ethernet.parse(packet);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const frame = try Ethernet.parse(packet);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
         const ipv4_bytes = frame.get(.payload);
         var view = try parse(ipv4_bytes);
         const parsed_len = view.get(.total_length);

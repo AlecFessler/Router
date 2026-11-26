@@ -2,16 +2,22 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const CsvParser = ICMPv4Fixtures.CsvParser;
 const DestinationUnreachable = Router.Protocols.ICMPv4Messages.DestinationUnreachable;
 const Echo = Router.Protocols.ICMPv4Messages.Echo;
+const Ethernet = Router.Protocols.Ethernet;
 const Format = Router.Meta.Format;
+const ICMPv4Fixtures = Router.TestFixtures.ICMPv4;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
+const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
 const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const TimeExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
 
 var port_allocator: PortAllocator = .{};
 
@@ -52,7 +58,7 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     var view = try parse(views.getView(.ipv4).get(.payload));
     Cli.enter(.icmpv4, view);
@@ -107,10 +113,8 @@ test "parse() rejects invalid checksums" {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.ICMPv4.CsvParser;
-    const pcap_file = Router.TestFixtures.ICMPv4.pcap_file;
-    const csv_file = Router.TestFixtures.ICMPv4.csv_file;
+    const pcap_file = ICMPv4Fixtures.pcap_file;
+    const csv_file = ICMPv4Fixtures.csv_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
@@ -119,27 +123,26 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.IPv4.Protocol.icmp, ip_view.get(.protocol));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        try std.testing.expectEqual(IPv4Protocol.Protocol.icmp, ip_view.get(.protocol));
         const view = try parse(ip_view.get(.payload));
         try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet));
     }
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.ICMPv4.pcap_file;
+    const pcap_file = ICMPv4Fixtures.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try Router.Protocols.Ethernet.parse(packet);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.IPv4.Protocol.icmp, ip_view.get(.protocol));
+        const frame = try Ethernet.parse(packet);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        try std.testing.expectEqual(IPv4Protocol.Protocol.icmp, ip_view.get(.protocol));
         const icmp_bytes = ip_view.get(.payload);
         var view = try parse(icmp_bytes);
         const buffer = try std.testing.allocator.alloc(u8, icmp_bytes.len);

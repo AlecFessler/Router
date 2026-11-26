@@ -1,9 +1,10 @@
 const std = @import("std");
 const Router = @import("router");
+const MessageType = Router.Protocols.ICMPv4.MessageType;
 
 pub const Row = struct {
     frame_number: usize,
-    message_type: Router.Protocols.ICMPv4.MessageType,
+    message_type: MessageType,
     identifier: u16,
     sequence_number: u16,
 };
@@ -23,7 +24,7 @@ pub fn parse(file: []const u8, alloc: std.mem.Allocator) ![]Row {
         if (line.len == 0) continue;
         var parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, line, "\r"), ',');
         const frame_number = try decimal(usize, parts.next() orelse return error.UnexpectedFileFormat);
-        const message_type: Router.Protocols.ICMPv4.MessageType = @enumFromInt(try decimal(u8, parts.next() orelse return error.UnexpectedFileFormat));
+        const message_type: MessageType = @enumFromInt(try decimal(u8, parts.next() orelse return error.UnexpectedFileFormat));
         const identifier = try decimal(u16, parts.next() orelse return error.UnexpectedFileFormat);
         const sequence_number = try decimal(u16, parts.next() orelse return error.UnexpectedFileFormat);
         if (parts.next() != null) return error.UnexpectedFileFormat;

@@ -2,12 +2,22 @@ const std = @import("std");
 const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
+const CsvParser = DHCPv4Fixtures.CsvParser;
+const DHCPv4Fixtures = Router.TestFixtures.DHCPv4;
+const Ethernet = Router.Protocols.Ethernet;
+const FixtureUtils = Router.TestFixtures.Utils;
 const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
+const IPv4Protocol = Router.Protocols.IPv4;
 const Mac = Router.Protocols.Ethernet.Mac;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
+const UdpProtocol = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
+
+const expectHexBytes = FixtureUtils.expectHexBytes;
 
 pub const DHCPv4Lease = struct {
     ip: IPv4,
@@ -218,7 +228,7 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     const view = try parse(views.getView(.udp).get(.payload));
     Cli.enter(.dhcpv4, view);
@@ -397,7 +407,6 @@ test "parse() rejects invalid DHCPv4 metadata" {
 }
 
 fn expectWiresharkOptionValue(option: OptionValue, hex: []const u8) !void {
-    const expectHexBytes = Router.TestFixtures.Utils.expectHexBytes;
     switch (option) {
         inline .subnet_mask, .broadcast_address, .requested_ip_address, .server_id => |ip| {
             try expectHexBytes(&ip, hex);
@@ -435,10 +444,8 @@ fn expectWiresharkOptionValue(option: OptionValue, hex: []const u8) !void {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.DHCPv4.CsvParser;
-    const pcap_file = Router.TestFixtures.DHCPv4.pcap_file;
-    const csv_file = Router.TestFixtures.DHCPv4.csv_file;
+    const pcap_file = DHCPv4Fixtures.pcap_file;
+    const csv_file = DHCPv4Fixtures.csv_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
@@ -447,11 +454,11 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.IPv4.Protocol.udp, ip_view.get(.protocol));
-        const udp_view = try Router.Protocols.Udp.parse(ip_view.get(.payload), ip_view);
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        try std.testing.expectEqual(IPv4Protocol.Protocol.udp, ip_view.get(.protocol));
+        const udp_view = try UdpProtocol.parse(ip_view.get(.payload), ip_view);
         const view = try parse(udp_view.get(.payload));
         try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet.packet));
 
@@ -629,18 +636,17 @@ test "parseOption() rejects invalid lengths and truncated options" {
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.DHCPv4.pcap_file;
+    const pcap_file = DHCPv4Fixtures.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try Router.Protocols.Ethernet.parse(packet);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.IPv4.Protocol.udp, ip_view.get(.protocol));
-        const udp_view = try Router.Protocols.Udp.parse(ip_view.get(.payload), ip_view);
+        const frame = try Ethernet.parse(packet);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        try std.testing.expectEqual(IPv4Protocol.Protocol.udp, ip_view.get(.protocol));
+        const udp_view = try UdpProtocol.parse(ip_view.get(.payload), ip_view);
         const dhcp_bytes = udp_view.get(.payload);
         var view = try parse(dhcp_bytes);
         const buffer = try std.testing.allocator.alloc(u8, dhcp_bytes.len);

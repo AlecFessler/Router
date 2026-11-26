@@ -1,6 +1,15 @@
 const std = @import("std");
 const Router = @import("router");
+
+const ChecksumModule = Router.Meta.Checksum;
+const ICMPv4Protocol = Router.Protocols.ICMPv4;
+const IPv4Packet = Router.Protocols.IPv4.IPv4Packet;
+const IPv4Protocol = Router.Protocols.IPv4;
 const StructField = std.builtin.Type.StructField;
+const TcpProtocol = Router.Protocols.Tcp;
+const UdpPacket = Router.Protocols.Udp.UdpPacket;
+const UdpProtocol = Router.Protocols.Udp;
+const ViewStack = Router.Protocols.ViewStack;
 
 fn FieldType(
     comptime Base: type,
@@ -248,7 +257,7 @@ pub fn View(Base: type) type {
             @field(self.fields, @tagName(field)) = try reader.take(len);
         }
 
-        pub fn checksum(self: @This()) Router.Meta.Checksum.Checksum(@This()) {
+        pub fn checksum(self: @This()) ChecksumModule.Checksum(@This()) {
             return .{ .view = self };
         }
 
@@ -491,6 +500,90 @@ pub fn View(Base: type) type {
                 else => {
                     ptr.* = actual_value;
                 },
+            }
+        }
+
+        fn checksumAffectedBytes(self: *const @This(), comptime field: FieldEnum) []u8 {
+            const FieldT = FieldType(Base, field);
+            const T = UnderlyingType(FieldT);
+            if (comptime @typeInfo(FieldT) == .optional or @typeInfo(T) == .pointer)
+                @compileError("setUpdateChecksum() requires a fixed-size, present field");
+
+            const first_storage = @field(self.fields, fields[0].name);
+            const field_storage = @field(self.fields, @tagName(field));
+            const first: [*]u8 = @ptrCast(first_storage);
+            const current: [*]u8 = @ptrCast(field_storage);
+            const offset = @intFromPtr(current) - @intFromPtr(first);
+            const field_bytes = if (comptime bitInfo(Base, @intFromEnum(field))) |bit|
+                bit.bytes
+            else
+                @sizeOf(T);
+            const start = offset & ~@as(usize, 1);
+            const end = (offset + field_bytes + 1) & ~@as(usize, 1);
+            return first[start..end];
+        }
+
+        pub fn setUpdateChecksum(
+            self: *@This(),
+            comptime field: FieldEnum,
+            value: FieldType(Base, field),
+            views: *ViewStack,
+        ) void {
+            const checksum_field: FieldEnum = if (comptime @hasField(Base, "header_checksum"))
+                .header_checksum
+            else if (comptime @hasField(Base, "checksum"))
+                .checksum
+            else
+                @compileError("setUpdateChecksum() requires a checksum field");
+            if (comptime field == checksum_field)
+                @compileError("setUpdateChecksum() cannot set the checksum field itself");
+            if (comptime @FieldType(Base, @tagName(checksum_field)) != u16)
+                @compileError("setUpdateChecksum() requires a u16 checksum field");
+            if (comptime Base == IPv4Packet) {
+                if (comptime field == .ihl or field == .total_length or field == .protocol)
+                    @compileError("setUpdateChecksum() cannot change IPv4 pseudoheader length or protocol");
+            }
+
+            const old_checksum = self.get(checksum_field);
+            const affected = self.checksumAffectedBytes(field);
+            const old_sum = ChecksumModule.checksumContribution(affected);
+            self.set(field, value);
+            const new_sum = ChecksumModule.checksumContribution(affected);
+            if (old_sum == new_sum) return;
+
+            if (comptime Base == UdpPacket) {
+                if (old_checksum == 0) return; // IPv4 UDP checksum disabled.
+            }
+
+            var new_checksum = ChecksumModule.update(old_checksum, old_sum, new_sum, affected.len / 2);
+            if (comptime Base == UdpPacket) {
+                if (new_checksum == 0) new_checksum = 0xffff;
+            }
+            self.set(checksum_field, new_checksum);
+
+            if (comptime Base == IPv4Packet) {
+                if (comptime field == .src or field == .dst) {
+                    // Later fragments do not contain a TCP or UDP checksum field.
+                    if (self.get(.fragment_offset) != 0) return;
+                    std.debug.assert(affected.len == 4);
+                    switch (self.get(.protocol)) {
+                        .tcp => {
+                            const tcp_view = views.getView(.tcp);
+                            const updated = ChecksumModule.update(tcp_view.get(.checksum), old_sum, new_sum, 2);
+                            tcp_view.set(.checksum, updated);
+                        },
+                        .udp => {
+                            const udp_view = views.getView(.udp);
+                            const old_udp_checksum = udp_view.get(.checksum);
+                            if (old_udp_checksum != 0) {
+                                var updated = ChecksumModule.update(old_udp_checksum, old_sum, new_sum, 2);
+                                if (updated == 0) updated = 0xffff;
+                                udp_view.set(.checksum, updated);
+                            }
+                        },
+                        else => {},
+                    }
+                }
             }
         }
 
@@ -1211,6 +1304,86 @@ test "View.fieldCmp() compares fields without raising validation errors" {
     buffer[2] = 0xFF;
     buffer[3] = 0xFF;
     try std.testing.expect(!view.fieldCmp(.test_enum, .any));
+}
+
+test "setUpdateChecksum updates IPv4 and TCP checksums after address and port changes" {
+    var packet = [_]u8{
+        0x45, 0x00, 0x00, 0x2c, 0x12, 0x34, 0x40, 0x00,
+        0x40, 0x06, 0xa5, 0x44, 0xc0, 0xa8, 0x01, 0x01,
+        0xc0, 0xa8, 0x01, 0x02, 0x04, 0xd2, 0x01, 0xbb,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x50, 0x18, 0x10, 0x00, 0x3f, 0xcc, 0x00, 0x00,
+        0x61, 0x62, 0x63, 0x64,
+    };
+    var ip_view = try IPv4Protocol.parse(&packet);
+    var tcp_view = try TcpProtocol.parse(ip_view.get(.payload), ip_view);
+    var views: ViewStack = .{};
+    views.setView(.ipv4, &ip_view);
+    views.setView(.tcp, &tcp_view);
+
+    ip_view.setUpdateChecksum(.src, .{ 198, 51, 100, 10 }, &views);
+    ip_view.setUpdateChecksum(.dst, .{ 203, 0, 113, 20 }, &views);
+    ip_view.setUpdateChecksum(.ttl, 63, &views);
+    ip_view.setUpdateChecksum(.dont_fragment, false, &views);
+    tcp_view.setUpdateChecksum(.src_port, 40_000, &views);
+    tcp_view.setUpdateChecksum(.dst_port, 8080, &views);
+
+    const reparsed_ip = try IPv4Protocol.parse(&packet);
+    const reparsed_tcp = try TcpProtocol.parse(reparsed_ip.get(.payload), reparsed_ip);
+    try std.testing.expectEqualDeep(IPv4Protocol.IPv4{ 198, 51, 100, 10 }, reparsed_ip.get(.src));
+    try std.testing.expectEqualDeep(IPv4Protocol.IPv4{ 203, 0, 113, 20 }, reparsed_ip.get(.dst));
+    try std.testing.expectEqual(@as(u8, 63), reparsed_ip.get(.ttl));
+    try std.testing.expect(!reparsed_ip.get(.dont_fragment));
+    try std.testing.expectEqual(@as(u16, 40_000), reparsed_tcp.get(.src_port));
+    try std.testing.expectEqual(@as(u16, 8080), reparsed_tcp.get(.dst_port));
+}
+
+test "setUpdateChecksum updates UDP pseudoheader and preserves disabled UDP checksum" {
+    const original = [_]u8{
+        0x45, 0x00, 0x00, 0x20, 0x12, 0x34, 0x40, 0x00,
+        0x40, 0x11, 0xa5, 0x45, 0xc0, 0xa8, 0x01, 0x01,
+        0xc0, 0xa8, 0x01, 0x02, 0x04, 0xd2, 0x00, 0x35,
+        0x00, 0x0c, 0xb2, 0xb4, 0x61, 0x62, 0x63, 0x64,
+    };
+    for ([_]bool{ false, true }) |disabled| {
+        var packet = original;
+        if (disabled) {
+            packet[26] = 0;
+            packet[27] = 0;
+        }
+        var ip_view = try IPv4Protocol.parse(&packet);
+        var udp_view = try UdpProtocol.parse(ip_view.get(.payload), ip_view);
+        var views: ViewStack = .{};
+        views.setView(.ipv4, &ip_view);
+        views.setView(.udp, &udp_view);
+
+        ip_view.setUpdateChecksum(.dst, .{ 203, 0, 113, 20 }, &views);
+        udp_view.setUpdateChecksum(.dst_port, 5300, &views);
+
+        const reparsed_ip = try IPv4Protocol.parse(&packet);
+        const reparsed_udp = try UdpProtocol.parse(reparsed_ip.get(.payload), reparsed_ip);
+        try std.testing.expectEqual(@as(u16, 5300), reparsed_udp.get(.dst_port));
+        if (disabled) try std.testing.expectEqual(@as(u16, 0), reparsed_udp.get(.checksum));
+    }
+
+    // A computed UDP checksum of zero must be transmitted as all ones.
+    var zero_packet = original;
+    const zero_ip = try IPv4Protocol.parse(&zero_packet);
+    var zero_udp = try UdpProtocol.parse(zero_ip.get(.payload), zero_ip);
+    var zero_views: ViewStack = .{};
+    zero_views.setView(.udp, &zero_udp);
+    zero_udp.setUpdateChecksum(.dst_port, 0xb2e9, &zero_views);
+    try std.testing.expectEqual(@as(u16, 0xffff), zero_udp.get(.checksum));
+    _ = try UdpProtocol.parse(zero_ip.get(.payload), zero_ip);
+}
+
+test "setUpdateChecksum updates ICMPv4 checksum" {
+    var packet = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 0x61, 0x62, 0x63 };
+    var view = try ICMPv4Protocol.parse(&packet);
+    var views: ViewStack = .{};
+    view.setUpdateChecksum(.code, 1, &views);
+    const reparsed = try ICMPv4Protocol.parse(&packet);
+    try std.testing.expectEqual(@as(u8, 1), reparsed.get(.code));
 }
 
 test "View.validate() compares integer fields at boundaries" {
