@@ -170,32 +170,29 @@ pub fn queueForArpResolution(
     };
     if (!try arp_waiters_table.register(key, buffer, device)) return;
 
-    sendRequest(device, key, sender_ip) catch |err| {
-        if (arp_waiters_table.take(key, device)) |pending| pending.release(device);
-        std.debug.print("ARP request failed: {}\n", .{err});
-    };
-}
-
-fn sendRequest(
-    device: NicApi,
-    key: ArpWaitersTable.Key,
-    sender_ip: IPv4,
-) !void {
     const sender_mac = device.macAddress(key.iface);
     const tx_buffer = device.nextTxBuffer(key.iface);
-    errdefer device.release(tx_buffer);
     var writer: std.Io.Writer = .fixed(tx_buffer);
-    try EthernetFrameView.serialize(.{
-        .dst_mac = .{0xff} ** 6,
-        .src_mac = sender_mac,
-        .vlan_tags = &.{},
-        .ethertype = .arp,
-        .payload = &.{},
-    }, &writer);
-    try ArpPacketView.serialize(
-        request(sender_ip, sender_mac, key.ip, null),
-        &writer,
-    );
+    const write_error: ?std.Io.Writer.Error = serialize: {
+        EthernetFrameView.serialize(.{
+            .dst_mac = .{0xff} ** 6,
+            .src_mac = sender_mac,
+            .vlan_tags = &.{},
+            .ethertype = .arp,
+            .payload = &.{},
+        }, &writer) catch |err| break :serialize err;
+        ArpPacketView.serialize(
+            request(sender_ip, sender_mac, key.ip, null),
+            &writer,
+        ) catch |err| break :serialize err;
+        break :serialize null;
+    };
+    if (write_error) |err| {
+        device.release(tx_buffer);
+        if (arp_waiters_table.take(key, device)) |pending| pending.release(device);
+        std.debug.print("ARP request failed: {}\n", .{err});
+        return;
+    }
     device.transmit(tx_buffer[0..writer.end]);
 }
 
