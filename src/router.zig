@@ -10,7 +10,6 @@ pub const TestFixtures = @import("test_fixtures");
 test {
     _ = Async.Fiber;
     _ = Async.FiberPool;
-    _ = Async.ReadyQueue;
     _ = Meta.Checksum;
     _ = Meta.View;
     _ = Protocols.Arp;

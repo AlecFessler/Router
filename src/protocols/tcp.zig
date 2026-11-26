@@ -1,7 +1,6 @@
 const std = @import("std");
 const Router = @import("router");
 
-const ArpWaitersTable = Router.Tables.ArpWaitersTable.ArpWaitersTable;
 const Cli = Router.Debug.Cli;
 const CsvParser = TcpFixtures.CsvParser;
 const Ethernet = Router.Protocols.Ethernet;
@@ -18,7 +17,7 @@ const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
 const classifyDestination = Router.Protocols.IPv4.classifyDestination;
-const waitForArpResolution = Router.Protocols.Arp.waitForArpResolution;
+const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
 
 const lan_arp_table = &Router.State.lan_arp_table;
 const lan_ip = &Router.State.lan_ip;
@@ -131,13 +130,9 @@ pub fn handle(
                     view.setUpdateChecksum(.src_port, src_port, views);
                     ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
 
-                    const gateway_mac = wan_arp_table.lookup(lease.router) orelse
-                        try waitForArpResolution(
-                            device,
-                            .{ .iface = .wan, .ip = lease.router },
-                        );
-
                     ethernet_view.set(.src_mac, device.macAddress(.wan));
+                    const gateway_mac = wan_arp_table.lookup(lease.router) orelse
+                        return queueForArpResolution(buffer, device, .{ .iface = .wan, .ip = lease.router });
                     ethernet_view.set(.dst_mac, gateway_mac);
 
                     device.transmit(buffer);
@@ -164,13 +159,9 @@ pub fn handle(
             view.setUpdateChecksum(.dst_port, dst_port, views);
             ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
 
-            const dst_mac = lan_arp_table.lookup(dst_ip) orelse
-                try waitForArpResolution(
-                    device,
-                    .{ .iface = .lan, .ip = dst_ip },
-                );
-
             ethernet_view.set(.src_mac, device.macAddress(.lan));
+            const dst_mac = lan_arp_table.lookup(dst_ip) orelse
+                return queueForArpResolution(buffer, device, .{ .iface = .lan, .ip = dst_ip });
             ethernet_view.set(.dst_mac, dst_mac);
 
             device.transmit(buffer);
