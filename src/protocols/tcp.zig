@@ -1,14 +1,33 @@
 const std = @import("std");
 const Router = @import("router");
 
+const ArpWaitersTable = Router.Tables.ArpWaitersTable.ArpWaitersTable;
 const Cli = Router.Debug.Cli;
+const CsvParser = TcpFixtures.CsvParser;
+const Ethernet = Router.Protocols.Ethernet;
+const EthernetFrameView = Router.Protocols.Ethernet.EthernetFrameView;
 const IFace = Router.Nic.Api.IFace;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
+const IPv4Protocol = Router.Protocols.IPv4;
+const NatTable = Router.Tables.NatTable.NatTable;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
 const PortAllocator = Router.Tables.NatTable.PortAllocator;
+const TcpFixtures = Router.TestFixtures.Tcp;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
 
-const nat_table = Router.State.nat_table;
+const classifyDestination = Router.Protocols.IPv4.classifyDestination;
+const waitForArpResolution = Router.Protocols.Arp.waitForArpResolution;
+
+const lan_arp_table = &Router.State.lan_arp_table;
+const lan_ip = &Router.State.lan_ip;
+const nat_table = &Router.State.nat_table;
+const wan_lease = &Router.State.wan_lease;
+const wan_arp_table = &Router.State.wan_arp_table;
+
+const NAT_TIMEOUT = std.Io.Duration.fromSeconds(7440);
+
 var port_allocator: PortAllocator = .{};
 
 pub const TcpPacket = struct {
@@ -62,32 +81,101 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
+    const ethernet_view = views.getView(.ethernet);
     const ip_view = views.getView(.ipv4);
-    const view = try parse(ip_view.get(.payload), ip_view.*);
+    var view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.tcp, view);
+    views.setView(.tcp, &view);
+
+    const ttl = ip_view.get(.ttl);
+    if (ttl <= 1) {
+        device.release(buffer);
+        return;
+    }
+
+    const lease = wan_lease.* orelse {
+        device.release(buffer);
+        return;
+    };
+
     switch (iface) {
         .lan => {
-            // determine if packet needs transferred on wan tx buffer
-            // or if its for another lan device
+            const dst = ip_view.get(.dst);
+            switch (classifyDestination(dst)) {
+                .wan => {
+                    const key: NatTable.Key = .{
+                        .protocol = .tcp,
+                        .ip = ip_view.get(.src),
+                        .port = view.get(.src_port),
+                    };
 
-            // for outbound packets, look up (protocol, LAN IP, LAN port)
-            // and replace the source IP and port
+                    const src_ip, const src_port = if (nat_table.outboundLookup(key, lease.ip)) |existing| hit: {
+                        try nat_table.refresh(key, NAT_TIMEOUT);
+                        break :hit existing;
+                    } else miss: {
+                        const entry = try nat_table.insert(
+                            &port_allocator,
+                            key,
+                            lease.ip,
+                            NAT_TIMEOUT,
+                        );
+                        break :miss .{
+                            entry.outside.ip,
+                            entry.outside.port,
+                        };
+                    };
+
+                    ip_view.setUpdateChecksum(.src, src_ip, views);
+                    view.setUpdateChecksum(.src_port, src_port, views);
+                    ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
+
+                    const gateway_mac = wan_arp_table.lookup(lease.router) orelse
+                        try waitForArpResolution(
+                            device,
+                            .{ .iface = .wan, .ip = lease.router },
+                        );
+
+                    ethernet_view.set(.src_mac, device.macAddress(.wan));
+                    ethernet_view.set(.dst_mac, gateway_mac);
+
+                    device.transmit(buffer);
+                },
+                else => device.release(buffer),
+            }
         },
         .wan => {
-            // drop packet if its not for a lan device
-            // determine which lan device the packet needs forwarded to
+            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
+                device.release(buffer);
+                return;
+            }
 
-            // look up (protocol, WAN IP, WAN port)
-            // and restore the destination LAN IP and port
+            const dst_ip, const dst_port = nat_table.inboundLookup(.{
+                .ip = ip_view.get(.dst),
+                .port = view.get(.dst_port),
+                .protocol = .tcp,
+            }) orelse {
+                device.release(buffer);
+                return;
+            };
+
+            ip_view.setUpdateChecksum(.dst, dst_ip, views);
+            view.setUpdateChecksum(.dst_port, dst_port, views);
+            ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
+
+            const dst_mac = lan_arp_table.lookup(dst_ip) orelse
+                try waitForArpResolution(
+                    device,
+                    .{ .iface = .lan, .ip = dst_ip },
+                );
+
+            ethernet_view.set(.src_mac, device.macAddress(.lan));
+            ethernet_view.set(.dst_mac, dst_mac);
+
+            device.transmit(buffer);
         },
     }
-    std.debug.print(
-        "TCP: packet unhandled by {s} interface\n",
-        .{@tagName(iface)},
-    );
-    device.release(buffer);
 }
 
 const test_ip_packet = [_]u8{
@@ -109,7 +197,7 @@ const test_ip_packet_with_options = [_]u8{
 };
 
 test "parse() reads TCP fields from wire bytes" {
-    const ip_view = try Router.Protocols.IPv4.parse(&test_ip_packet);
+    const ip_view = try IPv4Protocol.parse(&test_ip_packet);
     const view = try parse(ip_view.get(.payload), ip_view);
 
     try std.testing.expectEqual(@as(u16, 1234), view.get(.src_port));
@@ -135,7 +223,7 @@ test "parse() reads TCP fields from wire bytes" {
 }
 
 test "parse() rejects truncated headers" {
-    const ip_view = try Router.Protocols.IPv4.parse(&test_ip_packet);
+    const ip_view = try IPv4Protocol.parse(&test_ip_packet);
     const tcp_bytes = ip_view.get(.payload);
 
     for (0..20) |len| {
@@ -144,7 +232,7 @@ test "parse() rejects truncated headers" {
 }
 
 test "parse() reads TCP options according to the data offset" {
-    const ip_view = try Router.Protocols.IPv4.parse(&test_ip_packet_with_options);
+    const ip_view = try IPv4Protocol.parse(&test_ip_packet_with_options);
     const view = try parse(ip_view.get(.payload), ip_view);
     try std.testing.expectEqual(@as(u4, 6), view.get(.data_offset));
     try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, view.get(.options));
@@ -155,22 +243,20 @@ test "parse() reads TCP options according to the data offset" {
 test "parse() rejects invalid data offsets" {
     var packet = test_ip_packet;
     packet[32] = 0x40;
-    const ip_view = try Router.Protocols.IPv4.parse(&packet);
+    const ip_view = try IPv4Protocol.parse(&packet);
     try std.testing.expectError(error.InvalidField, parse(ip_view.get(.payload), ip_view));
 }
 
 test "parse() rejects invalid checksums" {
     var packet = test_ip_packet;
     packet[40] = 'z';
-    const ip_view = try Router.Protocols.IPv4.parse(&packet);
+    const ip_view = try IPv4Protocol.parse(&packet);
     try std.testing.expectError(error.BadChecksum, parse(ip_view.get(.payload), ip_view));
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.Tcp.CsvParser;
-    const pcap_file = Router.TestFixtures.Tcp.pcap_file;
-    const csv_file = Router.TestFixtures.Tcp.csv_file;
+    const pcap_file = TcpFixtures.pcap_file;
+    const csv_file = TcpFixtures.csv_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
@@ -179,27 +265,26 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.IPv4.Protocol.tcp, ip_view.get(.protocol));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        try std.testing.expectEqual(IPv4Protocol.Protocol.tcp, ip_view.get(.protocol));
         const view = try parse(ip_view.get(.payload), ip_view);
         try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet));
     }
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.Tcp.pcap_file;
+    const pcap_file = TcpFixtures.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try Router.Protocols.Ethernet.parse(packet);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.ipv4, frame.get(.ethertype));
-        const ip_view = try Router.Protocols.IPv4.parse(frame.get(.payload));
-        try std.testing.expectEqual(Router.Protocols.IPv4.Protocol.tcp, ip_view.get(.protocol));
+        const frame = try Ethernet.parse(packet);
+        try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
+        const ip_view = try IPv4Protocol.parse(frame.get(.payload));
+        try std.testing.expectEqual(IPv4Protocol.Protocol.tcp, ip_view.get(.protocol));
         const tcp_bytes = ip_view.get(.payload);
         var view = try parse(tcp_bytes, ip_view);
         const buffer = try std.testing.allocator.alloc(u8, tcp_bytes.len);
