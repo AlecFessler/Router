@@ -33,6 +33,8 @@ pub const Api = struct {
         self.vtable.release(self.ptr, buffer);
     }
 
+    /// Real NIC implementations pad short Ethernet frames before transmission,
+    /// in hardware or software. `buffer` contains only the serialized frame.
     pub fn transmit(self: Api, buffer: []u8) void {
         self.vtable.transmit(self.ptr, buffer);
     }

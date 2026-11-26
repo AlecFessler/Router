@@ -24,7 +24,7 @@ pub const DestinationUnreachableMsg = struct {
 pub const DestinationUnreachableMsgView = View(DestinationUnreachableMsg);
 
 pub fn validate(view: DestinationUnreachableMsgView, icmpv4_view: ICMPv4PacketView) !void {
-    if (icmpv4_view.get(.message_type) != .destination_unreachable) return error.InvalidField;
+    if (!icmpv4_view.fieldCmp(.message_type, .{ .eq = .destination_unreachable })) return error.InvalidField;
     // The quote contains the original IPv4 header and at least eight data bytes.
     if (view.get(.quoted_packet).len < 28) return error.InvalidField;
 }

@@ -85,12 +85,12 @@ pub fn handle(
         return;
     }
 
-    if (std.meta.eql(view.get(.sender_mac), my_mac)) {
+    if (view.fieldCmp(.sender_mac, .{ .eq = my_mac })) {
         device.release(buffer);
         return;
     }
 
-    if (std.meta.eql(view.get(.sender_ip), my_ip.?)) {
+    if (view.fieldCmp(.sender_ip, .{ .eq = my_ip.? })) {
         // TODO: defend this interface's IP against a conflicting MAC.
         // Queue at most one ARP announcement every 10 seconds.
         device.release(buffer);
@@ -100,7 +100,7 @@ pub fn handle(
     const opcode = view.get(.opcode);
     switch (opcode) {
         .request => {
-            if (std.meta.eql(view.get(.target_ip), my_ip.?)) {
+            if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
                 const tx_buffer = device.nextTxBuffer(iface);
                 errdefer device.release(tx_buffer);
                 var writer: std.Io.Writer = .fixed(tx_buffer);
@@ -117,12 +117,10 @@ pub fn handle(
                     &writer,
                 );
 
-                const tx_len = @max(60, writer.end);
-                @memset(tx_buffer[writer.end..tx_len], 0);
-                device.transmit(tx_buffer[0..tx_len]);
+                device.transmit(tx_buffer[0..writer.end]);
                 defer device.release(buffer);
 
-                if (std.meta.eql(view.get(.sender_ip), IPv4{ 0, 0, 0, 0 })) return;
+                if (view.fieldCmp(.sender_ip, .{ .eq = IPv4{ 0, 0, 0, 0 } })) return;
                 table.cache(view.get(.sender_ip), view.get(.sender_mac));
             } else {
                 device.release(buffer);
@@ -130,9 +128,9 @@ pub fn handle(
         },
         .reply => {
             defer device.release(buffer);
-            if (!std.meta.eql(view.get(.target_mac), my_mac)) return;
-            if (std.meta.eql(view.get(.sender_ip), IPv4{ 0, 0, 0, 0 })) return;
-            if (std.meta.eql(view.get(.target_ip), my_ip.?)) {
+            if (!view.fieldCmp(.target_mac, .{ .eq = my_mac })) return;
+            if (view.fieldCmp(.sender_ip, .{ .eq = IPv4{ 0, 0, 0, 0 } })) return;
+            if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
                 table.cache(view.get(.sender_ip), view.get(.sender_mac));
             }
         },
@@ -457,7 +455,7 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
         try std.testing.expectEqual(@as(usize, 1), nic.rx_releases);
         try std.testing.expectEqual(@as(usize, 0), nic.tx_releases);
         try std.testing.expectEqual(IFace.lan, nic.tx_iface.?);
-        try std.testing.expectEqual(@max(60, arp_end), nic.tx_len.?);
+        try std.testing.expectEqual(arp_end, nic.tx_len.?);
         try std.testing.expectEqualSlices(u8, &peer_mac, nic.tx[0..6]);
         try std.testing.expectEqualSlices(u8, &HandlerTestNic.LAN_MAC, nic.tx[6..12]);
         try std.testing.expectEqualSlices(u8, tags, nic.tx[12 .. 12 + tags.len]);
@@ -467,10 +465,6 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
         try std.testing.expectEqualSlices(u8, &my_ip, nic.tx[arp_start + 14 .. arp_start + 18]);
         try std.testing.expectEqualSlices(u8, &peer_mac, nic.tx[arp_start + 18 .. arp_start + 24]);
         try std.testing.expectEqualSlices(u8, &case.sender_ip, nic.tx[arp_start + 24 .. arp_end]);
-        for (nic.tx[arp_end..nic.tx_len.?]) |padding| {
-            try std.testing.expectEqual(@as(u8, 0), padding);
-        }
-
         if (std.meta.eql(case.sender_ip, IPv4{ 0, 0, 0, 0 })) {
             try std.testing.expectEqual(null, State.lan_arp_table.lookup(case.sender_ip));
         } else {

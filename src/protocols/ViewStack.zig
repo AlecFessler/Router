@@ -15,7 +15,7 @@ pub const Protocol = enum {
     icmpv4,
 };
 
-fn protocolToViewType(comptime protocol: Protocol) type {
+fn ProtocolToViewType(comptime protocol: Protocol) type {
     return switch (protocol) {
         .ethernet => *EthernetFrameView,
         .ipv4 => *IPv4PacketView,
@@ -35,14 +35,14 @@ fn viewIndex(comptime protocol: Protocol) usize {
 pub fn getView(
     self: *const @This(),
     comptime protocol: Protocol,
-) protocolToViewType(protocol) {
+) ProtocolToViewType(protocol) {
     return @ptrCast(@alignCast(self.views[viewIndex(protocol)]));
 }
 
 pub fn setView(
     self: *@This(),
     comptime protocol: Protocol,
-    view: protocolToViewType(protocol),
+    view: ProtocolToViewType(protocol),
 ) void {
     self.views[viewIndex(protocol)] = @ptrCast(view);
 }

@@ -99,9 +99,8 @@ pub const EthernetFrame = struct {
 pub const EthernetFrameView = View(EthernetFrame);
 
 pub fn validate(view: EthernetFrameView) !void {
-    const ethertype = @intFromEnum(view.get(.ethertype));
-    const is_ethernet_II_frame = ethertype > PAYLOAD_LEN_MAX;
-    const ethertype_invalid = is_ethernet_II_frame and ethertype <= VALID_ETHERTYPE_MIN;
+    const is_ethernet_II_frame = view.fieldCmp(.ethertype, .{ .gt = PAYLOAD_LEN_MAX });
+    const ethertype_invalid = is_ethernet_II_frame and view.fieldCmp(.ethertype, .{ .lte = VALID_ETHERTYPE_MIN });
     if (ethertype_invalid) {
         return error.InvalidEthertype;
     }
@@ -128,9 +127,8 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     try frame_view.takeBytes(.vlan_tags, tag_bytes, &reader);
 
     try frame_view.takeField(.ethertype, &reader);
-    const ethertype = @intFromEnum(frame_view.get(.ethertype));
-    const payload_len = if (ethertype <= PAYLOAD_LEN_MAX)
-        ethertype
+    const payload_len = if (frame_view.fieldCmp(.ethertype, .{ .lte = PAYLOAD_LEN_MAX }))
+        @intFromEnum(frame_view.get(.ethertype))
     else
         reader.bufferedLen();
     try frame_view.takeBytes(.payload, payload_len, &reader);

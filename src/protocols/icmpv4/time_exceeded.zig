@@ -21,7 +21,7 @@ pub const TimeExceededMsg = struct {
 pub const TimeExceededMsgView = View(TimeExceededMsg);
 
 pub fn validate(view: TimeExceededMsgView, icmpv4_view: ICMPv4PacketView) !void {
-    if (icmpv4_view.get(.message_type) != .time_exceeded) return error.InvalidField;
+    if (!icmpv4_view.fieldCmp(.message_type, .{ .eq = .time_exceeded })) return error.InvalidField;
     try icmpv4_view.validate(.code, .{ .lte = 1 });
     if (view.get(.quoted_packet).len < 28) return error.InvalidField;
 }

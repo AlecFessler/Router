@@ -28,7 +28,11 @@ fn Validation(comptime FieldT: type) type {
             multiple_of: T,
             eq: FieldT,
         },
-        .@"enum" => union(enum) {
+        .@"enum" => |info| union(enum) {
+            lt: info.tag_type,
+            gt: info.tag_type,
+            lte: info.tag_type,
+            gte: info.tag_type,
             eq: FieldT,
             any,
         },
@@ -330,27 +334,26 @@ pub fn View(Base: type) type {
             }
         }
 
-        pub fn validate(
+        pub fn fieldCmp(
             self: *const @This(),
             comptime field: FieldEnum,
             condition: Validation(FieldType(Base, field)),
-        ) error{InvalidField}!void {
+        ) bool {
             const FieldT = FieldType(Base, field);
             const T = UnderlyingType(FieldT);
             const storage = @field(self.fields, @tagName(field));
 
             if (comptime @typeInfo(FieldT) == .optional) {
                 if (condition == .eq and condition.eq == null) {
-                    if (storage != null) return error.InvalidField;
-                    return;
+                    return storage == null;
                 }
-                if (storage == null) return error.InvalidField;
+                if (storage == null) return false;
             }
 
             const actual: T = if (comptime @typeInfo(T) == .@"enum") blk: {
                 const ptr = if (comptime @typeInfo(FieldT) == .optional) storage.? else storage;
                 const raw = std.mem.bigToNative(@typeInfo(T).@"enum".tag_type, ptr.*);
-                break :blk std.enums.fromInt(T, raw) orelse return error.InvalidField;
+                break :blk std.enums.fromInt(T, raw) orelse return false;
             } else if (comptime @typeInfo(FieldT) == .optional)
                 self.get(field).?
             else
@@ -365,28 +368,36 @@ pub fn View(Base: type) type {
                     std.mem.eql(u8, actual, value)
                 else
                     std.meta.eql(actual, value);
-                if (!matches) return error.InvalidField;
-                return;
+                return matches;
             }
 
-            switch (@typeInfo(T)) {
-                .int => {
-                    const matches = switch (condition) {
-                        .lt => |value| actual < value,
-                        .gt => |value| actual > value,
-                        .lte => |value| actual <= value,
-                        .gte => |value| actual >= value,
-                        .multiple_of => |value| value != 0 and @rem(actual, value) == 0,
-                        .eq => unreachable,
-                    };
-                    if (!matches) return error.InvalidField;
+            return switch (@typeInfo(T)) {
+                .int => switch (condition) {
+                    .lt => |value| actual < value,
+                    .gt => |value| actual > value,
+                    .lte => |value| actual <= value,
+                    .gte => |value| actual >= value,
+                    .multiple_of => |value| value != 0 and @rem(actual, value) == 0,
+                    .eq => unreachable,
                 },
                 .@"enum" => switch (condition) {
-                    .any => {},
+                    .any => true,
+                    .lt => |value| @intFromEnum(actual) < value,
+                    .gt => |value| @intFromEnum(actual) > value,
+                    .lte => |value| @intFromEnum(actual) <= value,
+                    .gte => |value| @intFromEnum(actual) >= value,
                     .eq => unreachable,
                 },
                 else => unreachable,
-            }
+            };
+        }
+
+        pub fn validate(
+            self: *const @This(),
+            comptime field: FieldEnum,
+            condition: Validation(FieldType(Base, field)),
+        ) error{InvalidField}!void {
+            if (!self.fieldCmp(field, condition)) return error.InvalidField;
         }
 
         pub fn get(
@@ -1180,6 +1191,26 @@ test "View.validate() handles optional field presence and values" {
         error.InvalidField,
         view.validate(.test_enum, .any),
     );
+}
+
+test "View.fieldCmp() compares fields without raising validation errors" {
+    var buffer = test_buffer;
+    const view = parseTestBuffer(&buffer);
+
+    try std.testing.expect(view.fieldCmp(.test_int, .{ .eq = 0x0806 }));
+    try std.testing.expect(!view.fieldCmp(.test_int, .{ .eq = 0x1234 }));
+    try std.testing.expect(view.fieldCmp(.test_int, .{ .multiple_of = 2 }));
+    try std.testing.expect(!view.fieldCmp(.test_int, .{ .multiple_of = 0 }));
+    try std.testing.expect(view.fieldCmp(.test_enum, .any));
+    try std.testing.expect(view.fieldCmp(.test_enum, .{ .lt = 0xFFFF }));
+    try std.testing.expect(!view.fieldCmp(.test_enum, .{ .lt = 0xABCD }));
+    try std.testing.expect(view.fieldCmp(.test_array, .{ .eq = .{ 1, 2, 3, 4 } }));
+    try std.testing.expect(view.fieldCmp(.test_absent_int, .{ .eq = null }));
+    try std.testing.expect(!view.fieldCmp(.test_absent_int, .{ .eq = 0 }));
+
+    buffer[2] = 0xFF;
+    buffer[3] = 0xFF;
+    try std.testing.expect(!view.fieldCmp(.test_enum, .any));
 }
 
 test "View.validate() compares integer fields at boundaries" {
