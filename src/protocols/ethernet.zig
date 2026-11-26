@@ -139,7 +139,6 @@ pub fn parse(buffer: []const u8) !EthernetFrameView {
     return frame_view;
 }
 
-// give the reader the EthernetFrame or EthernetFrameView .vlan_tags buffer
 pub fn parseVlanTag(reader: *std.Io.Reader) !VlanTagView {
     var view: VlanTagView = undefined;
     try view.takeFields(.tpid, .vid, reader);
@@ -150,13 +149,15 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(buffer);
+    var view = try parse(buffer);
     Cli.enter(.ethernet, view);
+    views.setView(.ethernet, &view);
     const ethertype = view.get(.ethertype);
     switch (ethertype) {
-        .ipv4 => try IPv4.handle(buffer, view.get(.payload), device, iface),
-        .arp => try Arp.handle(buffer, view.get(.payload), view, device, iface),
+        .ipv4 => try IPv4.handle(buffer, device, iface, views),
+        .arp => try Arp.handle(buffer, device, iface, views),
         else => {
             std.debug.print(
                 "Ethernet: packet with ethertype {f} unhandled by {s} interface\n",

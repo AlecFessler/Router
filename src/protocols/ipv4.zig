@@ -83,18 +83,20 @@ pub fn parse(buffer: []const u8) !IPv4PacketView {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    packet: []u8, // the ethernet frame payload
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(packet);
+    const packet = views.getView(.ethernet).get(.payload);
+    var view = try parse(packet);
     Cli.enter(.ipv4, view);
+    views.setView(.ipv4, &view);
     const protocol = view.get(.protocol);
     switch (protocol) {
-        .icmp => try ICMPv4.handle(buffer, view.get(.payload), device, iface),
-        .tcp => try Tcp.handle(buffer, view.get(.payload), device, iface, view),
-        .udp => try Udp.handle(buffer, view.get(.payload), device, iface, view),
+        .icmp => try ICMPv4.handle(buffer, device, iface, views),
+        .tcp => try Tcp.handle(buffer, device, iface, views),
+        .udp => try Udp.handle(buffer, device, iface, views),
         else => {
             std.debug.print(
                 "IPv4: packet with protocol: {f} unhandled by {s} interface\n",

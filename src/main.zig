@@ -6,6 +6,7 @@ const IFace = Router.Nic.Api.IFace;
 const Mock = Router.Nic.Testing.Mock;
 const State = Router.State;
 const Tables = Router.Tables;
+const ViewStack = Router.Protocols.ViewStack;
 
 const ARP_CAPACITY: u32 = 256;
 const ARP_TTL = std.Io.Duration.fromSeconds(300);
@@ -62,7 +63,8 @@ pub fn main(init: std.process.Init) !void {
     var packet_num: usize = 1;
     while (true) {
         const packet = mock_nic.receive(iface) orelse break;
-        Ethernet.handle(packet, mock_nic, iface) catch |err| {
+        var views: ViewStack = .{};
+        Ethernet.handle(packet, mock_nic, iface, &views) catch |err| {
             mock_nic.release(packet);
             std.debug.print("Error: {}\n", .{err});
         };

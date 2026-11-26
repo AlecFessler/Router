@@ -33,12 +33,13 @@ pub fn parse(icmpv4_view: ICMPv4PacketView) !EchoMsgView {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    icmpv4_view: ICMPv4PacketView,
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(icmpv4_view);
+    const icmpv4_view = views.getView(.icmpv4);
+    const view = try parse(icmpv4_view.*);
     Cli.enter(.echo, view);
     switch (icmpv4_view.get(.message_type)) {
         .echo_request => std.debug.print("ICMPv4 echo request unhandled by {s} interface\n", .{@tagName(iface)}),

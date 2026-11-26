@@ -215,12 +215,12 @@ pub fn parseOption(reader: *std.Io.Reader) !?OptionValue {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    packet: []u8,
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(packet);
+    const view = try parse(views.getView(.udp).get(.payload));
     Cli.enter(.dhcpv4, view);
 
     var message_type_scanner: std.Io.Reader = .fixed(view.get(.options));

@@ -39,12 +39,13 @@ pub fn parse(icmpv4_view: ICMPv4PacketView) !DestinationUnreachableMsgView {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    icmpv4_view: ICMPv4PacketView,
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(icmpv4_view);
+    const icmpv4_view = views.getView(.icmpv4);
+    const view = try parse(icmpv4_view.*);
     Cli.enter(.destination_unreachable, view);
     const code: Code = @enumFromInt(icmpv4_view.get(.code));
     switch (code) {

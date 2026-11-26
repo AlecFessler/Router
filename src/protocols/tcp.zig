@@ -59,13 +59,13 @@ pub fn parse(buffer: []const u8, ip_view: IPv4PacketView) !TcpPacketView {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    packet: []u8, // the ipv4 payload
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
-    ip_view: IPv4PacketView,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(packet, ip_view);
+    const ip_view = views.getView(.ipv4);
+    const view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.tcp, view);
     switch (iface) {
         .lan => {

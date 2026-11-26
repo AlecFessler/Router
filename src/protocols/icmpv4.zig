@@ -49,23 +49,24 @@ pub fn parse(buffer: []const u8) !ICMPv4PacketView {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    packet: []u8,
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(packet);
+    var view = try parse(views.getView(.ipv4).get(.payload));
     Cli.enter(.icmpv4, view);
+    views.setView(.icmpv4, &view);
     const message_type = view.get(.message_type);
     switch (message_type) {
         .echo_reply, .echo_request => {
-            try Echo.handle(buffer, view, device, iface);
+            try Echo.handle(buffer, device, iface, views);
         },
         .destination_unreachable => {
-            try DestinationUnreachable.handle(buffer, view, device, iface);
+            try DestinationUnreachable.handle(buffer, device, iface, views);
         },
         .time_exceeded => {
-            try TimeExceeded.handle(buffer, view, device, iface);
+            try TimeExceeded.handle(buffer, device, iface, views);
         },
         else => {
             std.debug.print(

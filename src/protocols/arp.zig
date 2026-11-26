@@ -59,12 +59,12 @@ pub fn parse(buffer: []const u8) !ArpPacketView {
 
 pub fn handle(
     buffer: []u8,
-    packet: []u8,
-    ethernet_view: EthernetFrameView,
     device: NicApi,
     iface: IFace,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    var view = try parse(packet);
+    const ethernet_view = views.getView(.ethernet);
+    var view = try parse(ethernet_view.get(.payload));
     Cli.enter(.arp, view);
 
     const table = switch (iface) {
@@ -403,6 +403,18 @@ fn testArpFrame(
     return nic.rx[0..writer.end];
 }
 
+fn testHandle(
+    frame: []u8,
+    ethernet_view: EthernetFrameView,
+    device: NicApi,
+    iface: IFace,
+) !void {
+    var parent_view = ethernet_view;
+    var views: Router.Protocols.ViewStack = .{};
+    views.setView(.ethernet, &parent_view);
+    try handle(frame, device, iface, &views);
+}
+
 test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
     const State = Router.State;
     const my_ip: IPv4 = .{ 192, 168, 86, 1 };
@@ -438,7 +450,7 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
             request(case.sender_ip, peer_mac, my_ip, null),
         );
         const ethernet_view = try Router.Protocols.Ethernet.parse(frame);
-        try handle(frame, ethernet_view.get(.payload), ethernet_view, nic.api(), .lan);
+        try testHandle(frame, ethernet_view, nic.api(), .lan);
 
         const arp_start = 14 + tags.len;
         const arp_end = arp_start + 28;
@@ -501,7 +513,7 @@ test "handle() learns WAN replies addressed to this interface and drops ARP with
         .target_ip = wan_ip,
     });
     const ethernet_view = try Router.Protocols.Ethernet.parse(frame);
-    try handle(frame, ethernet_view.get(.payload), ethernet_view, nic.api(), .wan);
+    try testHandle(frame, ethernet_view, nic.api(), .wan);
     try std.testing.expectEqual(gateway_mac, State.wan_arp_table.lookup(gateway_ip).?);
     try std.testing.expectEqual(@as(usize, 1), nic.rx_releases);
     try std.testing.expectEqual(null, nic.tx_len);
@@ -515,7 +527,7 @@ test "handle() learns WAN replies addressed to this interface and drops ARP with
         request(gateway_ip, gateway_mac, wan_ip, null),
     );
     const unconfigured_view = try Router.Protocols.Ethernet.parse(unconfigured_frame);
-    try handle(unconfigured_frame, unconfigured_view.get(.payload), unconfigured_view, unconfigured.api(), .wan);
+    try testHandle(unconfigured_frame, unconfigured_view, unconfigured.api(), .wan);
     try std.testing.expectEqual(@as(usize, 1), unconfigured.rx_releases);
     try std.testing.expectEqual(null, unconfigured.tx_len);
 }
@@ -542,7 +554,7 @@ test "handle() releases unrelated requests and transmit buffers on serialization
         request(peer_ip, peer_mac, .{ 192, 168, 86, 99 }, null),
     );
     const unrelated_view = try Router.Protocols.Ethernet.parse(unrelated_frame);
-    try handle(unrelated_frame, unrelated_view.get(.payload), unrelated_view, unrelated.api(), .lan);
+    try testHandle(unrelated_frame, unrelated_view, unrelated.api(), .lan);
     try std.testing.expectEqual(@as(usize, 1), unrelated.rx_releases);
     try std.testing.expectEqual(null, unrelated.tx_len);
     try std.testing.expectEqual(null, State.lan_arp_table.lookup(peer_ip));
@@ -557,7 +569,7 @@ test "handle() releases unrelated requests and transmit buffers on serialization
     const ethernet_view = try Router.Protocols.Ethernet.parse(frame);
     try std.testing.expectError(
         error.WriteFailed,
-        handle(frame, ethernet_view.get(.payload), ethernet_view, failing.api(), .lan),
+        testHandle(frame, ethernet_view, failing.api(), .lan),
     );
     try std.testing.expectEqual(@as(usize, 1), failing.tx_releases);
     try std.testing.expectEqual(@as(usize, 0), failing.rx_releases);

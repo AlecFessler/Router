@@ -42,18 +42,19 @@ pub fn parse(buffer: []const u8, ip_view: IPv4PacketView) !UdpPacketView {
 }
 
 pub fn handle(
-    buffer: []u8, // the full ethernet frame
-    packet: []u8, // the ipv4 payload
+    buffer: []u8,
     device: NicApi,
     iface: IFace,
-    ip_view: IPv4PacketView,
+    views: *Router.Protocols.ViewStack,
 ) !void {
-    const view = try parse(packet, ip_view);
+    const ip_view = views.getView(.ipv4);
+    var view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.udp, view);
+    views.setView(.udp, &view);
     switch (iface) {
         .wan => {
             if (view.get(.src_port) == 67 and view.get(.dst_port) == 68) {
-                try DHCPv4.handle(buffer, view.get(.payload), device, iface);
+                try DHCPv4.handle(buffer, device, iface, views);
             } else {
                 std.debug.print(
                     "UDP: packet unhandled by {s} interface\n",
@@ -64,7 +65,7 @@ pub fn handle(
         },
         .lan => {
             if (view.get(.src_port) == 68 and view.get(.dst_port) == 67) {
-                try DHCPv4.handle(buffer, view.get(.payload), device, iface);
+                try DHCPv4.handle(buffer, device, iface, views);
             } else {
                 std.debug.print(
                     "UDP: packet unhandled by {s} interface\n",
