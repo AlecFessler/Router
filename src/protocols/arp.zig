@@ -13,14 +13,34 @@
 const std = @import("std");
 const Router = @import("router");
 
+const ArpFixtures = Router.TestFixtures.Arp;
+const ArpTableModule = Router.Tables.ArpTable;
+const ArpWaitersTable = Router.Tables.ArpWaitersTable.ArpWaitersTable;
 const Cli = Router.Debug.Cli;
+const CsvParser = ArpFixtures.CsvParser;
+const Ethernet = Router.Protocols.Ethernet;
 const EthernetFrame = Router.Protocols.Ethernet.EthernetFrame;
 const EthernetFrameView = Router.Protocols.Ethernet.EthernetFrameView;
+const Fiber = Router.Async.Fiber.Fiber;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const Mac = Router.Protocols.Ethernet.Mac;
 const NicApi = Router.Nic.Api.Api;
+const PcapParser = Router.TestFixtures.PcapParser;
+const ReadyQueue = Router.Async.ReadyQueue.ReadyQueue;
 const View = Router.Meta.View.View;
+const ViewStack = Router.Protocols.ViewStack;
+
+const getRunning = Router.Async.getRunning;
+const setRunning = Router.Async.setRunning;
+
+const arp_waiters_table = &Router.State.arp_waiters_table;
+const lan_arp_table = &Router.State.lan_arp_table;
+const lan_ip = &Router.State.lan_ip;
+const lan_ready_queue = &Router.State.lan_ready_queue;
+const wan_arp_table = &Router.State.wan_arp_table;
+const wan_lease = &Router.State.wan_lease;
+const wan_ready_queue = &Router.State.wan_ready_queue;
 
 pub const OpCode = enum(u16) {
     request = 1,
@@ -61,19 +81,19 @@ pub fn handle(
     buffer: []u8,
     device: NicApi,
     iface: IFace,
-    views: *Router.Protocols.ViewStack,
+    views: *ViewStack,
 ) !void {
     const ethernet_view = views.getView(.ethernet);
     var view = try parse(ethernet_view.get(.payload));
     Cli.enter(.arp, view);
 
     const table = switch (iface) {
-        .lan => &Router.State.lan_arp_table,
-        .wan => &Router.State.wan_arp_table,
+        .lan => lan_arp_table,
+        .wan => wan_arp_table,
     };
     const my_ip = switch (iface) {
-        .lan => Router.State.lan_ip,
-        .wan => if (Router.State.wan_lease) |lease|
+        .lan => lan_ip.*,
+        .wan => if (wan_lease.*) |lease|
             lease.ip
         else
             null,
@@ -132,9 +152,62 @@ pub fn handle(
             if (view.fieldCmp(.sender_ip, .{ .eq = IPv4{ 0, 0, 0, 0 } })) return;
             if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
                 table.cache(view.get(.sender_ip), view.get(.sender_mac));
+                arp_waiters_table.resolve(
+                    .{ .iface = iface, .ip = view.get(.sender_ip) },
+                    view.get(.sender_mac),
+                );
             }
         },
     }
+}
+
+pub fn waitForArpResolution(
+    device: NicApi,
+    key: ArpWaitersTable.Key,
+) !Mac {
+    const running = getRunning() orelse return error.NotInFiber;
+    const sender_ip = switch (key.iface) {
+        .lan => lan_ip.*,
+        .wan => if (wan_lease.*) |lease| lease.ip else return error.NoWanLease,
+    };
+    const ready_queue = switch (running.owner) {
+        .lan => lan_ready_queue,
+        .wan => wan_ready_queue,
+    };
+
+    var outcome: ArpWaitersTable.Outcome = undefined;
+    var node: ReadyQueue.Node = .{ .fiber = running.fiber };
+    const send_request = try arp_waiters_table.register(key, .{
+        .node = &node,
+        .ready_queue = ready_queue,
+        .outcome = &outcome,
+    });
+
+    if (send_request) {
+        const sender_mac = device.macAddress(key.iface);
+        const tx_buffer = device.nextTxBuffer(key.iface);
+        var writer: std.Io.Writer = .fixed(tx_buffer);
+
+        EthernetFrameView.serialize(.{
+            .dst_mac = .{0xff} ** 6,
+            .src_mac = sender_mac,
+            .vlan_tags = &.{},
+            .ethertype = .arp,
+            .payload = &.{},
+        }, &writer) catch unreachable;
+        ArpPacketView.serialize(
+            request(sender_ip, sender_mac, key.ip, null),
+            &writer,
+        ) catch unreachable;
+
+        device.transmit(tx_buffer[0..writer.end]);
+    }
+
+    Fiber.switchTo(running.fiber, running.loop_context);
+    return switch (outcome) {
+        .resolved => |mac| mac,
+        .timed_out => error.ArpResolutionTimedOut,
+    };
 }
 
 pub fn reply(
@@ -204,10 +277,8 @@ test "parse() rejects invalid metadata fields" {
 }
 
 test "parse() on wireshark captured frames matches wireshark's parsed output" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const CsvParser = Router.TestFixtures.Arp.CsvParser;
-    const pcap_file = Router.TestFixtures.Arp.pcap_file;
-    const csv_file = Router.TestFixtures.Arp.csv_file;
+    const pcap_file = ArpFixtures.pcap_file;
+    const csv_file = ArpFixtures.csv_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
@@ -216,22 +287,21 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
 
     try std.testing.expectEqual(parsed_packets.len, parsed_pcap.packet_bytes.len);
     for (parsed_packets, 0..) |ws_packet, i| {
-        const frame = try Router.Protocols.Ethernet.parse(parsed_pcap.packet_bytes[i]);
-        try std.testing.expectEqual(Router.Protocols.Ethernet.Ethertype.arp, frame.get(.ethertype));
+        const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
+        try std.testing.expectEqual(Ethernet.Ethertype.arp, frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
         try std.testing.expect(view.isEqual(&ws_packet));
     }
 }
 
 test "parse() then serialize() returns the original bytes" {
-    const PcapParser = Router.TestFixtures.PcapParser;
-    const pcap_file = Router.TestFixtures.Arp.pcap_file;
+    const pcap_file = ArpFixtures.pcap_file;
 
     var parsed_pcap = try PcapParser.parse(pcap_file, std.testing.allocator);
     defer parsed_pcap.deinit(std.testing.allocator);
 
     for (parsed_pcap.packet_bytes) |packet| {
-        const frame = try Router.Protocols.Ethernet.parse(packet);
+        const frame = try Ethernet.parse(packet);
         const arp_bytes = frame.get(.payload);
         var view = try parse(arp_bytes);
         var buffer: [@sizeOf(ArpPacket)]u8 = undefined;
@@ -408,13 +478,12 @@ fn testHandle(
     iface: IFace,
 ) !void {
     var parent_view = ethernet_view;
-    var views: Router.Protocols.ViewStack = .{};
+    var views: ViewStack = .{};
     views.setView(.ethernet, &parent_view);
     try handle(frame, device, iface, &views);
 }
 
 test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
-    const State = Router.State;
     const my_ip: IPv4 = .{ 192, 168, 86, 1 };
     const peer_ip: IPv4 = .{ 192, 168, 86, 42 };
     const peer_mac: Mac = .{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
@@ -423,14 +492,14 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
         .{ .sender_ip = peer_ip, .tag_count = 0 },
         .{ .sender_ip = .{ 0, 0, 0, 0 }, .tag_count = 5 },
     }) |case| {
-        State.lan_ip = my_ip;
-        State.lan_arp_table = try Router.Tables.ArpTable.ArpTable.init(
+        lan_ip.* = my_ip;
+        lan_arp_table.* = try ArpTableModule.ArpTable.init(
             std.testing.allocator,
             std.testing.io,
             8,
             .fromSeconds(60),
         );
-        defer State.lan_arp_table.deinit(std.testing.allocator);
+        defer lan_arp_table.*.deinit(std.testing.allocator);
 
         var nic: HandlerTestNic = .{};
         var tag_storage: [20]u8 = undefined;
@@ -447,7 +516,7 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
             tags,
             request(case.sender_ip, peer_mac, my_ip, null),
         );
-        const ethernet_view = try Router.Protocols.Ethernet.parse(frame);
+        const ethernet_view = try Ethernet.parse(frame);
         try testHandle(frame, ethernet_view, nic.api(), .lan);
 
         const arp_start = 14 + tags.len;
@@ -466,21 +535,20 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
         try std.testing.expectEqualSlices(u8, &peer_mac, nic.tx[arp_start + 18 .. arp_start + 24]);
         try std.testing.expectEqualSlices(u8, &case.sender_ip, nic.tx[arp_start + 24 .. arp_end]);
         if (std.meta.eql(case.sender_ip, IPv4{ 0, 0, 0, 0 })) {
-            try std.testing.expectEqual(null, State.lan_arp_table.lookup(case.sender_ip));
+            try std.testing.expectEqual(null, lan_arp_table.*.lookup(case.sender_ip));
         } else {
-            try std.testing.expectEqual(peer_mac, State.lan_arp_table.lookup(case.sender_ip).?);
+            try std.testing.expectEqual(peer_mac, lan_arp_table.*.lookup(case.sender_ip).?);
         }
     }
 }
 
 test "handle() learns WAN replies addressed to this interface and drops ARP without a lease" {
-    const State = Router.State;
     const wan_ip: IPv4 = .{ 136, 48, 33, 52 };
     const gateway_ip: IPv4 = .{ 136, 48, 32, 1 };
     const gateway_mac: Mac = .{ 0x02, 0x21, 0x22, 0x23, 0x24, 0x25 };
     const now = std.Io.Timestamp.now(std.testing.io, .boot);
 
-    State.wan_lease = .{
+    wan_lease.* = .{
         .ip = wan_ip,
         .subnet_mask = .{ 255, 255, 240, 0 },
         .router = gateway_ip,
@@ -489,14 +557,16 @@ test "handle() learns WAN replies addressed to this interface and drops ARP with
         .rebinding_deadline = now,
         .expiration_deadline = now,
     };
-    defer State.wan_lease = null;
-    State.wan_arp_table = try Router.Tables.ArpTable.ArpTable.init(
+    defer wan_lease.* = null;
+    wan_arp_table.* = try ArpTableModule.ArpTable.init(
         std.testing.allocator,
         std.testing.io,
         8,
         .fromSeconds(60),
     );
-    defer State.wan_arp_table.deinit(std.testing.allocator);
+    defer wan_arp_table.*.deinit(std.testing.allocator);
+    arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(2));
+    defer arp_waiters_table.*.deinit(std.testing.allocator);
 
     var nic: HandlerTestNic = .{};
     const frame = try testArpFrame(&nic, HandlerTestNic.WAN_MAC, &.{}, .{
@@ -506,13 +576,13 @@ test "handle() learns WAN replies addressed to this interface and drops ARP with
         .target_mac = HandlerTestNic.WAN_MAC,
         .target_ip = wan_ip,
     });
-    const ethernet_view = try Router.Protocols.Ethernet.parse(frame);
+    const ethernet_view = try Ethernet.parse(frame);
     try testHandle(frame, ethernet_view, nic.api(), .wan);
-    try std.testing.expectEqual(gateway_mac, State.wan_arp_table.lookup(gateway_ip).?);
+    try std.testing.expectEqual(gateway_mac, wan_arp_table.*.lookup(gateway_ip).?);
     try std.testing.expectEqual(@as(usize, 1), nic.rx_releases);
     try std.testing.expectEqual(null, nic.tx_len);
 
-    State.wan_lease = null;
+    wan_lease.* = null;
     var unconfigured: HandlerTestNic = .{};
     const unconfigured_frame = try testArpFrame(
         &unconfigured,
@@ -520,25 +590,24 @@ test "handle() learns WAN replies addressed to this interface and drops ARP with
         &.{},
         request(gateway_ip, gateway_mac, wan_ip, null),
     );
-    const unconfigured_view = try Router.Protocols.Ethernet.parse(unconfigured_frame);
+    const unconfigured_view = try Ethernet.parse(unconfigured_frame);
     try testHandle(unconfigured_frame, unconfigured_view, unconfigured.api(), .wan);
     try std.testing.expectEqual(@as(usize, 1), unconfigured.rx_releases);
     try std.testing.expectEqual(null, unconfigured.tx_len);
 }
 
 test "handle() releases unrelated requests and transmit buffers on serialization failure" {
-    const State = Router.State;
     const my_ip: IPv4 = .{ 192, 168, 86, 1 };
     const peer_ip: IPv4 = .{ 192, 168, 86, 42 };
     const peer_mac: Mac = .{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
-    State.lan_ip = my_ip;
-    State.lan_arp_table = try Router.Tables.ArpTable.ArpTable.init(
+    lan_ip.* = my_ip;
+    lan_arp_table.* = try ArpTableModule.ArpTable.init(
         std.testing.allocator,
         std.testing.io,
         8,
         .fromSeconds(60),
     );
-    defer State.lan_arp_table.deinit(std.testing.allocator);
+    defer lan_arp_table.*.deinit(std.testing.allocator);
 
     var unrelated: HandlerTestNic = .{};
     const unrelated_frame = try testArpFrame(
@@ -547,11 +616,11 @@ test "handle() releases unrelated requests and transmit buffers on serialization
         &.{},
         request(peer_ip, peer_mac, .{ 192, 168, 86, 99 }, null),
     );
-    const unrelated_view = try Router.Protocols.Ethernet.parse(unrelated_frame);
+    const unrelated_view = try Ethernet.parse(unrelated_frame);
     try testHandle(unrelated_frame, unrelated_view, unrelated.api(), .lan);
     try std.testing.expectEqual(@as(usize, 1), unrelated.rx_releases);
     try std.testing.expectEqual(null, unrelated.tx_len);
-    try std.testing.expectEqual(null, State.lan_arp_table.lookup(peer_ip));
+    try std.testing.expectEqual(null, lan_arp_table.*.lookup(peer_ip));
 
     var failing: HandlerTestNic = .{ .tx_capacity = 8 };
     const frame = try testArpFrame(
@@ -560,7 +629,7 @@ test "handle() releases unrelated requests and transmit buffers on serialization
         &.{},
         request(peer_ip, peer_mac, my_ip, null),
     );
-    const ethernet_view = try Router.Protocols.Ethernet.parse(frame);
+    const ethernet_view = try Ethernet.parse(frame);
     try std.testing.expectError(
         error.WriteFailed,
         testHandle(frame, ethernet_view, failing.api(), .lan),
@@ -570,4 +639,141 @@ test "handle() releases unrelated requests and transmit buffers on serialization
     try std.testing.expectEqual(null, failing.tx_len);
     failing.api().release(frame); // The caller releases RX when handle returns an error.
     try std.testing.expectEqual(@as(usize, 1), failing.rx_releases);
+}
+
+test "ARP reply resumes a WAN fiber waiting for a LAN neighbor" {
+    const WaitTask = struct {
+        loop_context: *std.Io.fiber.Context,
+        device: NicApi,
+        key: ArpWaitersTable.Key,
+        mac: ?Mac = null,
+        err: ?anyerror = null,
+        done: bool = false,
+
+        fn start(fiber: *Fiber, arg: *anyopaque) noreturn {
+            const self: *@This() = @ptrCast(@alignCast(arg));
+            if (waitForArpResolution(self.device, self.key)) |mac| {
+                self.mac = mac;
+            } else |err| {
+                self.err = err;
+            }
+            self.done = true;
+            Fiber.switchTo(fiber, self.loop_context);
+            unreachable;
+        }
+    };
+
+    const peer_ip: IPv4 = .{ 192, 168, 86, 42 };
+    const peer_mac: Mac = .{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    lan_ip.* = .{ 192, 168, 86, 1 };
+    lan_arp_table.* = try ArpTableModule.ArpTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(60));
+    defer lan_arp_table.*.deinit(std.testing.allocator);
+    arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(30));
+    defer arp_waiters_table.*.deinit(std.testing.allocator);
+    lan_ready_queue.* = ReadyQueue.init(std.testing.io);
+    wan_ready_queue.* = ReadyQueue.init(std.testing.io);
+    defer setRunning(null);
+
+    var nic: HandlerTestNic = .{};
+    var loop_context: std.Io.fiber.Context = undefined;
+    var task: WaitTask = .{
+        .loop_context = &loop_context,
+        .device = nic.api(),
+        .key = .{ .iface = .lan, .ip = peer_ip },
+    };
+    var fiber = try Fiber.init(std.testing.allocator, 8 * 1024, WaitTask.start, &task);
+    defer fiber.deinit(std.testing.allocator);
+
+    setRunning(.{ .fiber = &fiber, .loop_context = &loop_context, .owner = .wan });
+    Fiber.switchTo(&loop_context, &fiber);
+    setRunning(null);
+    try std.testing.expect(!task.done);
+    try std.testing.expectEqual(IFace.lan, nic.tx_iface.?);
+    const request_frame = try Ethernet.parse(nic.tx[0..nic.tx_len.?]);
+    const request_packet = try parse(request_frame.get(.payload));
+    try std.testing.expectEqual(OpCode.request, request_packet.get(.opcode));
+    try std.testing.expectEqual(peer_ip, request_packet.get(.target_ip));
+
+    var reply_nic: HandlerTestNic = .{};
+    const reply_frame = try testArpFrame(&reply_nic, HandlerTestNic.LAN_MAC, &.{}, .{
+        .opcode = .reply,
+        .sender_mac = peer_mac,
+        .sender_ip = peer_ip,
+        .target_mac = HandlerTestNic.LAN_MAC,
+        .target_ip = lan_ip.*,
+    });
+    const reply_view = try Ethernet.parse(reply_frame);
+    try testHandle(reply_frame, reply_view, reply_nic.api(), .lan);
+    try std.testing.expectEqual(peer_mac, lan_arp_table.*.lookup(peer_ip).?);
+    try std.testing.expect(lan_ready_queue.pop() == null);
+    try std.testing.expect(wan_ready_queue.pop() == &fiber);
+
+    setRunning(.{ .fiber = &fiber, .loop_context = &loop_context, .owner = .wan });
+    Fiber.switchTo(&loop_context, &fiber);
+    setRunning(null);
+    try std.testing.expect(task.done);
+    try std.testing.expectEqual(peer_mac, task.mac.?);
+    try std.testing.expect(task.err == null);
+}
+
+test "ARP wait returns capacity and timeout errors" {
+    const WaitTask = struct {
+        loop_context: *std.Io.fiber.Context,
+        device: NicApi,
+        key: ArpWaitersTable.Key,
+        err: ?anyerror = null,
+        done: bool = false,
+
+        fn start(fiber: *Fiber, arg: *anyopaque) noreturn {
+            const self: *@This() = @ptrCast(@alignCast(arg));
+            _ = waitForArpResolution(self.device, self.key) catch |err| {
+                self.err = err;
+                self.done = true;
+                Fiber.switchTo(fiber, self.loop_context);
+                unreachable;
+            };
+            unreachable;
+        }
+    };
+
+    lan_ip.* = .{ 192, 168, 86, 1 };
+    lan_ready_queue.* = ReadyQueue.init(std.testing.io);
+    wan_ready_queue.* = ReadyQueue.init(std.testing.io);
+    defer setRunning(null);
+    var nic: HandlerTestNic = .{};
+    var loop_context: std.Io.fiber.Context = undefined;
+    var task: WaitTask = .{
+        .loop_context = &loop_context,
+        .device = nic.api(),
+        .key = .{ .iface = .lan, .ip = .{ 192, 168, 86, 99 } },
+    };
+    var fiber = try Fiber.init(std.testing.allocator, 8 * 1024, WaitTask.start, &task);
+    defer fiber.deinit(std.testing.allocator);
+
+    arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 0, .fromSeconds(1));
+    setRunning(.{ .fiber = &fiber, .loop_context = &loop_context, .owner = .wan });
+    Fiber.switchTo(&loop_context, &fiber);
+    setRunning(null);
+    try std.testing.expect(task.done);
+    try std.testing.expectEqual(error.ArpWaitersTableFull, task.err.?);
+    try std.testing.expect(nic.tx_len == null);
+    arp_waiters_table.*.deinit(std.testing.allocator);
+
+    arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 1, .fromNanoseconds(0));
+    defer arp_waiters_table.*.deinit(std.testing.allocator);
+    task.err = null;
+    task.done = false;
+    var timeout_fiber = try Fiber.init(std.testing.allocator, 8 * 1024, WaitTask.start, &task);
+    defer timeout_fiber.deinit(std.testing.allocator);
+    setRunning(.{ .fiber = &timeout_fiber, .loop_context = &loop_context, .owner = .wan });
+    Fiber.switchTo(&loop_context, &timeout_fiber);
+    setRunning(null);
+    try std.testing.expect(!task.done);
+    arp_waiters_table.expire();
+    try std.testing.expect(wan_ready_queue.pop() == &timeout_fiber);
+    setRunning(.{ .fiber = &timeout_fiber, .loop_context = &loop_context, .owner = .wan });
+    Fiber.switchTo(&loop_context, &timeout_fiber);
+    setRunning(null);
+    try std.testing.expect(task.done);
+    try std.testing.expectEqual(error.ArpResolutionTimedOut, task.err.?);
 }

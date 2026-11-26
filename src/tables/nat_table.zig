@@ -54,19 +54,17 @@ pub const NatTable = struct {
         port: u16,
     };
 
+    pub const IpPort = struct { IPv4, u16 };
+
     pub const Entry = struct {
         outside: Key,
         deadline: std.Io.Timestamp,
-    };
-
-    const Mapping = struct {
-        entry: Entry,
         port_allocator: *PortAllocator,
     };
 
     io: std.Io,
     capacity: usize,
-    inside: std.AutoArrayHashMapUnmanaged(Key, Mapping) = .empty,
+    inside: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
     outside: std.AutoHashMapUnmanaged(Key, Key) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, capacity: u32) !NatTable {
@@ -81,8 +79,8 @@ pub const NatTable = struct {
     }
 
     pub fn deinit(self: *NatTable, alloc: std.mem.Allocator) void {
-        for (self.inside.values()) |mapping| {
-            mapping.port_allocator.release(mapping.entry.outside.port);
+        for (self.inside.values()) |entry| {
+            entry.port_allocator.release(entry.outside.port);
         }
         self.inside.deinit(alloc);
         self.outside.deinit(alloc);
@@ -95,28 +93,28 @@ pub const NatTable = struct {
     pub fn inboundLookup(
         self: *NatTable,
         key: Key,
-    ) ?struct { Key, Entry } {
+    ) ?IpPort {
         const inside_key = self.outside.get(key) orelse return null;
-        const entry = (self.inside.get(inside_key) orelse unreachable).entry;
+        const entry = self.inside.get(inside_key) orelse unreachable;
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (isExpired(entry.deadline, now)) {
             self.remove(inside_key);
             return null;
         }
-        return .{ inside_key, entry };
+        return .{ inside_key.ip, inside_key.port };
     }
 
     pub fn outboundLookup(
         self: *NatTable,
         key: Key,
-    ) ?Entry {
-        const entry = (self.inside.get(key) orelse return null).entry;
+    ) ?IpPort {
+        const entry = self.inside.get(key) orelse return null;
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (isExpired(entry.deadline, now)) {
             self.remove(key);
             return null;
         }
-        return entry;
+        return .{ entry.outside.ip, entry.outside.port };
     }
 
     pub fn insert(
@@ -128,13 +126,13 @@ pub const NatTable = struct {
     ) !Entry {
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (self.inside.get(key)) |existing| {
-            if (!isExpired(existing.entry.deadline, now)) return error.InsideKeyInUse;
+            if (!isExpired(existing.deadline, now)) return error.InsideKeyInUse;
             self.remove(key);
         }
 
         if (self.inside.count() == self.capacity) {
-            for (self.inside.keys(), self.inside.values()) |inside_key, mapping| {
-                if (!isExpired(mapping.entry.deadline, now)) continue;
+            for (self.inside.keys(), self.inside.values()) |inside_key, entry| {
+                if (!isExpired(entry.deadline, now)) continue;
                 self.remove(inside_key);
                 break;
             } else return error.NoCapacity;
@@ -142,9 +140,9 @@ pub const NatTable = struct {
 
         const outside_port = port_allocator.allocate(key.port) catch |err| switch (err) {
             error.NoPortsAvailable => blk: {
-                for (self.inside.keys(), self.inside.values()) |inside_key, mapping| {
-                    if (mapping.entry.outside.protocol != key.protocol or
-                        !isExpired(mapping.entry.deadline, now)) continue;
+                for (self.inside.keys(), self.inside.values()) |inside_key, entry| {
+                    if (entry.outside.protocol != key.protocol or
+                        !isExpired(entry.deadline, now)) continue;
                     self.remove(inside_key);
                     break;
                 } else return error.NoPortsAvailable;
@@ -154,12 +152,10 @@ pub const NatTable = struct {
         const entry: Entry = .{
             .outside = .{ .protocol = key.protocol, .ip = outside_ip, .port = outside_port },
             .deadline = now.addDuration(duration),
+            .port_allocator = port_allocator,
         };
         std.debug.assert(!self.outside.contains(entry.outside));
-        self.inside.putAssumeCapacityNoClobber(key, .{
-            .entry = entry,
-            .port_allocator = port_allocator,
-        });
+        self.inside.putAssumeCapacityNoClobber(key, entry);
         self.outside.putAssumeCapacityNoClobber(entry.outside, key);
         return entry;
     }
@@ -171,18 +167,18 @@ pub const NatTable = struct {
     ) !void {
         const now = std.Io.Timestamp.now(self.io, .boot);
         const entry = self.inside.getPtr(key) orelse return error.NotFound;
-        if (isExpired(entry.entry.deadline, now)) {
+        if (isExpired(entry.deadline, now)) {
             self.remove(key);
             return error.NotFound;
         }
-        entry.entry.deadline = now.addDuration(duration);
+        entry.deadline = now.addDuration(duration);
     }
 
     pub fn remove(self: *NatTable, key: Key) void {
         const removed = self.inside.fetchSwapRemove(key) orelse return;
-        const reverse_removed = self.outside.remove(removed.value.entry.outside);
+        const reverse_removed = self.outside.remove(removed.value.outside);
         std.debug.assert(reverse_removed);
-        removed.value.port_allocator.release(removed.value.entry.outside.port);
+        removed.value.port_allocator.release(removed.value.outside.port);
     }
 };
 
@@ -198,13 +194,15 @@ test "NAT mappings resolve in both directions, refresh, and release their port" 
     try std.testing.expectEqualDeep(outside_ip, entry.outside.ip);
     try std.testing.expectEqual(inside.port, entry.outside.port);
     try std.testing.expect(port_allocator.isAllocated(entry.outside.port));
-    try std.testing.expectEqualDeep(entry, table.outboundLookup(inside).?);
+    const outbound_ip, const outbound_port = table.outboundLookup(inside).?;
+    try std.testing.expectEqualDeep(outside_ip, outbound_ip);
+    try std.testing.expectEqual(entry.outside.port, outbound_port);
     const inbound = table.inboundLookup(entry.outside).?;
-    try std.testing.expectEqualDeep(inside, inbound[0]);
-    try std.testing.expectEqualDeep(entry, inbound[1]);
+    try std.testing.expectEqualDeep(inside.ip, inbound[0]);
+    try std.testing.expectEqual(inside.port, inbound[1]);
 
     try table.refresh(inside, .fromSeconds(120));
-    try std.testing.expect(table.outboundLookup(inside).?.deadline.toNanoseconds() > entry.deadline.toNanoseconds());
+    try std.testing.expect(table.inside.get(inside).?.deadline.toNanoseconds() > entry.deadline.toNanoseconds());
 
     table.remove(inside);
     try std.testing.expect(!port_allocator.isAllocated(entry.outside.port));
@@ -227,7 +225,9 @@ test "NAT insert uses another occupied port and keeps protocol spaces separate" 
     try std.testing.expectError(error.InsideKeyInUse, table.insert(&tcp_port_allocator, inside_a, outside_ip, .fromSeconds(60)));
     const second = try table.insert(&tcp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
     try std.testing.expect(first.outside.port != second.outside.port);
-    try std.testing.expectEqualDeep(inside_b, table.inboundLookup(second.outside).?[0]);
+    const inbound_ip, const inbound_port = table.inboundLookup(second.outside).?;
+    try std.testing.expectEqualDeep(inside_b.ip, inbound_ip);
+    try std.testing.expectEqual(inside_b.port, inbound_port);
 
     const udp_inside: NatTable.Key = .{ .protocol = .udp, .ip = inside_a.ip, .port = inside_a.port };
     const udp_entry = try table.insert(&udp_port_allocator, udp_inside, outside_ip, .fromSeconds(60));
@@ -304,7 +304,9 @@ test "NAT expired mapping gives its port to a new mapping at capacity" {
     const new_entry = try table.insert(&port_allocator, new_key, outside_ip, .fromSeconds(60));
     try std.testing.expectEqual(old_entry.outside.port, new_entry.outside.port);
     try std.testing.expect(table.outboundLookup(old_key) == null);
-    try std.testing.expectEqualDeep(new_key, table.inboundLookup(new_entry.outside).?[0]);
+    const inbound_ip, const inbound_port = table.inboundLookup(new_entry.outside).?;
+    try std.testing.expectEqualDeep(new_key.ip, inbound_ip);
+    try std.testing.expectEqual(new_key.port, inbound_port);
 }
 
 test "PortAllocator reuses a released preferred port" {
