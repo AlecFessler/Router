@@ -1,3 +1,4 @@
+pub const Async = @import("async/async.zig");
 pub const Debug = @import("debug/debug.zig");
 pub const Meta = @import("meta/meta.zig");
 pub const Nic = @import("nic/nic.zig");
@@ -7,6 +8,9 @@ pub const Tables = @import("tables/tables.zig");
 pub const TestFixtures = @import("test_fixtures");
 
 test {
+    _ = Async.Fiber;
+    _ = Async.FiberPool;
+    _ = Async.ReadyQueue;
     _ = Meta.Checksum;
     _ = Meta.View;
     _ = Protocols.Arp;
@@ -20,6 +24,7 @@ test {
     _ = Protocols.Tcp;
     _ = Protocols.Udp;
     _ = Tables.ArpTable;
+    _ = Tables.ArpWaitersTable;
     _ = Tables.DhcpTable;
     _ = Tables.NatTable;
 }
