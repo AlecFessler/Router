@@ -48,7 +48,12 @@ pub fn main(init: std.process.Init) !void {
     State.wan_arp_table = try ArpTable.init(init.gpa, init.io, ARP_CAPACITY, ARP_TTL);
     defer State.wan_arp_table.deinit(init.gpa);
 
-    State.arp_waiters_table = try ArpWaitersTable.init(init.gpa, init.io, ARP_WAITERS_CAPACITY, ARP_WAITERS_TIMEOUT);
+    State.arp_waiters_table = try ArpWaitersTable.init(
+        init.gpa,
+        init.io,
+        ARP_WAITERS_CAPACITY,
+        ARP_WAITERS_TIMEOUT,
+    );
     defer State.arp_waiters_table.deinit(init.gpa);
 
     State.dhcp_table = blk: {
@@ -69,10 +74,10 @@ pub fn main(init: std.process.Init) !void {
     defer mock.deinit();
     const mock_nic = mock.api();
 
-    defer State.arp_waiters_table.expireAll();
+    defer State.arp_waiters_table.expireAll(mock_nic);
 
     while (true) {
-        State.arp_waiters_table.expire();
+        State.arp_waiters_table.expire(mock_nic);
         const packet = mock_nic.receive(iface) orelse break;
         var views: ViewStack = .{};
         Ethernet.handle(packet, mock_nic, iface, &views) catch |err| {

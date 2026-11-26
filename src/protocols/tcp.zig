@@ -102,43 +102,47 @@ pub fn handle(
     switch (iface) {
         .lan => {
             const dst = ip_view.get(.dst);
-            switch (classifyDestination(dst)) {
-                .wan => {
-                    const key: NatTable.Key = .{
-                        .protocol = .tcp,
-                        .ip = ip_view.get(.src),
-                        .port = view.get(.src_port),
-                    };
-
-                    const src_ip, const src_port = if (nat_table.outboundLookup(key, lease.ip)) |existing| hit: {
-                        try nat_table.refresh(key, NAT_TIMEOUT);
-                        break :hit existing;
-                    } else miss: {
-                        const entry = try nat_table.insert(
-                            &port_allocator,
-                            key,
-                            lease.ip,
-                            NAT_TIMEOUT,
-                        );
-                        break :miss .{
-                            entry.outside.ip,
-                            entry.outside.port,
-                        };
-                    };
-
-                    ip_view.setUpdateChecksum(.src, src_ip, views);
-                    view.setUpdateChecksum(.src_port, src_port, views);
-                    ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
-
-                    ethernet_view.set(.src_mac, device.macAddress(.wan));
-                    const gateway_mac = wan_arp_table.lookup(lease.router) orelse
-                        return queueForArpResolution(buffer, device, .{ .iface = .wan, .ip = lease.router });
-                    ethernet_view.set(.dst_mac, gateway_mac);
-
-                    device.transmit(buffer);
-                },
-                else => device.release(buffer),
+            if (classifyDestination(dst) != .wan) {
+                device.release(buffer);
+                return;
             }
+
+            const key: NatTable.Key = .{
+                .protocol = .tcp,
+                .ip = ip_view.get(.src),
+                .port = view.get(.src_port),
+            };
+
+            const src_ip, const src_port = if (nat_table.outboundLookup(key, lease.ip)) |existing| hit: {
+                try nat_table.refresh(key, NAT_TIMEOUT);
+                break :hit existing;
+            } else miss: {
+                const entry = try nat_table.insert(
+                    &port_allocator,
+                    key,
+                    lease.ip,
+                    NAT_TIMEOUT,
+                );
+                break :miss .{
+                    entry.outside.ip,
+                    entry.outside.port,
+                };
+            };
+
+            ip_view.setUpdateChecksum(.src, src_ip, views);
+            view.setUpdateChecksum(.src_port, src_port, views);
+            ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
+
+            ethernet_view.set(.src_mac, device.macAddress(.wan));
+            const gateway_mac = wan_arp_table.lookup(lease.router) orelse
+                return queueForArpResolution(
+                    buffer,
+                    device,
+                    .{ .iface = .wan, .ip = lease.router },
+                );
+            ethernet_view.set(.dst_mac, gateway_mac);
+
+            device.transmit(buffer);
         },
         .wan => {
             if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
@@ -161,7 +165,11 @@ pub fn handle(
 
             ethernet_view.set(.src_mac, device.macAddress(.lan));
             const dst_mac = lan_arp_table.lookup(dst_ip) orelse
-                return queueForArpResolution(buffer, device, .{ .iface = .lan, .ip = dst_ip });
+                return queueForArpResolution(
+                    buffer,
+                    device,
+                    .{ .iface = .lan, .ip = dst_ip },
+                );
             ethernet_view.set(.dst_mac, dst_mac);
 
             device.transmit(buffer);

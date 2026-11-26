@@ -146,10 +146,13 @@ pub fn handle(
             if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
                 const mac = view.get(.sender_mac);
                 table.cache(view.get(.sender_ip), mac);
-                const pending = arp_waiters_table.take(.{ .iface = iface, .ip = view.get(.sender_ip) }) orelse return;
-                for (pending.frames[0..pending.len]) |frame| {
-                    frame.buffer[0..mac.len].* = mac;
-                    frame.device.transmit(frame.buffer);
+                const pending = arp_waiters_table.take(
+                    .{ .iface = iface, .ip = view.get(.sender_ip) },
+                    device,
+                ) orelse return;
+                for (pending.buffers[0..pending.len]) |queued_buffer| {
+                    queued_buffer[0..mac.len].* = mac;
+                    device.transmit(queued_buffer);
                 }
             }
         },
@@ -165,15 +168,19 @@ pub fn queueForArpResolution(
         .lan => lan_ip.*,
         .wan => if (wan_lease.*) |lease| lease.ip else return error.NoWanLease,
     };
-    if (!try arp_waiters_table.register(key, .{ .buffer = buffer, .device = device })) return;
+    if (!try arp_waiters_table.register(key, buffer, device)) return;
 
     sendRequest(device, key, sender_ip) catch |err| {
-        if (arp_waiters_table.take(key)) |pending| pending.release();
+        if (arp_waiters_table.take(key, device)) |pending| pending.release(device);
         std.debug.print("ARP request failed: {}\n", .{err});
     };
 }
 
-fn sendRequest(device: NicApi, key: ArpWaitersTable.Key, sender_ip: IPv4) !void {
+fn sendRequest(
+    device: NicApi,
+    key: ArpWaitersTable.Key,
+    sender_ip: IPv4,
+) !void {
     const sender_mac = device.macAddress(key.iface);
     const tx_buffer = device.nextTxBuffer(key.iface);
     errdefer device.release(tx_buffer);
@@ -385,7 +392,8 @@ const HandlerTestNic = struct {
     tx_releases: usize = 0,
     tx_iface: ?IFace = null,
     tx_len: ?usize = null,
-    forwarded_len: ?usize = null,
+    forwarded_lengths: [2]?usize = .{ null, null },
+    forwarded_count: usize = 0,
 
     fn api(self: *HandlerTestNic) NicApi {
         return .{
@@ -419,7 +427,7 @@ const HandlerTestNic = struct {
 
     fn releaseBuffer(ctx: *anyopaque, buffer: []u8) void {
         const self: *HandlerTestNic = @ptrCast(@alignCast(ctx));
-        if (buffer.ptr == self.rx[0..].ptr) {
+        if (self.isRxBuffer(buffer)) {
             self.rx_releases += 1;
         } else if (buffer.ptr == self.tx[0..].ptr) {
             self.tx_releases += 1;
@@ -428,11 +436,17 @@ const HandlerTestNic = struct {
         }
     }
 
+    fn isRxBuffer(self: *HandlerTestNic, buffer: []u8) bool {
+        const start = @intFromPtr(self.rx[0..].ptr);
+        const address = @intFromPtr(buffer.ptr);
+        return address >= start and address - start < self.rx.len;
+    }
+
     fn transmit(ctx: *anyopaque, buffer: []u8) void {
         const self: *HandlerTestNic = @ptrCast(@alignCast(ctx));
-        if (buffer.ptr == self.rx[0..].ptr) {
-            std.debug.assert(self.forwarded_len == null);
-            self.forwarded_len = buffer.len;
+        if (self.isRxBuffer(buffer)) {
+            self.forwarded_lengths[self.forwarded_count] = buffer.len;
+            self.forwarded_count += 1;
             return;
         }
         std.debug.assert(buffer.ptr == self.tx[0..].ptr);
@@ -639,38 +653,37 @@ test "ARP reply forwards all queued frames for its neighbor" {
     arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(30));
     defer arp_waiters_table.deinit(std.testing.allocator);
 
-    var first: HandlerTestNic = .{};
-    var second: HandlerTestNic = .{};
-    @memset(first.rx[0..60], 0xa1);
-    @memset(second.rx[0..72], 0xb2);
-    defer arp_waiters_table.expireAll();
-    try queueForArpResolution(first.rx[0..60], first.api(), key);
-    try queueForArpResolution(second.rx[0..72], second.api(), key);
-    try std.testing.expectEqual(IFace.lan, first.tx_iface.?);
-    const request_frame = try Ethernet.parse(first.tx[0..first.tx_len.?]);
+    var nic: HandlerTestNic = .{};
+    const device = nic.api();
+    const first = nic.rx[64..124];
+    const second = nic.rx[128..200];
+    @memset(first, 0xa1);
+    @memset(second, 0xb2);
+    defer arp_waiters_table.expireAll(device);
+    try queueForArpResolution(first, device, key);
+    try queueForArpResolution(second, device, key);
+    try std.testing.expectEqual(IFace.lan, nic.tx_iface.?);
+    const request_frame = try Ethernet.parse(nic.tx[0..nic.tx_len.?]);
     const request_packet = try parse(request_frame.get(.payload));
     try std.testing.expectEqual(OpCode.request, request_packet.get(.opcode));
     try std.testing.expectEqual(peer_ip, request_packet.get(.target_ip));
-    try std.testing.expectEqual(null, second.tx_len);
-    try std.testing.expectEqual(null, first.forwarded_len);
-    try std.testing.expectEqual(null, second.forwarded_len);
+    try std.testing.expectEqual(@as(usize, 0), nic.forwarded_count);
 
-    var reply_nic: HandlerTestNic = .{};
-    const frame = try testArpFrame(&reply_nic, HandlerTestNic.LAN_MAC, &.{}, .{
+    const frame = try testArpFrame(&nic, HandlerTestNic.LAN_MAC, &.{}, .{
         .opcode = .reply,
         .sender_mac = peer_mac,
         .sender_ip = peer_ip,
         .target_mac = HandlerTestNic.LAN_MAC,
         .target_ip = lan_ip.*,
     });
-    try testHandle(frame, try Ethernet.parse(frame), reply_nic.api(), .lan);
+    try testHandle(frame, try Ethernet.parse(frame), device, .lan);
     try std.testing.expectEqual(peer_mac, lan_arp_table.lookup(peer_ip).?);
-    try std.testing.expectEqual(@as(?usize, 60), first.forwarded_len);
-    try std.testing.expectEqual(@as(?usize, 72), second.forwarded_len);
-    try std.testing.expectEqual(peer_mac, first.rx[0..6].*);
-    try std.testing.expectEqual(peer_mac, second.rx[0..6].*);
-    try std.testing.expectEqualSlices(u8, &(.{0xa1} ** 54), first.rx[6..60]);
-    try std.testing.expectEqualSlices(u8, &(.{0xb2} ** 66), second.rx[6..72]);
+    try std.testing.expectEqual(@as(usize, 2), nic.forwarded_count);
+    try std.testing.expectEqual([2]?usize{ first.len, second.len }, nic.forwarded_lengths);
+    try std.testing.expectEqual(peer_mac, first[0..6].*);
+    try std.testing.expectEqual(peer_mac, second[0..6].*);
+    try std.testing.expectEqualSlices(u8, &(.{0xa1} ** 54), first[6..]);
+    try std.testing.expectEqualSlices(u8, &(.{0xb2} ** 66), second[6..]);
 }
 
 test "ARP pending frames are released on expiry and request failure" {
@@ -682,9 +695,9 @@ test "ARP pending frames are released on expiry and request failure" {
         arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 1, .zero);
         defer arp_waiters_table.deinit(std.testing.allocator);
         try queueForArpResolution(nic.rx[0..60], nic.api(), key);
-        arp_waiters_table.expire();
+        arp_waiters_table.expire(nic.api());
         try std.testing.expectEqual(@as(usize, 1), nic.rx_releases);
-        try std.testing.expectEqual(null, nic.forwarded_len);
+        try std.testing.expectEqual(@as(usize, 0), nic.forwarded_count);
         try std.testing.expectEqual(@as(usize, if (tx_capacity == 8) 1 else 0), nic.tx_releases);
     }
 }
