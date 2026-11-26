@@ -18,6 +18,13 @@ pub const ArpWaitersTable = struct {
         buffers: [MAX_WAITERS_PER_NEIGHBOR][]u8 = undefined,
         len: usize = 0,
 
+        fn append(self: *Entry, buffer: []u8) !void {
+            if (self.len == MAX_WAITERS_PER_NEIGHBOR) return error.ArpWaitersFull;
+
+            self.buffers[self.len] = buffer;
+            self.len += 1;
+        }
+
         pub fn release(self: *const Entry, device: NicApi) void {
             for (self.buffers[0..self.len]) |buffer| device.release(buffer);
         }
@@ -81,6 +88,18 @@ pub const ArpWaitersTable = struct {
         }
     }
 
+    pub fn appendIfPending(self: *ArpWaitersTable, key: Key, buffer: []u8) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const entry = self.table.getPtr(key) orelse return false;
+        const now = std.Io.Timestamp.now(self.io, .boot);
+        if (entry.deadline.durationTo(now).toNanoseconds() >= 0) return false;
+
+        try entry.append(buffer);
+        return true;
+    }
+
     pub fn register(
         self: *ArpWaitersTable,
         key: Key,
@@ -92,13 +111,14 @@ pub const ArpWaitersTable = struct {
 
         const now = std.Io.Timestamp.now(self.io, .boot);
         self.expireLocked(now, device);
+
         if (self.table.getPtr(key)) |entry| {
-            if (entry.len == MAX_WAITERS_PER_NEIGHBOR) return error.ArpWaitersFull;
-            entry.buffers[entry.len] = buffer;
-            entry.len += 1;
+            try entry.append(buffer);
             return false;
         }
+
         if (self.table.count() == self.capacity) return error.ArpWaitersTableFull;
+
         var entry: Entry = .{
             .deadline = now.addDuration(self.timeout),
             .len = 1,
@@ -108,7 +128,7 @@ pub const ArpWaitersTable = struct {
         return true;
     }
 
-    pub fn take(
+    pub fn get(
         self: *ArpWaitersTable,
         key: Key,
         device: NicApi,
@@ -116,14 +136,17 @@ pub const ArpWaitersTable = struct {
         const pending = blk: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
+
             const removed = self.table.fetchSwapRemove(key) orelse return null;
             break :blk removed.value;
         };
+
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (pending.deadline.durationTo(now).toNanoseconds() >= 0) {
             pending.release(device);
             return null;
         }
+
         return pending;
     }
 };

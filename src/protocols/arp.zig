@@ -146,10 +146,12 @@ pub fn handle(
             if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
                 const mac = view.get(.sender_mac);
                 table.cache(view.get(.sender_ip), mac);
-                const pending = arp_waiters_table.take(
+
+                const pending = arp_waiters_table.get(
                     .{ .iface = iface, .ip = view.get(.sender_ip) },
                     device,
                 ) orelse return;
+
                 for (pending.buffers[0..pending.len]) |queued_buffer| {
                     queued_buffer[0..mac.len].* = mac;
                     device.transmit(queued_buffer);
@@ -164,35 +166,36 @@ pub fn queueForArpResolution(
     device: NicApi,
     key: ArpWaitersTable.Key,
 ) !void {
+    const joined_pending = try arp_waiters_table.appendIfPending(key, buffer);
+    if (joined_pending) return;
+
     const sender_ip = switch (key.iface) {
         .lan => lan_ip.*,
         .wan => if (wan_lease.*) |lease| lease.ip else return error.NoWanLease,
     };
-    if (!try arp_waiters_table.register(key, buffer, device)) return;
-
     const sender_mac = device.macAddress(key.iface);
     const tx_buffer = device.nextTxBuffer(key.iface);
+    errdefer device.release(tx_buffer);
+
     var writer: std.Io.Writer = .fixed(tx_buffer);
-    const write_error: ?std.Io.Writer.Error = serialize: {
-        EthernetFrameView.serialize(.{
-            .dst_mac = .{0xff} ** 6,
-            .src_mac = sender_mac,
-            .vlan_tags = &.{},
-            .ethertype = .arp,
-            .payload = &.{},
-        }, &writer) catch |err| break :serialize err;
-        ArpPacketView.serialize(
-            request(sender_ip, sender_mac, key.ip, null),
-            &writer,
-        ) catch |err| break :serialize err;
-        break :serialize null;
-    };
-    if (write_error) |err| {
+    try EthernetFrameView.serialize(.{
+        .dst_mac = .{0xff} ** 6,
+        .src_mac = sender_mac,
+        .vlan_tags = &.{},
+        .ethertype = .arp,
+        .payload = &.{},
+    }, &writer);
+    try ArpPacketView.serialize(
+        request(sender_ip, sender_mac, key.ip, null),
+        &writer,
+    );
+
+    const should_send_request = try arp_waiters_table.register(key, buffer, device);
+    if (!should_send_request) {
         device.release(tx_buffer);
-        if (arp_waiters_table.take(key, device)) |pending| pending.release(device);
-        std.debug.print("ARP request failed: {}\n", .{err});
         return;
     }
+
     device.transmit(tx_buffer[0..writer.end]);
 }
 
@@ -385,6 +388,7 @@ const HandlerTestNic = struct {
     rx: [256]u8 = undefined,
     tx: [256]u8 = .{0xa5} ** 256,
     tx_capacity: usize = 256,
+    tx_requests: usize = 0,
     rx_releases: usize = 0,
     tx_releases: usize = 0,
     tx_iface: ?IFace = null,
@@ -411,6 +415,7 @@ const HandlerTestNic = struct {
 
     fn nextTxBuffer(ctx: *anyopaque, iface: IFace) []u8 {
         const self: *HandlerTestNic = @ptrCast(@alignCast(ctx));
+        self.tx_requests += 1;
         self.tx_iface = iface;
         return self.tx[0..self.tx_capacity];
     }
@@ -659,6 +664,8 @@ test "ARP reply forwards all queued frames for its neighbor" {
     defer arp_waiters_table.expireAll(device);
     try queueForArpResolution(first, device, key);
     try queueForArpResolution(second, device, key);
+    try std.testing.expectEqual(@as(usize, 1), nic.tx_requests);
+    try std.testing.expectEqual(@as(usize, 0), nic.tx_releases);
     try std.testing.expectEqual(IFace.lan, nic.tx_iface.?);
     const request_frame = try Ethernet.parse(nic.tx[0..nic.tx_len.?]);
     const request_packet = try parse(request_frame.get(.payload));
@@ -683,7 +690,7 @@ test "ARP reply forwards all queued frames for its neighbor" {
     try std.testing.expectEqualSlices(u8, &(.{0xb2} ** 66), second[6..]);
 }
 
-test "ARP pending frames are released on expiry and request failure" {
+test "ARP pending frames are released on expiry and stay with the caller on request failure" {
     lan_ip.* = .{ 192, 168, 86, 1 };
     const key: ArpWaitersTable.Key = .{ .iface = .lan, .ip = .{ 192, 168, 86, 42 } };
 
@@ -691,9 +698,14 @@ test "ARP pending frames are released on expiry and request failure" {
         var nic: HandlerTestNic = .{ .tx_capacity = tx_capacity };
         arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 1, .zero);
         defer arp_waiters_table.deinit(std.testing.allocator);
-        try queueForArpResolution(nic.rx[0..60], nic.api(), key);
+        const buffer = nic.rx[0..60];
+        if (tx_capacity == 8) {
+            try std.testing.expectError(error.WriteFailed, queueForArpResolution(buffer, nic.api(), key));
+        } else {
+            try queueForArpResolution(buffer, nic.api(), key);
+        }
         arp_waiters_table.expire(nic.api());
-        try std.testing.expectEqual(@as(usize, 1), nic.rx_releases);
+        try std.testing.expectEqual(@as(usize, if (tx_capacity == 8) 0 else 1), nic.rx_releases);
         try std.testing.expectEqual(@as(usize, 0), nic.forwarded_count);
         try std.testing.expectEqual(@as(usize, if (tx_capacity == 8) 1 else 0), nic.tx_releases);
     }
