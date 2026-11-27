@@ -6,7 +6,6 @@ const CsvParser = UdpFixtures.CsvParser;
 const DHCPv4 = Router.Protocols.DHCPv4;
 const Ethernet = Router.Protocols.Ethernet;
 const IFace = Router.Nic.Api.IFace;
-const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
@@ -15,6 +14,10 @@ const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const UdpFixtures = Router.TestFixtures.Udp;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
+
+const forwardNat = Router.Protocols.IPv4.forwardNat;
+
+const UDP_NAT_TIMEOUT = std.Io.Duration.fromSeconds(300);
 
 var port_allocator: PortAllocator = .{};
 
@@ -29,8 +32,8 @@ pub const UdpPacket = struct {
 pub const UdpPacketView = View(UdpPacket);
 
 pub fn validate(view: UdpPacketView, ip_view: IPv4PacketView) !void {
-    try view.validate(.length, .{ .gte = 4 });
-    if (view.get(.checksum) == 0) return;
+    if (ip_view.get(.more_fragments) or view.get(.checksum) == 0) return;
+
     var checksum = view.checksum();
     try checksum.addPseudoheader(ip_view);
     checksum.addFields(.src_port, .payload);
@@ -41,8 +44,14 @@ pub fn parse(buffer: []const u8, ip_view: IPv4PacketView) !UdpPacketView {
     var view: UdpPacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
     try view.takeFields(.src_port, .checksum, &reader);
-    const payload_len = view.get(.length) - 8;
+    try view.validate(.length, .{ .gte = 8 });
+
+    const payload_len = if (ip_view.get(.more_fragments))
+        reader.bufferedLen()
+    else
+        @as(usize, view.get(.length)) - 8;
     try view.takeBytes(.payload, payload_len, &reader);
+
     try validate(view, ip_view);
     return view;
 }
@@ -54,33 +63,31 @@ pub fn handle(
     views: *ViewStack,
 ) !void {
     const ip_view = views.getView(.ipv4);
+    const first_fragment = ip_view.get(.more_fragments);
     var view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.udp, view);
     views.setView(.udp, &view);
-    switch (iface) {
-        .wan => {
-            if (view.get(.src_port) == 67 and view.get(.dst_port) == 68) {
-                try DHCPv4.handle(buffer, device, iface, views);
-            } else {
-                std.debug.print(
-                    "UDP: packet unhandled by {s} interface\n",
-                    .{@tagName(iface)},
-                );
-                device.release(buffer);
-            }
-        },
-        .lan => {
-            if (view.get(.src_port) == 68 and view.get(.dst_port) == 67) {
-                try DHCPv4.handle(buffer, device, iface, views);
-            } else {
-                std.debug.print(
-                    "UDP: packet unhandled by {s} interface\n",
-                    .{@tagName(iface)},
-                );
-                device.release(buffer);
-            }
-        },
+
+    const src_port = view.get(.src_port);
+    const dst_port = view.get(.dst_port);
+    const is_dhcp = switch (iface) {
+        .lan => src_port == 68 and dst_port == 67,
+        .wan => src_port == 67 and dst_port == 68,
+    };
+    if (is_dhcp) {
+        if (first_fragment) return error.NeedsReassembly;
+        return DHCPv4.handle(buffer, device, iface, views);
     }
+
+    return forwardNat(
+        buffer,
+        device,
+        iface,
+        views,
+        &view,
+        &port_allocator,
+        UDP_NAT_TIMEOUT,
+    );
 }
 
 const test_ip_packet = [_]u8{
@@ -121,6 +128,27 @@ test "parse() accepts a zero checksum" {
     const ip_view = try IPv4Protocol.parse(&packet);
     const view = try parse(ip_view.get(.payload), ip_view);
     try std.testing.expectEqual(@as(u16, 0), view.get(.checksum));
+}
+
+test "parse() rejects lengths smaller than the UDP header" {
+    var packet = test_ip_packet;
+    packet[25] = 7;
+
+    const ip_view = try IPv4Protocol.parse(&packet);
+    try std.testing.expectError(error.InvalidField, parse(ip_view.get(.payload), ip_view));
+}
+
+test "parse() reads only the payload present in the first fragment" {
+    var packet = test_ip_packet ++ [_]u8{ 'e', 'f', 'g', 'h' };
+    packet[3] = packet.len;
+    packet[6] = 0x20;
+    packet[10..12].* = .{ 0xc5, 0x41 };
+    packet[25] = 24;
+
+    const ip_view = try IPv4Protocol.parse(&packet);
+    const view = try parse(ip_view.get(.payload), ip_view);
+    try std.testing.expectEqual(@as(u16, 24), view.get(.length));
+    try std.testing.expectEqualSlices(u8, "abcdefgh", view.get(.payload));
 }
 
 test "parse() reads an empty payload" {

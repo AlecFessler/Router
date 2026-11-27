@@ -4,11 +4,9 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const CsvParser = TcpFixtures.CsvParser;
 const Ethernet = Router.Protocols.Ethernet;
-const EthernetFrameView = Router.Protocols.Ethernet.EthernetFrameView;
 const IFace = Router.Nic.Api.IFace;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
-const NatTable = Router.Tables.NatTable.NatTable;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const PortAllocator = Router.Tables.NatTable.PortAllocator;
@@ -16,12 +14,7 @@ const TcpFixtures = Router.TestFixtures.Tcp;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
-const classifyDestination = Router.Protocols.IPv4.classifyDestination;
-const forward = Router.Protocols.IPv4.forward;
-const forwardFirstFragment = Router.Protocols.IPv4.forwardFirstFragment;
-
-const nat_table = &Router.State.nat_table;
-const wan_lease = &Router.State.wan_lease;
+const forwardNat = Router.Protocols.IPv4.forwardNat;
 
 const NAT_TIMEOUT = std.Io.Duration.fromSeconds(7440);
 
@@ -53,6 +46,8 @@ pub const TcpPacket = struct {
 pub const TcpPacketView = View(TcpPacket);
 
 pub fn validate(view: TcpPacketView, ip_view: IPv4PacketView) !void {
+    if (ip_view.get(.more_fragments)) return;
+
     var checksum = view.checksum();
     try checksum.addPseudoheader(ip_view);
     checksum.addFields(.src_port, .payload);
@@ -72,7 +67,7 @@ pub fn parse(buffer: []const u8, ip_view: IPv4PacketView) !TcpPacketView {
     try view.takeBytes(.options, options_bytes, &reader);
     try view.takeBytes(.payload, reader.bufferedLen(), &reader);
 
-    if (!ip_view.get(.more_fragments)) try validate(view, ip_view);
+    try validate(view, ip_view);
     return view;
 }
 
@@ -83,94 +78,19 @@ pub fn handle(
     views: *ViewStack,
 ) !void {
     const ip_view = views.getView(.ipv4);
-    const first_fragment = ip_view.get(.more_fragments);
-
     var view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.tcp, view);
     views.setView(.tcp, &view);
 
-    const lease = wan_lease.* orelse {
-        device.release(buffer);
-        return;
-    };
-
-    switch (iface) {
-        .lan => {
-            if (classifyDestination(ip_view.get(.dst)) != .wan) {
-                device.release(buffer);
-                return;
-            }
-
-            const key: NatTable.Key = .{
-                .protocol = .tcp,
-                .ip = ip_view.get(.src),
-                .port = view.get(.src_port),
-            };
-
-            const mapping = if (nat_table.outboundEntry(key, lease.ip)) |existing| hit: {
-                try nat_table.refresh(key, NAT_TIMEOUT);
-                break :hit existing;
-            } else try nat_table.insert(
-                &port_allocator,
-                key,
-                lease.ip,
-                NAT_TIMEOUT,
-            );
-
-            view.setUpdateChecksum(.src_port, mapping.outside.port, views);
-
-            if (first_fragment) {
-                return forwardFirstFragment(
-                    buffer,
-                    device,
-                    .wan,
-                    lease.router,
-                    views,
-                    key,
-                    mapping.generation,
-                    mapping.outside.ip,
-                );
-            }
-
-            ip_view.setUpdateChecksum(.src, mapping.outside.ip, views);
-            return forward(buffer, device, .wan, lease.router, views);
-        },
-        .wan => {
-            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
-                device.release(buffer);
-                return;
-            }
-
-            const key: NatTable.Key = .{
-                .protocol = .tcp,
-                .ip = ip_view.get(.dst),
-                .port = view.get(.dst_port),
-            };
-
-            const inside, const mapping = nat_table.inboundEntry(key) orelse {
-                device.release(buffer);
-                return;
-            };
-
-            view.setUpdateChecksum(.dst_port, inside.port, views);
-
-            if (first_fragment) {
-                return forwardFirstFragment(
-                    buffer,
-                    device,
-                    .lan,
-                    inside.ip,
-                    views,
-                    key,
-                    mapping.generation,
-                    inside.ip,
-                );
-            }
-
-            ip_view.setUpdateChecksum(.dst, inside.ip, views);
-            return forward(buffer, device, .lan, inside.ip, views);
-        },
-    }
+    return forwardNat(
+        buffer,
+        device,
+        iface,
+        views,
+        &view,
+        &port_allocator,
+        NAT_TIMEOUT,
+    );
 }
 
 const test_ip_packet = [_]u8{

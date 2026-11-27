@@ -12,6 +12,7 @@ const IPv4FragmentTable = Router.Tables.IPv4FragmentTable.IPv4FragmentTable;
 const NatTable = Router.Tables.NatTable.NatTable;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
+const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const Tcp = Router.Protocols.Tcp;
 const Udp = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
@@ -175,7 +176,103 @@ pub fn handle(
     }
 }
 
-pub fn forwardFirstFragment(
+pub fn forwardNat(
+    buffer: []u8,
+    device: NicApi,
+    iface: IFace,
+    views: *ViewStack,
+    transport_view: anytype,
+    port_allocator: *PortAllocator,
+    timeout: std.Io.Duration,
+) !void {
+    const ip_view = views.getView(.ipv4);
+    const first_fragment = ip_view.get(.more_fragments);
+
+    const lease = wan_lease.* orelse {
+        device.release(buffer);
+        return;
+    };
+
+    switch (iface) {
+        .lan => {
+            if (classifyDestination(ip_view.get(.dst)) != .wan) {
+                device.release(buffer);
+                return;
+            }
+
+            const key: NatTable.Key = .{
+                .protocol = ip_view.get(.protocol),
+                .ip = ip_view.get(.src),
+                .port = transport_view.get(.src_port),
+            };
+
+            const mapping = if (nat_table.outboundEntry(key, lease.ip)) |existing| hit: {
+                try nat_table.refresh(key, timeout);
+                break :hit existing;
+            } else try nat_table.insert(
+                port_allocator,
+                key,
+                lease.ip,
+                timeout,
+            );
+
+            transport_view.setUpdateChecksum(.src_port, mapping.outside.port, views);
+
+            if (first_fragment) {
+                return forwardFirstFragment(
+                    buffer,
+                    device,
+                    .wan,
+                    lease.router,
+                    views,
+                    key,
+                    mapping.generation,
+                    mapping.outside.ip,
+                );
+            }
+
+            ip_view.setUpdateChecksum(.src, mapping.outside.ip, views);
+            return forward(buffer, device, .wan, lease.router, views);
+        },
+        .wan => {
+            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
+                device.release(buffer);
+                return;
+            }
+
+            const key: NatTable.Key = .{
+                .protocol = ip_view.get(.protocol),
+                .ip = ip_view.get(.dst),
+                .port = transport_view.get(.dst_port),
+            };
+
+            const inside, const mapping = nat_table.inboundEntry(key) orelse {
+                device.release(buffer);
+                return;
+            };
+
+            transport_view.setUpdateChecksum(.dst_port, inside.port, views);
+
+            if (first_fragment) {
+                return forwardFirstFragment(
+                    buffer,
+                    device,
+                    .lan,
+                    inside.ip,
+                    views,
+                    key,
+                    mapping.generation,
+                    inside.ip,
+                );
+            }
+
+            ip_view.setUpdateChecksum(.dst, inside.ip, views);
+            return forward(buffer, device, .lan, inside.ip, views);
+        },
+    }
+}
+
+fn forwardFirstFragment(
     buffer: []u8,
     device: NicApi,
     egress: IFace,
