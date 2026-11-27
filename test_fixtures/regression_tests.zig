@@ -3309,3 +3309,146 @@ test "a LAN host spoofing another host's source address must not create NAT pinh
     try std.testing.expectEqual(@as(usize, 0), h.txCount());
     try std.testing.expectEqual(@as(usize, 1), h.dropCount());
 }
+
+const trailer_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const trailer_gateway: IPv4 = .{ 203, 0, 113, 1 };
+const trailer_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const trailer_client_ip: IPv4 = .{ 192, 168, 86, 42 };
+const trailer_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+const trailer_peer_ip: IPv4 = .{ 8, 8, 8, 8 };
+const trailer_marker: u8 = 0xa7;
+
+fn trailerUdpFrame(
+    alloc: std.mem.Allocator,
+    iface: IFace,
+    src_ip: IPv4,
+    dst_ip: IPv4,
+    src_port: u16,
+    dst_port: u16,
+    tags: []const Packets.VlanTag,
+    trailer: []const u8,
+) ![]u8 {
+    const udp_bytes = try Packets.udp(alloc, src_ip, dst_ip, .{
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .payload = "",
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = src_ip,
+        .dst = dst_ip,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = udp_bytes,
+        // Bytes after the IP datagram but inside the Ethernet frame. They are
+        // not counted in the IP total_length.
+        .trailing = trailer,
+    });
+    defer alloc.free(ip_bytes);
+    return Packets.eth(alloc, .{
+        .dst = switch (iface) {
+            .lan => RecordingNic.lan_mac,
+            .wan => RecordingNic.wan_mac,
+        },
+        .src = switch (iface) {
+            .lan => trailer_client_mac,
+            .wan => trailer_gateway_mac,
+        },
+        .vlan_tags = tags,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+}
+
+test "L2 bytes after the IP packet must not be forwarded across interfaces" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var trailer: [200]u8 = undefined;
+    @memset(&trailer, trailer_marker);
+
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+    h.cacheArp(.wan, trailer_gateway, trailer_gateway_mac);
+    h.cacheArp(.lan, trailer_client_ip, trailer_client_mac);
+
+    // LAN -> WAN, untagged: 14 (Ethernet) + 28 (IP + UDP) bytes are meaningful;
+    // the 200 bytes after the IP datagram must not reach the WAN link.
+    {
+        const frame = try trailerUdpFrame(alloc, .lan, trailer_client_ip, trailer_peer_ip, 40_000, 53, &.{}, &trailer);
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.wan, tx.iface);
+        try std.testing.expectEqual(@as(usize, 14 + 28), tx.bytes.len);
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            std.mem.count(u8, tx.bytes, &[_]u8{trailer_marker}),
+        );
+        h.nic.resetLogs();
+    }
+
+    // Tagged frames are refused by the cross-interface tag policy, so the
+    // trailer cannot cross either; dropping is an accepted outcome.
+    {
+        const frame = try trailerUdpFrame(alloc, .lan, trailer_client_ip, trailer_peer_ip, 40_002, 53, &.{.{ .vid = 100 }}, &trailer);
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+        try std.testing.expectEqual(@as(usize, 0), h.txCount());
+        try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+        h.nic.resetLogs();
+    }
+
+    // WAN -> LAN: the mapping 40000 -> 192.168.86.42:40000 exists, and the
+    // reply's trailer must not be delivered to the LAN client either.
+    {
+        const frame = try trailerUdpFrame(alloc, .wan, trailer_peer_ip, trailer_lease_ip, 53, 40_000, &.{}, &trailer);
+        defer alloc.free(frame);
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.lan, tx.iface);
+        try std.testing.expectEqual(@as(usize, 14 + 28), tx.bytes.len);
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            std.mem.count(u8, tx.bytes, &[_]u8{trailer_marker}),
+        );
+        h.nic.resetLogs();
+    }
+
+    // Positive control: a generated reply (echo reply) already trims to the IP
+    // total length, so the forwarding path is the inconsistent one.
+    {
+        const icmp_bytes = try Packets.echo(alloc, .{ .identifier = 1, .sequence_number = 1, .data = "" });
+        defer alloc.free(icmp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = trailer_client_ip,
+            .dst = .{ 192, 168, 86, 1 },
+            .protocol = 1,
+            .dont_fragment = true,
+            .payload = icmp_bytes,
+            .trailing = &trailer,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = trailer_client_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(@as(usize, 14 + 28), tx.bytes.len);
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            std.mem.count(u8, tx.bytes, &[_]u8{trailer_marker}),
+        );
+    }
+}
