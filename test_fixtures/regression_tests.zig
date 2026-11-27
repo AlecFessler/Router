@@ -1922,3 +1922,81 @@ test "an ICMPv4 message with an invalid zero checksum must not be acted on" {
 
     try std.testing.expectEqual(@as(usize, 0), h.txCount());
 }
+
+const group_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const group_gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+const group_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const group_client_ip: IPv4 = .{ 192, 168, 86, 42 };
+const group_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+const group_group_mac: Mac = .{0xff} ** 6;
+
+test "ARP must not learn a group sender MAC as a neighbour" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+    // The real gateway is already resolved; forwarding works.
+    h.cacheArp(.wan, group_gateway_ip, group_gateway_mac);
+    h.cacheArp(.lan, group_client_ip, group_client_mac);
+
+    // An ARP reply that names the gateway's IP but a group (broadcast) sender
+    // hardware address. IEEE 802.3 requires the source address field to be a
+    // unicast address, and caching a group MAC as a next hop means every
+    // forwarded frame is sent to that group address.
+    {
+        const arp_bytes = try Packets.arp(alloc, .{
+            .opcode = 2,
+            .sender_mac = group_group_mac,
+            .sender_ip = group_gateway_ip,
+            .target_mac = RecordingNic.wan_mac,
+            .target_ip = group_lease_ip,
+        });
+        defer alloc.free(arp_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.wan_mac,
+            .src = group_gateway_mac,
+            .ethertype = 0x0806,
+            .payload = arp_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+        h.nic.resetLogs();
+    }
+
+    // The forged reply must be ignored: the gateway keeps its unicast MAC.
+    try std.testing.expectEqual(group_gateway_mac, State.wan_arp_table.lookup(group_gateway_ip).?);
+
+    // Consequently a forwarded datagram must still be sent to the gateway's
+    // real unicast MAC, not flooded to the whole WAN segment.
+    const udp_bytes = try Packets.udp(alloc, group_client_ip, .{ 8, 8, 8, 8 }, .{
+        .src_port = 40_000,
+        .dst_port = 53,
+        .payload = "forward-me",
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = group_client_ip,
+        .dst = .{ 8, 8, 8, 8 },
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = udp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    const frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = group_client_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+    defer alloc.free(frame);
+    try h.inject(.lan, frame);
+    _ = h.runAll(.lan);
+
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    const tx = h.txAt(0);
+    try std.testing.expectEqual(IFace.wan, tx.iface);
+    const tx_eth = try Ethernet.parse(tx.bytes);
+    try std.testing.expectEqual(group_gateway_mac, tx_eth.get(.dst_mac));
+}
