@@ -32,6 +32,7 @@ const ViewStack = Router.Protocols.ViewStack;
 const arp_waiters_table = &Router.State.arp_waiters_table;
 const lan_arp_table = &Router.State.lan_arp_table;
 const lan_ip = &Router.State.lan_ip;
+const lan_subnet_mask = &Router.State.lan_subnet_mask;
 const wan_arp_table = &Router.State.wan_arp_table;
 const wan_lease = &Router.State.wan_lease;
 
@@ -68,6 +69,17 @@ pub fn parse(buffer: []const u8) !ArpPacketView {
     try view.takeFields(.hardware_type, .target_ip, &reader);
     try validate(view);
     return view;
+}
+
+fn senderIsOnLink(iface: IFace, my_ip: IPv4, sender_ip: IPv4) bool {
+    const mask: IPv4 = switch (iface) {
+        .lan => lan_subnet_mask.*,
+        .wan => (wan_lease.* orelse return false).subnet_mask,
+    };
+    const sender_bits: u32 = @bitCast(sender_ip);
+    const my_bits: u32 = @bitCast(my_ip);
+    const mask_bits: u32 = @bitCast(mask);
+    return (sender_bits & mask_bits) == (my_bits & mask_bits);
 }
 
 pub fn handle(
@@ -139,6 +151,7 @@ pub fn handle(
             if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
                 const sender_ip = view.get(.sender_ip);
                 const mac = view.get(.sender_mac);
+                if (!senderIsOnLink(iface, my_ip.?, sender_ip)) return;
                 const pending = arp_waiters_table.get(
                     .{ .iface = iface, .ip = sender_ip },
                     device,
@@ -493,6 +506,8 @@ test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
         .{ .sender_ip = .{ 0, 0, 0, 0 }, .tag_count = 5 },
     }) |case| {
         lan_ip.* = my_ip;
+        lan_subnet_mask.* = .{ 255, 255, 255, 0 };
+        lan_subnet_mask.* = .{ 255, 255, 255, 0 };
         lan_arp_table.* = try ArpTableModule.ArpTable.init(
             std.testing.allocator,
             std.testing.io,
@@ -601,6 +616,7 @@ test "handle() releases unrelated requests and transmit buffers on serialization
     const peer_ip: IPv4 = .{ 192, 168, 86, 42 };
     const peer_mac: Mac = .{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
     lan_ip.* = my_ip;
+    lan_subnet_mask.* = .{ 255, 255, 255, 0 };
     lan_arp_table.* = try ArpTableModule.ArpTable.init(
         std.testing.allocator,
         std.testing.io,
@@ -646,6 +662,7 @@ test "ARP reply forwards all queued frames for its neighbor" {
     const peer_mac: Mac = .{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
     const key: ArpWaitersTable.Key = .{ .iface = .lan, .ip = peer_ip };
     lan_ip.* = .{ 192, 168, 86, 1 };
+    lan_subnet_mask.* = .{ 255, 255, 255, 0 };
     lan_arp_table.* = try ArpTableModule.ArpTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(60));
     defer lan_arp_table.deinit(std.testing.allocator);
     arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(30));
@@ -688,6 +705,7 @@ test "ARP reply forwards all queued frames for its neighbor" {
 
 test "ARP pending frames are released on expiry and stay with the caller on request failure" {
     lan_ip.* = .{ 192, 168, 86, 1 };
+    lan_subnet_mask.* = .{ 255, 255, 255, 0 };
     const key: ArpWaitersTable.Key = .{ .iface = .lan, .ip = .{ 192, 168, 86, 42 } };
 
     for ([_]usize{ 256, 8 }) |tx_capacity| {
