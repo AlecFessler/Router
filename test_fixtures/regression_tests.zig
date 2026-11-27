@@ -2938,3 +2938,66 @@ test "one L2 client cannot reserve the whole DHCP pool with distinct client iden
     try std.testing.expectEqual(Router.Protocols.DHCPv4.Op.BOOTREPLY, tx_dhcp.get(.op));
     try std.testing.expect(!std.meta.eql(tx_dhcp.get(.your_ip), IPv4{ 0, 0, 0, 0 }));
 }
+
+test "one LAN host flooding spoofed ARP entries must not evict a live neighbour" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{});
+    defer h.deinit();
+
+    const lan_ip: IPv4 = .{ 192, 168, 86, 1 };
+    const victim_ip: IPv4 = .{ 192, 168, 86, 42 };
+    const victim_mac = client_mac;
+    const attacker_mac: Mac = .{ 0x02, 0x66, 0x66, 0x66, 0x66, 0x66 };
+
+    // The router learns the real neighbour from a normal ARP reply.
+    const learn_arp = try Packets.arp(alloc, .{
+        .opcode = 2, // reply
+        .sender_mac = victim_mac,
+        .sender_ip = victim_ip,
+        .target_mac = RecordingNic.lan_mac,
+        .target_ip = lan_ip,
+    });
+    defer alloc.free(learn_arp);
+    const learn_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = victim_mac,
+        .ethertype = 0x0806,
+        .payload = learn_arp,
+    });
+    defer alloc.free(learn_frame);
+    try h.inject(.lan, learn_frame);
+    _ = h.runAll(.lan);
+    try std.testing.expect(State.lan_arp_table.lookup(victim_ip) != null);
+    try std.testing.expect(std.meta.eql(State.lan_arp_table.lookup(victim_ip).?, victim_mac));
+
+    // A single attacker host floods the cache with spoofed entries from one
+    // MAC, using sender IPs it does not own (the cache has no on-link or
+    // per-source accounting). The table holds 256 entries by default.
+    for (0..256) |i| {
+        const spoofed_ip: IPv4 = .{ 10, 0, @intCast(i >> 8), @intCast(i & 0xff) };
+        const arp = try Packets.arp(alloc, .{
+            .opcode = 2,
+            .sender_mac = attacker_mac,
+            .sender_ip = spoofed_ip,
+            .target_mac = RecordingNic.lan_mac,
+            .target_ip = lan_ip,
+        });
+        defer alloc.free(arp);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = attacker_mac,
+            .ethertype = 0x0806,
+            .payload = arp,
+        });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+
+    // The legitimate neighbour's mapping must survive the flood: one
+    // unauthenticated host must not be able to displace valid entries with
+    // spoofed ones (per-source quota and/or only caching entries the router
+    // can legitimately learn).
+    try std.testing.expect(State.lan_arp_table.lookup(victim_ip) != null);
+    try std.testing.expect(std.meta.eql(State.lan_arp_table.lookup(victim_ip).?, victim_mac));
+}
