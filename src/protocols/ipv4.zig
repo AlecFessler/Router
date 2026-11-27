@@ -420,6 +420,11 @@ pub fn forward(
     next_hop: IPv4,
     views: *ViewStack,
 ) !void {
+    const ethernet_view = views.getView(.ethernet);
+
+    if (ethernet_view.get(.vlan_tags).len != 0)
+        return device.release(buffer);
+
     const ip_view = views.getView(.ipv4);
     ip_view.setUpdateChecksum(.ttl, ip_view.get(.ttl) - 1, views);
 
@@ -427,7 +432,6 @@ pub fn forward(
         .lan => lan_arp_table,
         .wan => wan_arp_table,
     };
-    const ethernet_view = views.getView(.ethernet);
     ethernet_view.set(.src_mac, device.macAddress(egress));
 
     const mac = arp_table.lookup(next_hop) orelse
