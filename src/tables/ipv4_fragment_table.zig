@@ -140,6 +140,12 @@ pub const IPv4FragmentTable = struct {
         return identification;
     }
 
+    fn removeEntry(self: *IPv4FragmentTable, key: Key, device: NicApi) void {
+        const entry = self.table.get(key) orelse return;
+        if (entry.state == .waiting) entry.state.waiting.release(device);
+        _ = self.table.remove(key);
+    }
+
     fn getOrCreate(self: *IPv4FragmentTable, key: Key, device: NicApi) !*Entry {
         const now = std.Io.Timestamp.now(self.io, .boot);
         var entries = self.table.iterator();
@@ -152,7 +158,23 @@ pub const IPv4FragmentTable = struct {
         }
 
         if (self.table.getPtr(key)) |entry| return entry;
-        if (self.table.count() == self.capacity) return error.FragmentTableFull;
+
+        if (self.table.count() == self.capacity) {
+            // Live capacity is full. Reclaim the entry closest to expiry and
+            // release its queued buffers instead of denying every other flow.
+            var victim: ?Key = null;
+            var victim_deadline: i96 = 0;
+            var candidates = self.table.iterator();
+            while (candidates.next()) |item| {
+                const deadline = item.value_ptr.deadline.toNanoseconds();
+                if (victim == null or deadline < victim_deadline) {
+                    victim = item.key_ptr.*;
+                    victim_deadline = deadline;
+                }
+            }
+            const evicted = victim orelse return error.FragmentTableFull;
+            self.removeEntry(evicted, device);
+        }
 
         const entry = self.table.getOrPutAssumeCapacity(key).value_ptr;
         entry.* = .{ .deadline = now.addDuration(self.timeout) };
@@ -208,8 +230,6 @@ test "fragment table drains queued buffers and reclaims expired entries" {
     var second: [1]u8 = undefined;
     try std.testing.expect((try table.append(key, &first, device)) == .queued);
     try std.testing.expect((try table.append(key, &second, device)) == .queued);
-    try std.testing.expectError(error.FragmentTableFull, table.resolve(next_key, translation, device));
-
     const batch = try table.resolve(key, translation, device);
     try std.testing.expectEqual(@as(usize, 2), batch.len);
     try std.testing.expect(batch.buffers[0].ptr == first[0..].ptr);
