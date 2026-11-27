@@ -3244,3 +3244,68 @@ test "DHCP client must reject an ACK whose router option is an unusable next-hop
             null,
     );
 }
+
+test "a LAN host spoofing another host's source address must not create NAT pinholes for it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+
+    const lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+    const victim_ip: IPv4 = .{ 192, 168, 86, 43 };
+    const victim_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x03 };
+    const attacker_mac: Mac = .{ 0x02, 0x66, 0x66, 0x66, 0x66, 0x66 };
+
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+    h.cacheArp(.lan, victim_ip, victim_mac);
+
+    // Positive control: the victim's own flow is NATed normally.
+    {
+        const udp_bytes = try Packets.udp(alloc, victim_ip, remote_ip, .{ .src_port = 9090, .dst_port = 53, .payload = "legit" });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{ .src = victim_ip, .dst = remote_ip, .protocol = 17, .dont_fragment = true, .payload = udp_bytes });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.lan_mac, .src = victim_mac, .ethertype = 0x0800, .payload = ip_bytes });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    try std.testing.expect(State.nat_table.inboundLookup(.{ .protocol = .udp, .ip = lease_ip, .port = 9090 }) != null);
+
+    // Attack: a different link-layer host sends a datagram whose IP source is
+    // the victim's address (and a port the victim never used). The router must
+    // not create forwarding state for a source the sender does not own.
+    h.nic.resetLogs();
+    {
+        const udp_bytes = try Packets.udp(alloc, victim_ip, remote_ip, .{ .src_port = 8080, .dst_port = 53, .payload = "pinhole" });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{ .src = victim_ip, .dst = remote_ip, .protocol = 17, .dont_fragment = true, .payload = udp_bytes });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.lan_mac, .src = attacker_mac, .ethertype = 0x0800, .payload = ip_bytes });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expect(State.nat_table.inboundLookup(.{ .protocol = .udp, .ip = lease_ip, .port = 8080 }) == null);
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+    try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+
+    // Consequence: an external host must not be able to reach the victim's
+    // never-opened port through a mapping created by the spoofed source.
+    h.nic.resetLogs();
+    {
+        const udp_bytes = try Packets.udp(alloc, .{ 6, 6, 6, 6 }, lease_ip, .{ .src_port = 1234, .dst_port = 8080, .payload = "reach" });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{ .src = .{ 6, 6, 6, 6 }, .dst = lease_ip, .protocol = 17, .dont_fragment = true, .payload = udp_bytes });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.wan_mac, .src = gateway_mac, .ethertype = 0x0800, .payload = ip_bytes });
+        defer alloc.free(frame);
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+    }
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+    try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+}
