@@ -446,15 +446,18 @@ pub fn forward(
     };
     ethernet_view.set(.src_mac, device.macAddress(egress));
 
+    const l2_header_len = buffer.len - ethernet_view.get(.payload).len;
+    const frame_len = @min(buffer.len, l2_header_len + ip_view.get(.total_length));
+
     const mac = arp_table.lookup(next_hop) orelse
         return queueForArpResolution(
-            buffer,
+            buffer[0..frame_len],
             device,
             .{ .iface = egress, .ip = next_hop },
         );
 
     ethernet_view.set(.dst_mac, mac);
-    device.transmit(buffer);
+    device.transmit(buffer[0..frame_len]);
 }
 
 pub const DstClass = enum {
