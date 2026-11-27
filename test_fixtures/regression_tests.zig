@@ -2506,3 +2506,131 @@ test "NAT mappings for a LAN address are invalidated when its DHCP lease is rele
     // Nothing from the previous lease holder's mapping may reach the LAN.
     try std.testing.expectEqual(@as(usize, 0), h.txCount());
 }
+
+const vlan_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const vlan_gateway: IPv4 = .{ 203, 0, 113, 1 };
+const vlan_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const vlan_client_ip: IPv4 = .{ 192, 168, 86, 42 };
+const vlan_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+const vlan_remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+
+test "ingress 802.1Q tags must not be carried across interfaces when forwarding" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+    h.cacheArp(.wan, vlan_gateway, vlan_gateway_mac);
+    h.cacheArp(.lan, vlan_client_ip, vlan_client_mac);
+
+    // Positive control: an ordinary untagged LAN datagram is forwarded to the
+    // WAN with no VLAN tag, and creates the NAT mapping used below.
+    {
+        const udp_bytes = try Packets.udp(alloc, vlan_client_ip, vlan_remote_ip, .{
+            .src_port = 40_000,
+            .dst_port = 53,
+            .payload = "untagged",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = vlan_client_ip,
+            .dst = vlan_remote_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = vlan_client_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.wan, tx.iface);
+        const tx_eth = try Ethernet.parse(tx.bytes);
+        try std.testing.expectEqual(@as(usize, 0), tx_eth.get(.vlan_tags).len);
+        h.nic.resetLogs();
+    }
+
+    // A LAN client tags a datagram with VLAN 100. That tag is meaningful only
+    // on the LAN L2 domain; the WAN link has its own (ISP) VLAN space. The
+    // forwarded frame must not carry the client's tag onto the WAN (dropping
+    // tagged frames is also acceptable - the assertion only requires that the
+    // tag never crosses the interface).
+    {
+        const udp_bytes = try Packets.udp(alloc, vlan_client_ip, vlan_remote_ip, .{
+            .src_port = 40_001,
+            .dst_port = 53,
+            .payload = "tagged",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = vlan_client_ip,
+            .dst = vlan_remote_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = vlan_client_mac,
+            .vlan_tags = &.{.{ .vid = 100 }},
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+
+        if (h.txCount() > 0) {
+            const tx = h.txAt(0);
+            try std.testing.expectEqual(IFace.wan, tx.iface);
+            const tx_eth = try Ethernet.parse(tx.bytes);
+            try std.testing.expectEqual(@as(usize, 0), tx_eth.get(.vlan_tags).len);
+        }
+        h.nic.resetLogs();
+    }
+
+    // Same leak in the other direction: an ISP-tagged frame arriving on the WAN
+    // must not deliver its tag to the LAN client.
+    {
+        const udp_bytes = try Packets.udp(alloc, vlan_remote_ip, vlan_lease_ip, .{
+            .src_port = 53,
+            .dst_port = 40_000,
+            .payload = "tagged-back",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = vlan_remote_ip,
+            .dst = vlan_lease_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.wan_mac,
+            .src = vlan_gateway_mac,
+            .vlan_tags = &.{.{ .vid = 200 }},
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+
+        if (h.txCount() > 0) {
+            const tx = h.txAt(0);
+            try std.testing.expectEqual(IFace.lan, tx.iface);
+            const tx_eth = try Ethernet.parse(tx.bytes);
+            try std.testing.expectEqual(@as(usize, 0), tx_eth.get(.vlan_tags).len);
+        }
+    }
+}
