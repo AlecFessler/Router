@@ -6,3 +6,19 @@ pub fn expectHexBytes(bytes: []const u8, hex: []const u8) !void {
         try std.testing.expectEqual(byte, try std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16));
     }
 }
+
+/// Fill in the ICMPv4 checksum field of `bytes` (which must start with the
+/// 4-byte ICMP header). Test-only helper for messages that are built by hand.
+pub fn writeIcmpv4Checksum(bytes: []u8) void {
+    std.debug.assert(bytes.len >= 4);
+    bytes[2] = 0;
+    bytes[3] = 0;
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i + 1 < bytes.len) : (i += 2) {
+        sum += (@as(u32, bytes[i]) << 8) | bytes[i + 1];
+    }
+    if (i < bytes.len) sum += @as(u32, bytes[i]) << 8;
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    std.mem.writeInt(u16, bytes[2..4], ~@as(u16, @intCast(sum)), .big);
+}

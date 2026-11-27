@@ -1855,3 +1855,70 @@ test "ICMP echo requests from broadcast, multicast, or martian sources must not 
         try std.testing.expectEqual(Router.Protocols.ICMPv4.MessageType.echo_reply, tx_icmp.get(.message_type));
     }
 }
+
+test "an ICMPv4 message with an invalid zero checksum must not be acted on" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{});
+    defer h.deinit();
+
+    const lan_ip: IPv4 = .{ 192, 168, 86, 1 };
+    const echo_body = struct {
+        fn build(alloc_: std.mem.Allocator, checksum: ?u16) ![]u8 {
+            return Packets.echo(alloc_, .{
+                .identifier = 0x1234,
+                .sequence_number = 1,
+                .data = "zero-checksum-bypass",
+                .checksum = checksum,
+            });
+        }
+    };
+
+    // Positive control: the same echo request with a valid checksum is answered.
+    const valid_icmp = try echo_body.build(alloc, null);
+    defer alloc.free(valid_icmp);
+    const valid_ip = try Packets.ipv4(alloc, .{
+        .src = client_ip,
+        .dst = lan_ip,
+        .protocol = 1,
+        .dont_fragment = true,
+        .payload = valid_icmp,
+    });
+    defer alloc.free(valid_ip);
+    const valid_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = client_mac,
+        .ethertype = 0x0800,
+        .payload = valid_ip,
+    });
+    defer alloc.free(valid_frame);
+    try h.inject(.lan, valid_frame);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+
+    // An ICMPv4 checksum of zero is not a "checksum disabled" marker: the
+    // checksum is the one's-complement sum of the whole message, so a message
+    // whose computed checksum is not zero but whose field is zero is corrupt
+    // and must be dropped. The router must not answer it.
+    h.nic.resetLogs();
+    const bad_icmp = try echo_body.build(alloc, 0);
+    defer alloc.free(bad_icmp);
+    const bad_ip = try Packets.ipv4(alloc, .{
+        .src = client_ip,
+        .dst = lan_ip,
+        .protocol = 1,
+        .dont_fragment = true,
+        .payload = bad_icmp,
+    });
+    defer alloc.free(bad_ip);
+    const bad_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = client_mac,
+        .ethertype = 0x0800,
+        .payload = bad_ip,
+    });
+    defer alloc.free(bad_frame);
+    try h.inject(.lan, bad_frame);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
+
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+}

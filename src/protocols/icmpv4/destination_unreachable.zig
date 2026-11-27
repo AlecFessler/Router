@@ -12,6 +12,7 @@ const IFace = Router.Nic.Api.IFace;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
+const TestUtils = Router.TestFixtures.Utils;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
@@ -129,22 +130,29 @@ test "parse() on captured destination unreachable frames matches Wireshark's fie
 }
 
 test "parse() accepts an unrecognized code and rejects truncated messages" {
-    const packet = [_]u8{ 3, 250, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
+    var packet = [_]u8{ 3, 250, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
+    TestUtils.writeIcmpv4Checksum(&packet);
     const icmpv4_view = try ICMPv4.parse(&packet);
     const code: Code = @enumFromInt(icmpv4_view.get(.code));
     try std.testing.expectEqual(@as(u8, 250), @intFromEnum(code));
     _ = try parse(icmpv4_view);
 
     for (0..4) |body_len| {
-        const short_view = try ICMPv4.parse(packet[0 .. 4 + body_len]);
+        var short: [7]u8 = undefined;
+        @memcpy(short[0 .. 4 + body_len], packet[0 .. 4 + body_len]);
+        TestUtils.writeIcmpv4Checksum(short[0 .. 4 + body_len]);
+        const short_view = try ICMPv4.parse(short[0 .. 4 + body_len]);
         try std.testing.expectError(error.EndOfStream, parse(short_view));
     }
-    const no_quote = try ICMPv4.parse(packet[0..8]);
-    try std.testing.expectError(error.InvalidField, parse(no_quote));
+    var no_quote: [8]u8 = undefined;
+    @memcpy(&no_quote, packet[0..8]);
+    TestUtils.writeIcmpv4Checksum(&no_quote);
+    try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&no_quote)));
 }
 
 test "parse() rejects a different ICMPv4 message type" {
-    const packet = [_]u8{ 8, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
+    var packet = [_]u8{ 8, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
+    TestUtils.writeIcmpv4Checksum(&packet);
     const icmpv4_view = try ICMPv4.parse(&packet);
     try std.testing.expectError(error.InvalidField, parse(icmpv4_view));
 }

@@ -13,6 +13,7 @@ const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
+const TestUtils = Router.TestFixtures.Utils;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
@@ -188,18 +189,26 @@ test "parse() on synthetic captured frames matches Wireshark's fields" {
 }
 
 test "parse() rejects truncated messages, invalid codes, and other types" {
-    const packet = [_]u8{ 11, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
+    var packet = [_]u8{ 11, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 28;
+    TestUtils.writeIcmpv4Checksum(&packet);
     for (0..4) |body_len| {
-        const short_view = try ICMPv4.parse(packet[0 .. 4 + body_len]);
+        var short: [7]u8 = undefined;
+        @memcpy(short[0 .. 4 + body_len], packet[0 .. 4 + body_len]);
+        TestUtils.writeIcmpv4Checksum(short[0 .. 4 + body_len]);
+        const short_view = try ICMPv4.parse(short[0 .. 4 + body_len]);
         try std.testing.expectError(error.EndOfStream, parse(short_view));
     }
-    const no_quote = try ICMPv4.parse(packet[0..8]);
-    try std.testing.expectError(error.InvalidField, parse(no_quote));
+    var no_quote: [8]u8 = undefined;
+    @memcpy(&no_quote, packet[0..8]);
+    TestUtils.writeIcmpv4Checksum(&no_quote);
+    try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&no_quote)));
 
     var invalid = packet;
     invalid[1] = 2;
+    TestUtils.writeIcmpv4Checksum(&invalid);
     try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&invalid)));
     invalid[0] = 3;
     invalid[1] = 0;
+    TestUtils.writeIcmpv4Checksum(&invalid);
     try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&invalid)));
 }
