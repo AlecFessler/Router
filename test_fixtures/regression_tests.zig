@@ -3084,3 +3084,128 @@ test "one LAN host cannot monopolize the fragment table and deny reassembly to o
     try std.testing.expectEqual(IFace.wan, h.txAt(0).iface);
     try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
 }
+
+test "an ARP request must not overwrite an existing neighbour mapping" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+
+    const lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+    const lan_ip: IPv4 = .{ 192, 168, 86, 1 };
+    const lan_victim_ip: IPv4 = .{ 192, 168, 86, 43 };
+    const lan_victim_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x03 };
+    const attacker_mac: Mac = .{ 0x02, 0x66, 0x66, 0x66, 0x66, 0x66 };
+
+    // The router has validated both neighbours (gateway on WAN, client on LAN).
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+    h.cacheArp(.lan, lan_victim_ip, lan_victim_mac);
+
+    // Positive control: LAN->WAN forwarding uses the real gateway MAC.
+    h.nic.resetLogs();
+    {
+        const udp_bytes = try Packets.udp(alloc, client_ip, remote_ip, .{ .src_port = 40_000, .dst_port = 53, .payload = "x" });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{ .src = client_ip, .dst = remote_ip, .protocol = 17, .dont_fragment = true, .payload = udp_bytes });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.lan_mac, .src = client_mac, .ethertype = 0x0800, .payload = ip_bytes });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
+
+    // Positive control: a mapping held by the LAN neighbour is delivered to its
+    // real MAC on the way back in.
+    h.nic.resetLogs();
+    {
+        const udp_bytes = try Packets.udp(alloc, lan_victim_ip, remote_ip, .{ .src_port = 40_002, .dst_port = 53, .payload = "open" });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{ .src = lan_victim_ip, .dst = remote_ip, .protocol = 17, .dont_fragment = true, .payload = udp_bytes });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.lan_mac, .src = lan_victim_mac, .ethertype = 0x0800, .payload = ip_bytes });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+        const reply_udp = try Packets.udp(alloc, remote_ip, lease_ip, .{ .src_port = 53, .dst_port = 40_002, .payload = "back" });
+        defer alloc.free(reply_udp);
+        const reply_ip = try Packets.ipv4(alloc, .{ .src = remote_ip, .dst = lease_ip, .protocol = 17, .dont_fragment = true, .payload = reply_udp });
+        defer alloc.free(reply_ip);
+        const reply_frame = try Packets.eth(alloc, .{ .dst = RecordingNic.wan_mac, .src = gateway_mac, .ethertype = 0x0800, .payload = reply_ip });
+        defer alloc.free(reply_frame);
+        try h.inject(.wan, reply_frame);
+        _ = h.runAll(.wan);
+    }
+    try std.testing.expectEqual(@as(usize, 2), h.txCount());
+    try std.testing.expectEqual(lan_victim_mac, (try Ethernet.parse(h.txAt(1).bytes)).get(.dst_mac));
+
+    // WAN variant: an on-link host sends an ARP *request* for the router's WAN
+    // address but claims the gateway's IP in the sender fields. The router
+    // answers it (fine) but must not replace the validated gateway mapping.
+    {
+        const arp_bytes = try Packets.arp(alloc, .{
+            .opcode = 1,
+            .sender_mac = attacker_mac,
+            .sender_ip = gateway_ip,
+            .target_mac = .{0} ** 6,
+            .target_ip = lease_ip,
+        });
+        defer alloc.free(arp_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.wan_mac, .src = attacker_mac, .ethertype = 0x0806, .payload = arp_bytes });
+        defer alloc.free(frame);
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+    }
+    try std.testing.expectEqual(gateway_mac, State.wan_arp_table.lookup(gateway_ip).?);
+
+    // LAN variant: a host claims a live neighbour's IP in an ARP request.
+    {
+        const arp_bytes = try Packets.arp(alloc, .{
+            .opcode = 1,
+            .sender_mac = attacker_mac,
+            .sender_ip = lan_victim_ip,
+            .target_mac = .{0} ** 6,
+            .target_ip = lan_ip,
+        });
+        defer alloc.free(arp_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.lan_mac, .src = attacker_mac, .ethertype = 0x0806, .payload = arp_bytes });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(lan_victim_mac, State.lan_arp_table.lookup(lan_victim_ip).?);
+
+    // Consequence check: forwarded traffic must still use the real MACs.
+    h.nic.resetLogs();
+    {
+        const udp_bytes = try Packets.udp(alloc, client_ip, remote_ip, .{ .src_port = 40_001, .dst_port = 53, .payload = "y" });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{ .src = client_ip, .dst = remote_ip, .protocol = 17, .dont_fragment = true, .payload = udp_bytes });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.lan_mac, .src = client_mac, .ethertype = 0x0800, .payload = ip_bytes });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
+
+    h.nic.resetLogs();
+    {
+        // The LAN variant poisoned no mapping: traffic for .43's existing
+        // flow still goes to .43, not the attacker.
+        const reply_udp = try Packets.udp(alloc, remote_ip, lease_ip, .{ .src_port = 53, .dst_port = 40_002, .payload = "again" });
+        defer alloc.free(reply_udp);
+        const reply_ip = try Packets.ipv4(alloc, .{ .src = remote_ip, .dst = lease_ip, .protocol = 17, .dont_fragment = true, .payload = reply_udp });
+        defer alloc.free(reply_ip);
+        const reply_frame = try Packets.eth(alloc, .{ .dst = RecordingNic.wan_mac, .src = gateway_mac, .ethertype = 0x0800, .payload = reply_ip });
+        defer alloc.free(reply_frame);
+        try h.inject(.wan, reply_frame);
+        _ = h.runAll(.wan);
+    }
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    try std.testing.expectEqual(lan_victim_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
+}
