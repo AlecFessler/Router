@@ -3,6 +3,7 @@ const Router = @import("router");
 const ArpTable = Router.Tables.ArpTable.ArpTable;
 const ArpWaitersTable = Router.Tables.ArpWaitersTable.ArpWaitersTable;
 const DHCPv4Lease = Router.Protocols.DHCPv4.DHCPv4Lease;
+const WanTransaction = Router.Protocols.DHCPv4.WanTransaction;
 const DhcpTable = Router.Tables.DhcpTable.DhcpTable;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4FragmentTable = Router.Tables.IPv4FragmentTable.IPv4FragmentTable;
@@ -21,6 +22,7 @@ pub var lan_fragment_table: IPv4FragmentTable = undefined;
 pub var wan_fragment_table: IPv4FragmentTable = undefined;
 
 pub var wan_lease: ?DHCPv4Lease = null;
+pub var wan_transaction: ?WanTransaction = null;
 
 pub var lan_ip: IPv4 = undefined;
 pub var lan_subnet_mask: IPv4 = undefined;
