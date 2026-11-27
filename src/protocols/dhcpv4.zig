@@ -328,6 +328,13 @@ fn flushForwardingState(ip: IPv4) void {
     lan_arp_table.remove(ip);
 }
 
+fn isUsableWanAddress(ip: IPv4) bool {
+    if (ip[0] == 0 or ip[0] == 127) return false;
+    if (ip[0] == 169 and ip[1] == 254) return false;
+    if (ip[0] >= 224) return false;
+    return true;
+}
+
 pub fn handle(
     buffer: []u8,
     device: NicApi,
@@ -470,6 +477,7 @@ pub fn handle(
                     const sent_at = request_sent_at orelse return device.release(buffer);
                     const requested_ip = transaction.requested_ip orelse return device.release(buffer);
                     if (!std.meta.eql(offered_ip, requested_ip)) return device.release(buffer);
+                    if (!isUsableWanAddress(offered_ip)) return device.release(buffer);
 
                     const mask = options.subnet_mask orelse return device.release(buffer);
                     const gateway = options.router orelse return device.release(buffer);
@@ -499,7 +507,7 @@ pub fn handle(
                 },
                 .offer => {
                     if (wan_lease.* != null or transaction.requested_ip != null or
-                        std.meta.eql(offered_ip, ZERO_IP))
+                        !isUsableWanAddress(offered_ip))
                         return device.release(buffer);
 
                     transaction.requested_ip = offered_ip;
