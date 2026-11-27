@@ -223,6 +223,11 @@ pub fn forwardNat(
                 timeout,
             );
 
+            nat_table.appendPeer(key, .{
+                .ip = ip_view.get(.dst),
+                .port = transport_view.get(fields.wan),
+            });
+
             transport_view.setUpdateChecksum(fields.lan, mapping.outside.port, views);
 
             if (first_fragment) {
@@ -252,6 +257,13 @@ pub fn forwardNat(
             };
 
             const inside, const mapping = nat_table.inboundEntry(key) orelse
+                return device.release(buffer);
+
+            const source_peer: NatTable.Peer = .{
+                .ip = ip_view.get(.src),
+                .port = transport_view.get(fields.lan),
+            };
+            if (!mapping.acceptsPeer(source_peer))
                 return device.release(buffer);
 
             if (ip_view.get(.ttl) <= 1) {
@@ -371,6 +383,9 @@ pub fn forwardFragment(
                 return device.release(buffer);
 
             const inside, const entry = nat_table.inboundEntry(translation.nat_key) orelse
+                return device.release(buffer);
+
+            if (!entry.acceptsPeerIp(ip_view.get(.src)))
                 return device.release(buffer);
 
             break :blk .{ inside.ip, entry.generation };

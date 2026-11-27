@@ -6,12 +6,15 @@ const DHCPv4Lease = Router.Protocols.DHCPv4.DHCPv4Lease;
 const DhcpTable = Router.Tables.DhcpTable.DhcpTable;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4FragmentTable = Router.Tables.IPv4FragmentTable.IPv4FragmentTable;
+const NatFilteringMode = Router.Tables.NatTable.NatTable.FilteringMode;
 const NatTable = Router.Tables.NatTable.NatTable;
 
 pub var lan_arp_table: ArpTable = undefined;
 pub var wan_arp_table: ArpTable = undefined;
 pub var dhcp_table: DhcpTable = undefined;
 pub var nat_table: NatTable = undefined;
+
+pub var nat_filtering_mode: NatFilteringMode = .address_restricted;
 pub var arp_waiters_table: ArpWaitersTable = undefined;
 
 pub var lan_fragment_table: IPv4FragmentTable = undefined;

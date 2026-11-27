@@ -56,11 +56,55 @@ pub const NatTable = struct {
 
     pub const IpPort = struct { IPv4, u16 };
 
+    /// RFC 4787 filtering modes. The mapping itself is always
+    /// endpoint-independent; this only controls which remote peers may send
+    /// inbound packets through a live mapping.
+    pub const FilteringMode = enum {
+        full_cone, // any remote peer
+        address_restricted, // only peer addresses the inside host contacted
+        endpoint_dependent, // only the exact peer endpoints contacted
+    };
+
+    pub const Peer = struct {
+        ip: IPv4,
+        port: u16,
+    };
+
+    const MAX_PEERS = 4;
+    const empty_peer: Peer = .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+
     pub const Entry = struct {
         outside: Key,
         generation: u64,
         deadline: std.Io.Timestamp,
         port_allocator: *PortAllocator,
+        peers: [MAX_PEERS]Peer = .{ empty_peer, empty_peer, empty_peer, empty_peer },
+        peer_count: u8 = 0,
+
+        pub fn acceptsPeer(self: Entry, peer: Peer) bool {
+            return switch (Router.State.nat_filtering_mode) {
+                .full_cone => true,
+                .address_restricted => self.acceptsPeerIp(peer.ip),
+                .endpoint_dependent => self.acceptsPeerExact(peer),
+            };
+        }
+
+        /// Fragments carry no transport port, so endpoint-dependent mode can
+        /// only check the peer address there.
+        pub fn acceptsPeerIp(self: Entry, ip: IPv4) bool {
+            if (Router.State.nat_filtering_mode == .full_cone) return true;
+            for (self.peers[0..@as(usize, self.peer_count)]) |candidate| {
+                if (std.meta.eql(candidate.ip, ip)) return true;
+            }
+            return false;
+        }
+
+        fn acceptsPeerExact(self: Entry, peer: Peer) bool {
+            for (self.peers[0..@as(usize, self.peer_count)]) |candidate| {
+                if (std.meta.eql(candidate, peer)) return true;
+            }
+            return false;
+        }
     };
 
     io: std.Io,
@@ -187,6 +231,21 @@ pub const NatTable = struct {
             return error.NotFound;
         }
         entry.deadline = now.addDuration(duration);
+    }
+
+    pub fn appendPeer(self: *NatTable, key: Key, peer: Peer) void {
+        const entry = self.inside.getPtr(key) orelse return;
+        const count = @as(usize, entry.peer_count);
+        for (entry.peers[0..count]) |candidate| {
+            if (std.meta.eql(candidate, peer)) return;
+        }
+        if (count < MAX_PEERS) {
+            entry.peers[count] = peer;
+            entry.peer_count += 1;
+            return;
+        }
+        std.mem.copyForwards(Peer, entry.peers[0 .. MAX_PEERS - 1], entry.peers[1..MAX_PEERS]);
+        entry.peers[MAX_PEERS - 1] = peer;
     }
 
     pub fn remove(self: *NatTable, key: Key) void {
@@ -359,4 +418,40 @@ test "PortAllocator chooses a port in range for a low preference" {
     const selected = try port_allocator.allocate(53);
     try std.testing.expect(selected >= PortAllocator.first_port);
     try std.testing.expect(port_allocator.isAllocated(selected));
+}
+
+test "NAT filtering modes accept only the configured peers" {
+    const alloc = std.testing.allocator;
+    var table = try NatTable.init(alloc, std.testing.io, 1);
+    defer table.deinit(alloc);
+    var port_allocator: PortAllocator = .{};
+    const inside: NatTable.Key = .{ .protocol = .udp, .ip = .{ 192, 168, 1, 10 }, .port = 50000 };
+    const outside_ip: IPv4 = .{ 203, 0, 113, 5 };
+    const contacted: NatTable.Peer = .{ .ip = .{ 8, 8, 8, 8 }, .port = 53 };
+    const same_ip_other_port: NatTable.Peer = .{ .ip = .{ 8, 8, 8, 8 }, .port = 1234 };
+    const other_ip: NatTable.Peer = .{ .ip = .{ 6, 6, 6, 6 }, .port = 53 };
+
+    _ = try table.insert(&port_allocator, inside, outside_ip, .fromSeconds(60));
+    table.appendPeer(inside, contacted);
+    const entry = table.inside.get(inside).?;
+    const previous_mode = Router.State.nat_filtering_mode;
+    defer Router.State.nat_filtering_mode = previous_mode;
+
+    Router.State.nat_filtering_mode = .full_cone;
+    try std.testing.expect(entry.acceptsPeer(other_ip));
+    try std.testing.expect(entry.acceptsPeerIp(other_ip.ip));
+
+    Router.State.nat_filtering_mode = .address_restricted;
+    try std.testing.expect(entry.acceptsPeer(contacted));
+    try std.testing.expect(entry.acceptsPeer(same_ip_other_port));
+    try std.testing.expect(!entry.acceptsPeer(other_ip));
+    try std.testing.expect(entry.acceptsPeerIp(contacted.ip));
+    try std.testing.expect(!entry.acceptsPeerIp(other_ip.ip));
+
+    Router.State.nat_filtering_mode = .endpoint_dependent;
+    try std.testing.expect(entry.acceptsPeer(contacted));
+    try std.testing.expect(!entry.acceptsPeer(same_ip_other_port));
+    try std.testing.expect(!entry.acceptsPeer(other_ip));
+    try std.testing.expect(entry.acceptsPeerIp(contacted.ip));
+    try std.testing.expect(!entry.acceptsPeerIp(other_ip.ip));
 }
