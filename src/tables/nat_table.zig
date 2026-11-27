@@ -262,6 +262,19 @@ pub const NatTable = struct {
         entry.peers[MAX_PEERS - 1] = peer;
     }
 
+    pub fn removeAllForInsideIp(self: *NatTable, ip: IPv4) void {
+        while (true) {
+            var victim: ?Key = null;
+            for (self.inside.keys()) |key| {
+                if (!std.meta.eql(key.ip, ip)) continue;
+                victim = key;
+                break;
+            }
+            const key = victim orelse return;
+            self.remove(key);
+        }
+    }
+
     pub fn remove(self: *NatTable, key: Key) void {
         const removed = self.inside.fetchSwapRemove(key) orelse return;
         const reverse_removed = self.outside.remove(removed.value.outside);

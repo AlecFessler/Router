@@ -66,6 +66,10 @@ pub const ArpTable = struct {
         return self.table.items(.mac)[index];
     }
 
+    pub fn remove(self: *ArpTable, ip: IPv4) void {
+        if (self.indexOfValue(.ip, ip)) |index| self.table.swapRemove(index);
+    }
+
     pub fn cache(self: *ArpTable, ip: IPv4, mac: Mac) void {
         const entry: Entry = .{
             .ip = ip,
