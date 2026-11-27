@@ -26,7 +26,9 @@ const expectHexBytes = FixtureUtils.expectHexBytes;
 const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
 
 const dhcp_table = &Router.State.dhcp_table;
+const lan_arp_table = &Router.State.lan_arp_table;
 const lan_ip = &Router.State.lan_ip;
+const nat_table = &Router.State.nat_table;
 const lan_subnet_mask = &Router.State.lan_subnet_mask;
 const wan_arp_table = &Router.State.wan_arp_table;
 const wan_lease = &Router.State.wan_lease;
@@ -321,6 +323,11 @@ fn serializeOption(code: OptionType, value: anytype, writer: *std.Io.Writer) !vo
     try writer.writeAll(bytes);
 }
 
+fn flushForwardingState(ip: IPv4) void {
+    nat_table.removeAllForInsideIp(ip);
+    lan_arp_table.remove(ip);
+}
+
 pub fn handle(
     buffer: []u8,
     device: NicApi,
@@ -376,6 +383,8 @@ pub fn handle(
                 .decline => {
                     const ip = options.requested_ip_address orelse return device.release(buffer);
                     dhcp_table.decline(client, sender_mac, ip);
+                    if (dhcp_table.lookupByIp(ip) == null)
+                        flushForwardingState(ip);
                     return device.release(buffer);
                 },
                 .discover => offer: {
@@ -390,6 +399,8 @@ pub fn handle(
                 .inform => if (has_ciaddr) .ack else return device.release(buffer),
                 .release => {
                     dhcp_table.release(client, sender_mac, ciaddr);
+                    if (dhcp_table.lookupByIp(ciaddr) == null)
+                        flushForwardingState(ciaddr);
                     return device.release(buffer);
                 },
                 .request => request: {

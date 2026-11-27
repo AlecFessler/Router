@@ -2381,3 +2381,128 @@ test "UDP checksum must be validated over the UDP length, not the IPv4 payload l
         .port = 40_001,
     }) == null);
 }
+
+test "NAT mappings for a LAN address are invalidated when its DHCP lease is released" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .wan_lease = testWanLease(std.testing.io),
+        .dhcp_pool = &[_]IPv4{.{ 192, 168, 86, 10 }},
+    });
+    defer h.deinit();
+
+    const lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+    const leased_ip: IPv4 = .{ 192, 168, 86, 10 };
+    const victim_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x01 };
+    const attacker_mac: Mac = .{ 0x02, 0xbb, 0x00, 0x00, 0x00, 0x02 };
+    const victim_id = "victim";
+    const attacker_id = "attacker";
+    const inside_port: u16 = 40_000;
+
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+
+    // Victim obtains the only address in the pool.
+    const discover = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 1,
+        .xid = 0x0101_0101,
+        .client_id = victim_id,
+    });
+    defer alloc.free(discover);
+    try h.inject(.lan, discover);
+    _ = h.runAll(.lan);
+    const request = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 3,
+        .xid = 0x0101_0101,
+        .client_id = victim_id,
+        .requested_ip = leased_ip,
+        .server_id = .{ 192, 168, 86, 1 },
+    });
+    defer alloc.free(request);
+    try h.inject(.lan, request);
+    _ = h.runAll(.lan);
+    try std.testing.expect(State.dhcp_table.lookupByIp(leased_ip) != null);
+
+    // Victim opens an outbound UDP flow through NAT.
+    h.nic.resetLogs();
+    const query = try lanUdpFrame(alloc, leased_ip, victim_mac, remote_ip, inside_port, 53);
+    defer alloc.free(query);
+    try h.inject(.lan, query);
+    _ = h.runAll(.lan);
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    const out_ip = try Router.Protocols.IPv4.parse((try Ethernet.parse(h.txAt(0).bytes)).get(.payload));
+    const out_udp = try Router.Protocols.Udp.parse(out_ip.get(.payload), out_ip);
+    const outside_port = out_udp.get(.src_port);
+
+    // Victim releases the lease. The address goes back to the free pool.
+    const release = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 7,
+        .xid = 0x0202_0202,
+        .ciaddr = leased_ip,
+        .client_id = victim_id,
+    });
+    defer alloc.free(release);
+    try h.inject(.lan, release);
+    _ = h.runAll(.lan);
+    try std.testing.expect(State.dhcp_table.lookupByIp(leased_ip) == null);
+
+    // The released address must not keep forwarding state from its previous
+    // owner: the NAT mapping (and hence its inbound traffic) must be gone.
+    try std.testing.expect(State.nat_table.inboundLookup(.{
+        .protocol = .udp,
+        .ip = lease_ip,
+        .port = outside_port,
+    }) == null);
+
+    // Another client takes over the same address.
+    const attacker_discover = try DhcpClient.frame(alloc, attacker_mac, .{
+        .message_type = 1,
+        .xid = 0x0303_0303,
+        .client_id = attacker_id,
+    });
+    defer alloc.free(attacker_discover);
+    try h.inject(.lan, attacker_discover);
+    _ = h.runAll(.lan);
+    const attacker_request = try DhcpClient.frame(alloc, attacker_mac, .{
+        .message_type = 3,
+        .xid = 0x0303_0303,
+        .client_id = attacker_id,
+        .requested_ip = leased_ip,
+        .server_id = .{ 192, 168, 86, 1 },
+    });
+    defer alloc.free(attacker_request);
+    try h.inject(.lan, attacker_request);
+    _ = h.runAll(.lan);
+    try std.testing.expect(State.dhcp_table.lookupByIp(leased_ip) != null);
+
+    // The remote peer replies to the victim's old mapping. If the mapping
+    // survived the lease handover, the reply is delivered to the attacker.
+    h.cacheArp(.lan, leased_ip, attacker_mac);
+    h.nic.resetLogs();
+    const reply_udp = try Packets.udp(alloc, remote_ip, lease_ip, .{
+        .src_port = 53,
+        .dst_port = outside_port,
+        .payload = "dns-response",
+    });
+    defer alloc.free(reply_udp);
+    const reply_ip = try Packets.ipv4(alloc, .{
+        .src = remote_ip,
+        .dst = lease_ip,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = reply_udp,
+    });
+    defer alloc.free(reply_ip);
+    const reply_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.wan_mac,
+        .src = gateway_mac,
+        .ethertype = 0x0800,
+        .payload = reply_ip,
+    });
+    defer alloc.free(reply_frame);
+    try h.inject(.wan, reply_frame);
+    _ = h.runAll(.wan);
+
+    // Nothing from the previous lease holder's mapping may reach the LAN.
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+}
