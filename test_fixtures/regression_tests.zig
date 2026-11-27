@@ -1700,3 +1700,72 @@ test "ICMP errors quoting a packet outside the sender's flow must not be forward
         );
     }
 }
+
+/// Build a complete LAN->WAN UDP Ethernet frame with correct checksums.
+fn lanUdpFrame(
+    alloc: std.mem.Allocator,
+    src_ip: IPv4,
+    src_mac: Mac,
+    dst_ip: IPv4,
+    src_port: u16,
+    dst_port: u16,
+) ![]u8 {
+    const udp_bytes = try Packets.udp(alloc, src_ip, dst_ip, .{
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .payload = "x",
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = src_ip,
+        .dst = dst_ip,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = udp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    return Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = src_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+}
+
+test "one LAN host exhausting the NAT table must not deny NAT service to other hosts" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .wan_lease = testWanLease(std.testing.io),
+        .nat_capacity = 2,
+    });
+    defer h.deinit();
+
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+    const attacker_ip: IPv4 = .{ 192, 168, 86, 42 };
+    const victim_ip: IPv4 = .{ 192, 168, 86, 43 };
+    const attacker_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x01 };
+    const victim_mac: Mac = .{ 0x02, 0xbb, 0x00, 0x00, 0x00, 0x02 };
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+
+    // A single LAN host opens as many flows as the table can hold.
+    for ([_]u16{ 40_000, 40_001 }) |src_port| {
+        const frame = try lanUdpFrame(alloc, attacker_ip, attacker_mac, remote_ip, src_port, 53);
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(@as(usize, 2), h.txCount());
+    try std.testing.expectEqual(@as(usize, 0), h.errorCount());
+
+    // A different, independent LAN host opens its own flow. Filling the table
+    // from one host must not make the router deny everyone else.
+    const victim_frame = try lanUdpFrame(alloc, victim_ip, victim_mac, remote_ip, 50_000, 53);
+    defer alloc.free(victim_frame);
+    try h.inject(.lan, victim_frame);
+    _ = h.runAll(.lan);
+
+    try std.testing.expectEqual(@as(usize, 3), h.txCount());
+    try std.testing.expectEqual(@as(usize, 0), h.errorCount());
+    try std.testing.expectEqual(@as(usize, 0), h.dropCount());
+}
