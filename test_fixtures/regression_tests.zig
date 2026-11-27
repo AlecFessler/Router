@@ -1207,3 +1207,106 @@ test "a DHCPDECLINE with a spoofed chaddr from another Ethernet source must be r
     try std.testing.expect(State.dhcp_table.lookupByIp(victim_ip) != null);
     try std.testing.expectEqual(@as(usize, 0), State.dhcp_table.excluded_ips.items.len);
 }
+
+const wan_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const wan_gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+const wan_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const lan_client_ip: IPv4 = .{ 192, 168, 86, 42 };
+const lan_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+
+test "LAN datagrams to loopback, this-network, link-local, or reserved destinations must not be forwarded to the WAN" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+    h.cacheArp(.wan, wan_gateway_ip, wan_gateway_mac);
+
+    // Positive control: an ordinary routable WAN destination must still be
+    // forwarded (and NATed) once, so the drop assertions below cannot pass
+    // vacuously if LAN->WAN forwarding is broken.
+    {
+        const udp_bytes = try Packets.udp(alloc, lan_client_ip, .{ 8, 8, 8, 8 }, .{
+            .src_port = 40_100,
+            .dst_port = 53,
+            .payload = "control",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = lan_client_ip,
+            .dst = .{ 8, 8, 8, 8 },
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = lan_client_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.wan, tx.iface);
+        const tx_eth = try Ethernet.parse(tx.bytes);
+        const tx_ip = try Router.Protocols.IPv4.parse(tx_eth.get(.payload));
+        try std.testing.expectEqual(wan_lease_ip, tx_ip.get(.src));
+        try std.testing.expectEqual(IPv4{ 8, 8, 8, 8 }, tx_ip.get(.dst));
+        try std.testing.expectEqual(@as(u8, 63), tx_ip.get(.ttl));
+        try std.testing.expectEqual(@as(usize, 1), State.nat_table.inside.count());
+        h.nic.resetLogs();
+    }
+
+    // Destinations that can never be valid on the WAN link. RFC 1122 3.2.1.3
+    // and RFC 1812 3.3.6 require a router to discard datagrams addressed to
+    // the loopback network, "this network" (0/8), and other reserved space;
+    // RFC 3927 7 forbids forwarding link-local destinations to another link.
+    const forbidden = [_]IPv4{
+        .{ 127, 0, 0, 1 }, // loopback
+        .{ 0, 0, 0, 0 }, // "this network"
+        .{ 169, 254, 1, 1 }, // link-local
+        .{ 240, 0, 0, 1 }, // reserved / class E
+    };
+
+    for (forbidden, 0..) |dst, i| {
+        h.nic.resetLogs();
+
+        const udp_bytes = try Packets.udp(alloc, lan_client_ip, dst, .{
+            .src_port = @intCast(40_000 + i),
+            .dst_port = 53,
+            .payload = "must-not-leave",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = lan_client_ip,
+            .dst = dst,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = lan_client_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+
+        // The datagram must be dropped: no WAN transmission at all.
+        try std.testing.expectEqual(@as(usize, 0), h.txCount());
+        try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+    }
+
+    // Dropping the datagrams must not create any additional NAT state.
+    try std.testing.expectEqual(@as(usize, 1), State.nat_table.inside.count());
+}

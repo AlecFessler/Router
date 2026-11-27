@@ -425,6 +425,7 @@ pub const DstClass = enum {
     broadcast, // 255.255.255.255 or this LAN's directed broadcast
     multicast, // 224.0.0.0/4
     lan, // another address on the LAN subnet
+    drop, // non-routable; must never be forwarded off-link
     wan, // everything else
 };
 
@@ -440,6 +441,12 @@ pub fn classifyDestination(dst: IPv4) DstClass {
 
     if (dst[0] >= 224 and dst[0] <= 239) return .multicast;
 
+    // RFC 1122 3.2.1.3, RFC 1812 3.3.6, RFC 3927 7: 0/8, 127/8,
+    // 169.254/16 and 240/4 are never valid off-link destinations.
+    if (dst[0] == 0 or dst[0] == 127 or
+        (dst[0] == 169 and dst[1] == 254) or dst[0] >= 240)
+        return .drop;
+
     if (dst_bits == lan_bits) return .local;
     if (wan_lease.*) |lease| {
         const wan_bits: u32 = @bitCast(lease.ip);
@@ -450,7 +457,7 @@ pub fn classifyDestination(dst: IPv4) DstClass {
     return .wan;
 }
 
-test "classifyDestination distinguishes local, LAN, WAN, broadcast, and multicast destinations" {
+test "classifyDestination distinguishes local, LAN, WAN, broadcast, multicast, and non-routable destinations" {
     lan_ip.* = .{ 192, 168, 86, 1 };
     lan_subnet_mask.* = .{ 255, 255, 255, 0 };
     wan_lease.* = null;
@@ -462,6 +469,10 @@ test "classifyDestination distinguishes local, LAN, WAN, broadcast, and multicas
     try std.testing.expectEqual(DstClass.multicast, classifyDestination(.{ 224, 0, 0, 251 }));
     try std.testing.expectEqual(DstClass.multicast, classifyDestination(.{ 239, 255, 255, 250 }));
     try std.testing.expectEqual(DstClass.wan, classifyDestination(.{ 8, 8, 8, 8 }));
+    try std.testing.expectEqual(DstClass.drop, classifyDestination(.{ 0, 0, 0, 0 }));
+    try std.testing.expectEqual(DstClass.drop, classifyDestination(.{ 127, 0, 0, 1 }));
+    try std.testing.expectEqual(DstClass.drop, classifyDestination(.{ 169, 254, 1, 1 }));
+    try std.testing.expectEqual(DstClass.drop, classifyDestination(.{ 240, 0, 0, 1 }));
 
     const now = std.Io.Timestamp.now(std.testing.io, .boot);
     wan_lease.* = .{
