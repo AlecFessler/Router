@@ -35,7 +35,7 @@ pub fn validate(view: UdpPacketView, ip_view: IPv4PacketView) !void {
     if (ip_view.get(.more_fragments) or view.get(.checksum) == 0) return;
 
     var checksum = view.checksum();
-    try checksum.addPseudoheader(ip_view);
+    try checksum.addPseudoheaderLength(ip_view, view.get(.length));
     checksum.addFields(.src_port, .payload);
     try checksum.validate();
 }

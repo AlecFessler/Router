@@ -72,16 +72,41 @@ pub fn Checksum(comptime V: type) type {
                 const header_bytes: u16 = @as(u16, ip_view.get(.ihl)) * 4;
                 const total_length = ip_view.get(.total_length);
                 if (total_length < header_bytes) return error.InvalidField;
-                const length = total_length - header_bytes;
-                const src = ip_view.get(.src);
-                const dst = ip_view.get(.dst);
-                self.addBytes(&src);
-                self.addBytes(&dst);
-                self.addBytes(&.{ 0, @intFromEnum(ip_view.get(.protocol)) });
-                self.addWord(length);
+                self.addPseudoheaderFields(ip_view, total_length - header_bytes);
             } else {
                 @compileError("addPseudoheader() requires an IPv4 packet view");
             }
+        }
+
+        /// UDP's pseudo-header Length is the UDP length (RFC 768), not the
+        /// enclosing IPv4 payload length.
+        pub fn addPseudoheaderLength(
+            self: *Self,
+            ip_view: anytype,
+            length: u16,
+        ) !void {
+            const IpView = @TypeOf(ip_view);
+            const IPv4View = IPv4.IPv4PacketView;
+
+            if (comptime IpView == IPv4View) {
+                const header_bytes: u16 = @as(u16, ip_view.get(.ihl)) * 4;
+                const total_length = ip_view.get(.total_length);
+                if (total_length < header_bytes or
+                    length > total_length - header_bytes)
+                    return error.InvalidField;
+                self.addPseudoheaderFields(ip_view, length);
+            } else {
+                @compileError("addPseudoheaderLength() requires an IPv4 packet view");
+            }
+        }
+
+        fn addPseudoheaderFields(self: *Self, ip_view: anytype, length: u16) void {
+            const src = ip_view.get(.src);
+            const dst = ip_view.get(.dst);
+            self.addBytes(&src);
+            self.addBytes(&dst);
+            self.addBytes(&.{ 0, @intFromEnum(ip_view.get(.protocol)) });
+            self.addWord(length);
         }
 
         pub fn finish(self: *const Self) u16 {

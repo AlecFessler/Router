@@ -2273,3 +2273,111 @@ test "WAN ingress datagrams with LAN-side or martian sources must be dropped" {
         try std.testing.expectEqual(@as(usize, 1), h.dropCount());
     }
 }
+
+fn sumNetworkWords(sum_in: u64, bytes: []const u8) u64 {
+    var sum = sum_in;
+    var i: usize = 0;
+    while (i + 1 < bytes.len) : (i += 2) {
+        sum += (@as(u16, bytes[i]) << 8) | bytes[i + 1];
+    }
+    if (i < bytes.len) sum += @as(u16, bytes[i]) << 8;
+    return sum;
+}
+
+fn udpChecksumWithPseudoLength(
+    src: IPv4,
+    dst: IPv4,
+    udp_bytes: []const u8,
+    pseudo_length: u16,
+) u16 {
+    var sum: u64 = 0;
+    sum = sumNetworkWords(sum, &src);
+    sum = sumNetworkWords(sum, &dst);
+    sum += 17; // protocol
+    sum += pseudo_length;
+    sum = sumNetworkWords(sum, udp_bytes);
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return ~@as(u16, @intCast(sum));
+}
+
+test "UDP checksum must be validated over the UDP length, not the IPv4 payload length" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .wan_lease = testWanLease(std.testing.io),
+    });
+    defer h.deinit();
+    h.cacheArp(.wan, .{ 203, 0, 113, 1 }, gateway_mac);
+
+    // Positive control: UDP length equals the IPv4 payload length and the
+    // checksum is computed over that length, so it is forwarded.
+    const good_udp = try Packets.udp(alloc, client_ip, .{ 8, 8, 8, 8 }, .{
+        .src_port = 40_000,
+        .dst_port = 53,
+        .payload = "abcd",
+    });
+    defer alloc.free(good_udp);
+    const good_ip = try Packets.ipv4(alloc, .{
+        .src = client_ip,
+        .dst = .{ 8, 8, 8, 8 },
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = good_udp,
+    });
+    defer alloc.free(good_ip);
+    const good_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = client_mac,
+        .ethertype = 0x0800,
+        .payload = good_ip,
+    });
+    defer alloc.free(good_frame);
+    try h.inject(.lan, good_frame);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+
+    // RFC 768 checksums the pseudo-header's Length field from the UDP length
+    // field. The router instead uses the whole IPv4 payload length, so a UDP
+    // datagram whose length field is 8 while the IP payload is 12 (four
+    // trailing bytes) accepts a checksum that no RFC 768 endpoint would accept.
+    // Such a corrupt datagram must be dropped and must not create NAT state.
+    h.nic.resetLogs();
+    const bad_udp = try Packets.udp(alloc, client_ip, .{ 8, 8, 8, 8 }, .{
+        .src_port = 40_001,
+        .dst_port = 53,
+        .length = 8,
+        .checksum = 0,
+        .payload = &.{},
+    });
+    defer alloc.free(bad_udp);
+    var bad_datagram: [12]u8 = undefined;
+    @memcpy(bad_datagram[0..8], bad_udp);
+    @memset(bad_datagram[8..], 0xaa);
+    // Checksum computed with the router's bogus pseudo-header length (12).
+    const bogus = udpChecksumWithPseudoLength(client_ip, .{ 8, 8, 8, 8 }, bad_datagram[0..8], 12);
+    std.mem.writeInt(u16, bad_datagram[6..8], bogus, .big);
+
+    const bad_ip = try Packets.ipv4(alloc, .{
+        .src = client_ip,
+        .dst = .{ 8, 8, 8, 8 },
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = &bad_datagram,
+    });
+    defer alloc.free(bad_ip);
+    const bad_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = client_mac,
+        .ethertype = 0x0800,
+        .payload = bad_ip,
+    });
+    defer alloc.free(bad_frame);
+    try h.inject(.lan, bad_frame);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
+
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+    try std.testing.expect(State.nat_table.inboundLookup(.{
+        .protocol = .udp,
+        .ip = .{ 203, 0, 113, 50 },
+        .port = 40_001,
+    }) == null);
+}
