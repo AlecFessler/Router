@@ -174,10 +174,11 @@ pub fn queueForArpResolution(
         .wan => if (wan_lease.*) |lease| lease.ip else return error.NoWanLease,
     };
     const sender_mac = device.macAddress(key.iface);
+
     const tx_buffer = device.nextTxBuffer(key.iface);
     errdefer device.release(tx_buffer);
-
     var writer: std.Io.Writer = .fixed(tx_buffer);
+
     try EthernetFrameView.serialize(.{
         .dst_mac = .{0xff} ** 6,
         .src_mac = sender_mac,
