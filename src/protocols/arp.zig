@@ -95,6 +95,10 @@ pub fn handle(
 
     if (my_ip == null) return device.release(buffer);
 
+    // IEEE 802.3 requires a unicast source address. A group sender MAC is
+    // never a valid neighbour: do not answer it and never cache it.
+    if (view.get(.sender_mac)[0] & 1 != 0) return device.release(buffer);
+
     if (view.fieldCmp(.sender_mac, .{ .eq = my_mac })) return device.release(buffer);
 
     if (view.fieldCmp(.sender_ip, .{ .eq = my_ip.? })) {
