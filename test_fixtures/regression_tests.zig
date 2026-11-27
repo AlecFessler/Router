@@ -3001,3 +3001,86 @@ test "one LAN host flooding spoofed ARP entries must not evict a live neighbour"
     try std.testing.expect(State.lan_arp_table.lookup(victim_ip) != null);
     try std.testing.expect(std.meta.eql(State.lan_arp_table.lookup(victim_ip).?, victim_mac));
 }
+
+test "one LAN host cannot monopolize the fragment table and deny reassembly to other flows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .wan_lease = testWanLease(std.testing.io),
+        .fragment_capacity = 4,
+    });
+    defer h.deinit();
+
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+    const attacker_ip: IPv4 = .{ 192, 168, 86, 42 };
+    const victim_ip: IPv4 = .{ 192, 168, 86, 43 };
+    const attacker_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x01 };
+    const victim_mac: Mac = .{ 0x02, 0xbb, 0x00, 0x00, 0x00, 0x02 };
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+
+    // The attacker fills every live reassembly slot with one non-first
+    // fragment per key. Only src/dst/identification/protocol are keyed, and
+    // all of them are attacker-chosen, so one host can occupy every slot.
+    for (1..5) |identification| {
+        const payload = [_]u8{0xaa} ** 16;
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = attacker_ip,
+            .dst = remote_ip,
+            .protocol = 17,
+            .identification = @intCast(identification),
+            .more_fragments = false,
+            .fragment_offset = 8,
+            .payload = &payload,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = attacker_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+    try std.testing.expectEqual(@as(usize, 0), h.errorCount());
+    try std.testing.expectEqual(@as(usize, 4), State.lan_fragment_table.table.count());
+
+    // A different host starts its own fragmented datagram. Live entries may be
+    // reclaimed (LRU) or per-source quotas enforced, but one host filling the
+    // table must not deny reassembly/forwarding to every other flow.
+    h.nic.resetLogs();
+    const udp_bytes = try Packets.udp(alloc, victim_ip, remote_ip, .{
+        .src_port = 40_000,
+        .dst_port = 53,
+        .payload = "abcdefgh",
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = victim_ip,
+        .dst = remote_ip,
+        .protocol = 17,
+        .identification = 7,
+        .more_fragments = true,
+        .fragment_offset = 0,
+        .payload = udp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    const frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = victim_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+    defer alloc.free(frame);
+    try h.inject(.lan, frame);
+    _ = h.runAll(.lan);
+
+    // The victim's first fragment must be forwarded (one TX to the gateway),
+    // not dropped because the attacker owns every reassembly slot.
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    try std.testing.expectEqual(@as(usize, 0), h.errorCount());
+    try std.testing.expectEqual(IFace.wan, h.txAt(0).iface);
+    try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
+}
