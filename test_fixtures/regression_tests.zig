@@ -2810,3 +2810,131 @@ test "DHCP client must reject a WAN lease that assigns a non-unicast address" {
         if (State.wan_lease) |lease| lease.ip else null,
     );
 }
+
+/// Minimal DHCPv4 client message builder for the DHCP state-table regressions.
+const DhcpClientMsg = struct {
+    pub const Opts = struct {
+        message_type: u8,
+        xid: u32 = 0x1122_3344,
+        ciaddr: IPv4 = .{ 0, 0, 0, 0 },
+        client_id: ?[]const u8 = null,
+        requested_ip: ?IPv4 = null,
+        server_id: ?IPv4 = null,
+        broadcast_flag: bool = false,
+    };
+
+    fn u16be(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u16) !void {
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, value, .big);
+        try list.appendSlice(alloc, &bytes);
+    }
+
+    fn u32be(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, value, .big);
+        try list.appendSlice(alloc, &bytes);
+    }
+
+    fn option(list: *std.ArrayList(u8), alloc: std.mem.Allocator, code: u8, data: []const u8) !void {
+        try list.append(alloc, code);
+        try list.append(alloc, @intCast(data.len));
+        try list.appendSlice(alloc, data);
+    }
+
+    pub fn frame(alloc: std.mem.Allocator, mac: Mac, opts: Opts) ![]u8 {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(alloc);
+        try list.append(alloc, 1); // BOOTREQUEST
+        try list.append(alloc, 1); // Ethernet
+        try list.append(alloc, 6); // hlen
+        try list.append(alloc, 0); // hops
+        try u32be(&list, alloc, opts.xid);
+        try u16be(&list, alloc, 0); // secs
+        try u16be(&list, alloc, if (opts.broadcast_flag) 0x8000 else 0);
+        try list.appendSlice(alloc, &opts.ciaddr);
+        try list.appendSlice(alloc, &([_]u8{0} ** 4));
+        try list.appendSlice(alloc, &([_]u8{0} ** 4));
+        try list.appendSlice(alloc, &([_]u8{0} ** 4));
+        try list.appendSlice(alloc, &mac);
+        try list.appendSlice(alloc, &([_]u8{0} ** 10));
+        try list.appendSlice(alloc, &([_]u8{0} ** 64));
+        try list.appendSlice(alloc, &([_]u8{0} ** 128));
+        try list.appendSlice(alloc, &.{ 0x63, 0x82, 0x53, 0x63 });
+
+        const message_type = [_]u8{opts.message_type};
+        try option(&list, alloc, 53, &message_type);
+        if (opts.client_id) |id| try option(&list, alloc, 61, id);
+        if (opts.requested_ip) |ip| try option(&list, alloc, 50, &ip);
+        if (opts.server_id) |ip| try option(&list, alloc, 54, &ip);
+        try list.append(alloc, 255);
+
+        const dhcp = try list.toOwnedSlice(alloc);
+        defer alloc.free(dhcp);
+        const udp_bytes = try Packets.udp(alloc, .{ 0, 0, 0, 0 }, .{ 255, 255, 255, 255 }, .{
+            .src_port = 68,
+            .dst_port = 67,
+            .checksum = 0,
+            .payload = dhcp,
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = .{ 0, 0, 0, 0 },
+            .dst = .{ 255, 255, 255, 255 },
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        return Packets.eth(alloc, .{
+            .dst = .{0xff} ** 6,
+            .src = mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+    }
+};
+
+test "one L2 client cannot reserve the whole DHCP pool with distinct client identifiers" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .dhcp_pool = &[_]IPv4{ .{ 192, 168, 86, 10 }, .{ 192, 168, 86, 11 } },
+    });
+    defer h.deinit();
+
+    const attacker_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x01 };
+    const legit_mac: Mac = .{ 0x02, 0xbb, 0x00, 0x00, 0x00, 0x02 };
+
+    // A single attacker host claims every address with distinct client ids.
+    for ([_][]const u8{ "spoof-1", "spoof-2", "spoof-3" }) |client_id| {
+        const discover = try DhcpClientMsg.frame(alloc, attacker_mac, .{
+            .message_type = 1,
+            .xid = 0x1111_2222,
+            .client_id = client_id,
+        });
+        defer alloc.free(discover);
+        try h.inject(.lan, discover);
+        _ = h.runAll(.lan);
+    }
+    try std.testing.expectEqual(@as(usize, 0), State.dhcp_table.ip_pool.items.len);
+
+    // A legitimate client on the same segment now asks for an address. The
+    // router must not let one L2 client deny DHCP service to the whole LAN.
+    h.nic.resetLogs();
+    const legit = try DhcpClientMsg.frame(alloc, legit_mac, .{
+        .message_type = 1,
+        .xid = 0x3333_4444,
+        .client_id = "legit",
+    });
+    defer alloc.free(legit);
+    try h.inject(.lan, legit);
+    _ = h.runAll(.lan);
+
+    // Exactly one DHCP OFFER must be sent to the legitimate client.
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    const tx_frame = try Ethernet.parse(h.txAt(0).bytes);
+    const tx_ip = try Router.Protocols.IPv4.parse(tx_frame.get(.payload));
+    const tx_udp = try Router.Protocols.Udp.parse(tx_ip.get(.payload), tx_ip);
+    const tx_dhcp = try Router.Protocols.DHCPv4.parse(tx_udp.get(.payload));
+    try std.testing.expectEqual(Router.Protocols.DHCPv4.Op.BOOTREPLY, tx_dhcp.get(.op));
+    try std.testing.expect(!std.meta.eql(tx_dhcp.get(.your_ip), IPv4{ 0, 0, 0, 0 }));
+}

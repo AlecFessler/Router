@@ -223,8 +223,32 @@ pub const DhcpTable = struct {
 
             if (self.ip_pool.items.len > 0) break :pick self.ip_pool.items[0];
 
+            var expired_ip: ?IPv4 = null;
+            var oldest_offered: ?usize = null;
+            var oldest_deadline: i96 = 0;
             for (self.table.items(.deadline), 0..) |deadline, index| {
-                if (!self.isExpired(deadline)) continue;
+                if (self.isExpired(deadline)) {
+                    const ip = self.table.items(.ip)[index];
+                    self.removeAtIndex(index);
+                    self.ip_pool.appendAssumeCapacity(ip);
+                    expired_ip = ip;
+                    break;
+                }
+                if (self.table.items(.state)[index] != .offered) continue;
+
+                const deadline_ns = deadline.toNanoseconds();
+                if (oldest_offered == null or deadline_ns < oldest_deadline) {
+                    oldest_offered = index;
+                    oldest_deadline = deadline_ns;
+                }
+            }
+
+            if (expired_ip) |ip| break :pick ip;
+
+            // The pool is empty but one or more leases are still in the
+            // short-lived offered state. Reclaim the oldest offer instead
+            // of letting one client reserve the whole pool.
+            if (oldest_offered) |index| {
                 const ip = self.table.items(.ip)[index];
                 self.removeAtIndex(index);
                 self.ip_pool.appendAssumeCapacity(ip);
@@ -383,8 +407,10 @@ test "DHCP expiry reclaims multiple addresses while retaining a live lease" {
     const client_b: DhcpTable.Client = .{ .id = "client-b" };
     const client_c: DhcpTable.Client = .{ .id = "client-c" };
 
-    _ = try table.offer(client_a, test_mac, test_ip1, .fromSeconds(60));
-    _ = try table.offer(client_b, test_mac, test_ip2, .fromSeconds(60));
+    // Bind these so the full-pool case is not eligible for oldest-offer
+    // reclamation; this test is about expiry.
+    try table.bindOrRenew(client_a, test_mac, test_ip1, .fromSeconds(60));
+    try table.bindOrRenew(client_b, test_mac, test_ip2, .fromSeconds(60));
     try table.bindOrRenew(client_c, test_mac, test_ip3, .fromSeconds(60));
     const replacement: DhcpTable.Client = .{ .id = "client-d" };
     try std.testing.expect(try table.offer(replacement, test_mac, null, .fromSeconds(60)) == null);
