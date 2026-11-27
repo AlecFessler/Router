@@ -52,7 +52,6 @@ const QuotedTransportView = View(struct {
 });
 
 pub fn validate(view: ICMPv4PacketView) !void {
-    if (view.get(.checksum) == 0) return;
     var checksum = view.checksum();
     checksum.addFields(.message_type, .payload);
     try checksum.validate();

@@ -11,6 +11,7 @@ const IFace = Router.Nic.Api.IFace;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
+const TestUtils = Router.TestFixtures.Utils;
 const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
@@ -128,9 +129,13 @@ test "parse() reads echo request and reply fields" {
 }
 
 test "parse() accepts empty data and rejects truncated echo fields" {
-    const packet = [_]u8{ 0x08, 0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01 };
+    var packet = [_]u8{ 0x08, 0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01 };
+    TestUtils.writeIcmpv4Checksum(&packet);
     for (0..4) |body_len| {
-        const icmpv4_view = try ICMPv4.parse(packet[0 .. 4 + body_len]);
+        var short: [7]u8 = undefined;
+        @memcpy(short[0 .. 4 + body_len], packet[0 .. 4 + body_len]);
+        TestUtils.writeIcmpv4Checksum(short[0 .. 4 + body_len]);
+        const icmpv4_view = try ICMPv4.parse(short[0 .. 4 + body_len]);
         try std.testing.expectError(error.EndOfStream, parse(icmpv4_view));
     }
     const icmpv4_view = try ICMPv4.parse(&packet);
@@ -141,11 +146,11 @@ test "parse() accepts empty data and rejects truncated echo fields" {
 test "parse() rejects nonzero echo code and non-echo message type" {
     var packet = test_request;
     packet[1] = 1;
-    packet[2] = 0;
-    packet[3] = 0;
+    TestUtils.writeIcmpv4Checksum(&packet);
     try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&packet)));
     packet[0] = 3;
     packet[1] = 0;
+    TestUtils.writeIcmpv4Checksum(&packet);
     try std.testing.expectError(error.InvalidField, parse(try ICMPv4.parse(&packet)));
 }
 
