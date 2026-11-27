@@ -188,11 +188,25 @@ pub const NatTable = struct {
         }
 
         if (self.inside.count() == self.capacity) {
+            var reclaimed_expired = false;
+            var victim: ?Key = null;
+            var victim_deadline: i96 = 0;
             for (self.inside.keys(), self.inside.values()) |inside_key, entry| {
-                if (!isExpired(entry.deadline, now)) continue;
-                self.remove(inside_key);
-                break;
-            } else return error.NoCapacity;
+                if (isExpired(entry.deadline, now)) {
+                    self.remove(inside_key);
+                    reclaimed_expired = true;
+                    break;
+                }
+                // Reclaim the least-recently-refreshed entry for the new flow.
+                const deadline = entry.deadline.toNanoseconds();
+                if (victim == null or deadline < victim_deadline) {
+                    victim = inside_key;
+                    victim_deadline = deadline;
+                }
+            }
+            if (!reclaimed_expired) {
+                self.remove(victim.?);
+            }
         }
 
         const outside_port = port_allocator.allocate(key.port) catch |err| switch (err) {
@@ -332,7 +346,7 @@ test "NAT insert uses another occupied port and keeps protocol spaces separate" 
     try std.testing.expect(table.inboundLookup(udp_entry.outside) != null);
 }
 
-test "NAT lookups release expired ports and insertion reuses expired capacity" {
+test "NAT lookups release expired ports and insertion reclaims capacity" {
     const alloc = std.testing.allocator;
     var table = try NatTable.init(alloc, std.testing.io, 2);
     defer table.deinit(alloc);
@@ -360,8 +374,11 @@ test "NAT lookups release expired ports and insertion reuses expired capacity" {
     try std.testing.expect(table.inboundLookup(live.outside) != null);
     try std.testing.expect(table.inboundLookup(replacement.outside) != null);
 
-    try std.testing.expectError(error.NoCapacity, table.insert(&tcp_port_allocator, tcp_inside, outside_ip, .fromSeconds(60)));
+    _ = try table.insert(&tcp_port_allocator, tcp_inside, outside_ip, .fromSeconds(60));
+    try std.testing.expect(table.outboundLookup(tcp_inside, outside_ip) != null);
     try std.testing.expectEqual(@as(usize, 2), table.outside.count());
+    try std.testing.expect(table.inboundLookup(live.outside) == null or
+        table.inboundLookup(replacement.outside) == null);
 }
 
 test "NAT initialization fails without storage" {
