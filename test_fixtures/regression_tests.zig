@@ -2143,3 +2143,133 @@ test "a fragmented ICMPv4 echo must not be answered from its first fragment" {
         try std.testing.expectEqual(@as(u13, 0), tx_ip.get(.fragment_offset));
     }
 }
+
+const spoof_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const spoof_gateway: IPv4 = .{ 203, 0, 113, 1 };
+const spoof_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const spoof_client_ip: IPv4 = .{ 192, 168, 86, 42 };
+const spoof_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+const spoof_remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+
+test "WAN ingress datagrams with LAN-side or martian sources must be dropped" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.init(alloc, io, .{
+        .wan_lease = testWanLease(io),
+        // full-cone isolates source validation from the NAT peer filter.
+        .nat_filtering_mode = .full_cone,
+    });
+    defer h.deinit();
+    h.cacheArp(.wan, spoof_gateway, spoof_gateway_mac);
+    h.cacheArp(.lan, spoof_client_ip, spoof_client_mac);
+
+    // The LAN client opens a UDP flow, creating an inbound NAT mapping whose
+    // public port is 40_000 on 203.0.113.50.
+    {
+        const udp_bytes = try Packets.udp(alloc, spoof_client_ip, spoof_remote_ip, .{
+            .src_port = 40_000,
+            .dst_port = 53,
+            .payload = "open-flow",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = spoof_client_ip,
+            .dst = spoof_remote_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.lan_mac,
+            .src = spoof_client_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        h.nic.resetLogs();
+    }
+
+    // Positive control: a legitimate reply from the contacted peer is still
+    // delivered, so the drop below is source validation, not a blanket WAN drop.
+    {
+        const reply = try Packets.udp(alloc, spoof_remote_ip, spoof_lease_ip, .{
+            .src_port = 53,
+            .dst_port = 40_000,
+            .payload = "legitimate-reply",
+        });
+        defer alloc.free(reply);
+        const reply_ip = try Packets.ipv4(alloc, .{
+            .src = spoof_remote_ip,
+            .dst = spoof_lease_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = reply,
+        });
+        defer alloc.free(reply_ip);
+        const reply_frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.wan_mac,
+            .src = spoof_gateway_mac,
+            .ethertype = 0x0800,
+            .payload = reply_ip,
+        });
+        defer alloc.free(reply_frame);
+        try h.inject(.wan, reply_frame);
+        _ = h.runAll(.wan);
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        try std.testing.expectEqual(IFace.lan, h.txAt(0).iface);
+        h.nic.resetLogs();
+    }
+
+    // A source address in any of these ranges cannot legitimately arrive from
+    // the WAN: the LAN subnet is not routed over the WAN, loopback, "this
+    // network", link-local, multicast and broadcast sources are never valid
+    // off-link. Forwarding such a datagram to a LAN client lets a WAN attacker
+    // impersonate the LAN gateway (192.168.86.1) or a LAN peer.
+    const spoofed_sources = [_]IPv4{
+        .{ 192, 168, 86, 1 }, // the LAN gateway / router's own LAN address
+        .{ 192, 168, 86, 42 }, // the LAN client's own address
+        .{ 127, 0, 0, 1 }, // loopback
+        .{ 0, 0, 0, 0 }, // "this network"
+        .{ 169, 254, 1, 1 }, // link-local
+        .{ 224, 0, 0, 1 }, // multicast
+        .{ 255, 255, 255, 255 }, // limited broadcast
+    };
+
+    for (spoofed_sources) |src| {
+        h.nic.resetLogs();
+
+        const udp_bytes = try Packets.udp(alloc, src, spoof_lease_ip, .{
+            .src_port = 53,
+            .dst_port = 40_000,
+            .payload = "spoofed-reply",
+        });
+        defer alloc.free(udp_bytes);
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = src,
+            .dst = spoof_lease_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+        const frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.wan_mac,
+            .src = spoof_gateway_mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+        defer alloc.free(frame);
+
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+
+        // The spoofed datagram must be dropped, not delivered to the LAN client.
+        try std.testing.expectEqual(@as(usize, 0), h.txCount());
+        try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+    }
+}

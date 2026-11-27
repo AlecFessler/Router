@@ -139,7 +139,8 @@ pub fn handle(
         const lease = wan_lease.* orelse return device.release(buffer);
         const should_forward = switch (iface) {
             .lan => classifyDestination(view.get(.dst)) == .wan,
-            .wan => view.fieldCmp(.dst, .{ .eq = lease.ip }),
+            .wan => view.fieldCmp(.dst, .{ .eq = lease.ip }) and
+                classifyDestination(view.get(.src)) == .wan,
         };
         if (!should_forward) return device.release(buffer);
 
@@ -248,6 +249,11 @@ pub fn forwardNat(
         },
         .wan => {
             if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip }))
+                return device.release(buffer);
+
+            // A source on the LAN, on the router itself, or in non-routable
+            // space cannot legitimately arrive from the WAN (RFC 2827/BCP 38).
+            if (classifyDestination(ip_view.get(.src)) != .wan)
                 return device.release(buffer);
 
             const key: NatTable.Key = .{
