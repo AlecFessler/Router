@@ -15,6 +15,8 @@ const PcapParser = Router.TestFixtures.PcapParser;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
+const forwardQuotedError = Router.Protocols.ICMPv4.forwardQuotedError;
+
 pub const Code = enum(u8) {
     host_unreachable = 1,
     port_unreachable = 3,
@@ -56,23 +58,23 @@ pub fn handle(
     Cli.enter(.destination_unreachable, view);
     const code: Code = @enumFromInt(icmpv4_view.get(.code));
     switch (code) {
-        .host_unreachable => std.debug.print(
-            "ICMPv4: {f} unhandled by {s} interface\n",
-            .{ Format.enumLabel(code), @tagName(iface) },
-        ),
-        .port_unreachable => std.debug.print(
-            "ICMPv4: {f} unhandled by {s} interface\n",
-            .{ Format.enumLabel(code), @tagName(iface) },
-        ),
-        .fragmentation_needed => std.debug.print("ICMPv4: {f} (next-hop MTU {}) unhandled by {s} interface\n", .{
-            Format.enumLabel(code), view.get(.next_hop_mtu), @tagName(iface),
-        }),
-        else => std.debug.print(
-            "ICMPv4: {f} unhandled by {s} interface\n",
-            .{ Format.enumLabel(code), @tagName(iface) },
-        ),
+        .host_unreachable, .port_unreachable, .fragmentation_needed => {
+            return forwardQuotedError(
+                buffer,
+                device,
+                iface,
+                views,
+                view.get(.quoted_packet),
+            );
+        },
+        else => {
+            std.debug.print(
+                "ICMPv4: {f} unhandled by {s} interface\n",
+                .{ Format.enumLabel(code), @tagName(iface) },
+            );
+            device.release(buffer);
+        },
     }
-    device.release(buffer);
 }
 
 test "parse() reads destination unreachable messages from the WAN capture" {

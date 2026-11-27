@@ -84,11 +84,15 @@ pub fn Checksum(comptime V: type) type {
             }
         }
 
-        pub fn validate(self: *const Self) error{BadChecksum}!void {
+        pub fn finish(self: *const Self) u16 {
             var sum = self.sum;
             if (self.pending_byte) |byte| sum += @as(u16, byte) << 8;
             while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
-            if (sum != 0xffff) return error.BadChecksum;
+            return ~@as(u16, @intCast(sum));
+        }
+
+        pub fn validate(self: *const Self) error{BadChecksum}!void {
+            if (self.finish() != 0) return error.BadChecksum;
         }
     };
 }

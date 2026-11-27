@@ -87,6 +87,14 @@ pub fn validate(view: IPv4PacketView) !void {
 }
 
 pub fn parse(buffer: []const u8) !IPv4PacketView {
+    return parsePacket(buffer, false);
+}
+
+pub fn parseQuoted(buffer: []const u8) !IPv4PacketView {
+    return parsePacket(buffer, true);
+}
+
+fn parsePacket(buffer: []const u8, comptime quoted: bool) !IPv4PacketView {
     var view: IPv4PacketView = undefined;
     var reader: std.Io.Reader = .fixed(buffer);
 
@@ -100,7 +108,11 @@ pub fn parse(buffer: []const u8) !IPv4PacketView {
     // validate before taking the payload to verify the header checksum
     try validate(view);
 
-    const payload_bytes = view.get(.total_length) - header_bytes;
+    const declared_payload_bytes = view.get(.total_length) - header_bytes;
+    const payload_bytes = if (quoted)
+        @min(declared_payload_bytes, reader.bufferedLen())
+    else
+        declared_payload_bytes;
     try view.takeBytes(.payload, payload_bytes, &reader);
 
     return view;

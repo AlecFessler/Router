@@ -18,6 +18,15 @@ const TimeExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
+const checksumContribution = Router.Meta.Checksum.checksumContribution;
+const classifyDestination = Router.Protocols.IPv4.classifyDestination;
+const forward = Router.Protocols.IPv4.forward;
+const parseQuoted = Router.Protocols.IPv4.parseQuoted;
+const updateChecksum = Router.Meta.Checksum.update;
+
+const nat_table = &Router.State.nat_table;
+const wan_lease = &Router.State.wan_lease;
+
 pub const MessageType = enum(u8) {
     echo_reply = 0,
     destination_unreachable = 3,
@@ -34,6 +43,12 @@ pub const ICMPv4Packet = struct {
 };
 
 pub const ICMPv4PacketView = View(ICMPv4Packet);
+
+const QuotedTransportView = View(struct {
+    src_port: u16,
+    dst_port: u16,
+    checksum: ?u16,
+});
 
 pub fn validate(view: ICMPv4PacketView) !void {
     if (view.get(.checksum) == 0) return;
@@ -79,6 +94,118 @@ pub fn handle(
             device.release(buffer);
         },
     }
+}
+
+pub fn forwardQuotedError(
+    buffer: []u8,
+    device: NicApi,
+    iface: IFace,
+    views: *ViewStack,
+    quoted_packet: []u8,
+) !void {
+    const lease = wan_lease.* orelse return device.release(buffer);
+    const outer = views.getView(.ipv4);
+    const icmp = views.getView(.icmpv4);
+
+    var quote = try parseQuoted(quoted_packet);
+    const payload = quote.get(.payload);
+    const protocol = quote.get(.protocol);
+
+    if (quote.get(.fragment_offset) != 0 or payload.len < 8)
+        return device.release(buffer);
+
+    const checksum_offset: usize = switch (protocol) {
+        .tcp => 16,
+        .udp => 6,
+        else => return device.release(buffer),
+    };
+
+    var transport: QuotedTransportView = undefined;
+    var reader: std.Io.Reader = .fixed(payload);
+    try transport.takeFields(.src_port, .dst_port, &reader);
+    if (payload.len >= checksum_offset + 2) {
+        try reader.discardAll(checksum_offset - 4);
+        try transport.takeField(.checksum, &reader);
+    } else {
+        transport.set(.checksum, null);
+    }
+
+    const egress, const next_hop = switch (iface) {
+        .wan => wan: {
+            if (!outer.fieldCmp(.dst, .{ .eq = lease.ip }) or
+                !quote.fieldCmp(.src, .{ .eq = lease.ip }))
+                return device.release(buffer);
+
+            const client_ip, const client_port = nat_table.inboundLookup(.{
+                .protocol = protocol,
+                .ip = quote.get(.src),
+                .port = transport.get(.src_port),
+            }) orelse return device.release(buffer);
+
+            rewriteQuotedEndpoint(&quote, &transport, .src, client_ip, client_port);
+            outer.setUpdateChecksum(.dst, client_ip, views);
+            break :wan .{ IFace.lan, client_ip };
+        },
+        .lan => lan: {
+            const remote_ip = outer.get(.dst);
+            if (classifyDestination(remote_ip) != .wan or
+                !quote.fieldCmp(.src, .{ .eq = remote_ip }))
+                return device.release(buffer);
+
+            const public_ip, const public_port = nat_table.outboundLookup(.{
+                .protocol = protocol,
+                .ip = quote.get(.dst),
+                .port = transport.get(.dst_port),
+            }, lease.ip) orelse return device.release(buffer);
+
+            rewriteQuotedEndpoint(&quote, &transport, .dst, public_ip, public_port);
+            outer.setUpdateChecksum(.src, public_ip, views);
+            break :lan .{ IFace.wan, lease.router };
+        },
+    };
+
+    icmp.set(.checksum, 0);
+    var checksum = icmp.checksum();
+    checksum.addFields(.message_type, .payload);
+    icmp.set(.checksum, checksum.finish());
+
+    return forward(buffer, device, egress, next_hop, views);
+}
+
+fn rewriteQuotedEndpoint(
+    quote: *IPv4PacketView,
+    transport: *QuotedTransportView,
+    comptime field: IPv4PacketView.Field,
+    ip: IPv4,
+    port: u16,
+) void {
+    const old_ip = quote.get(field);
+    const old_ip_sum = checksumContribution(&old_ip);
+    const new_ip_sum = checksumContribution(&ip);
+
+    const port_field: QuotedTransportView.Field = if (field == .src) .src_port else .dst_port;
+    const old_port = transport.get(port_field);
+
+    quote.set(field, ip);
+    quote.set(.header_checksum, updateChecksum(
+        quote.get(.header_checksum),
+        old_ip_sum,
+        new_ip_sum,
+        2,
+    ));
+    transport.set(port_field, port);
+
+    const is_udp = quote.get(.protocol) == .udp;
+    const old_checksum = transport.get(.checksum) orelse return;
+    if (is_udp and old_checksum == 0) return;
+
+    const updated = updateChecksum(
+        old_checksum,
+        old_ip_sum + old_port,
+        new_ip_sum + port,
+        3,
+    );
+    transport.set(.checksum, if (is_udp and updated == 0) 0xffff else updated);
 }
 
 const test_packet = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 0x61, 0x62, 0x63 };
