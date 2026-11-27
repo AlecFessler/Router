@@ -180,12 +180,33 @@ pub const DhcpTable = struct {
         self: *DhcpTable,
         client: Client,
         mac: Mac,
-        candidate_ip: IPv4,
+        preferred_ip: ?IPv4,
         offer_duration: std.Io.Duration,
-    ) !IPv4 {
+    ) !?IPv4 {
         if (self.lookupByClient(client)) |index| {
             return self.table.items(.ip)[index];
         }
+
+        const candidate_ip = pick: {
+            if (preferred_ip) |preferred| {
+                _ = self.lookupByIp(preferred);
+                for (self.ip_pool.items) |ip| {
+                    if (std.meta.eql(ip, preferred)) break :pick ip;
+                }
+            }
+
+            if (self.ip_pool.items.len > 0) break :pick self.ip_pool.items[0];
+
+            for (self.table.items(.deadline), 0..) |deadline, index| {
+                if (!self.isExpired(deadline)) continue;
+                const ip = self.table.items(.ip)[index];
+                self.removeAtIndex(index);
+                self.ip_pool.appendAssumeCapacity(ip);
+                break :pick ip;
+            }
+            return null;
+        };
+
         try self.addNewEntry(
             client,
             mac,
@@ -295,7 +316,7 @@ test "DHCP rejects another client's address and invalid renewals without changin
     const client_b: DhcpTable.Client = .{ .mac = other_mac };
 
     try table.bindOrRenew(client_a, test_mac, test_ip1, .fromSeconds(60));
-    try std.testing.expectError(error.InvalidIP, table.offer(client_b, other_mac, test_ip1, .fromSeconds(30)));
+    try std.testing.expectError(error.InvalidIP, table.bindOrRenew(client_b, other_mac, test_ip1, .fromSeconds(30)));
     try std.testing.expectError(error.InvalidMac, table.bindOrRenew(client_a, other_mac, test_ip1, .fromSeconds(60)));
     try std.testing.expectError(error.InvalidIP, table.bindOrRenew(client_a, test_mac, test_ip2, .fromSeconds(60)));
     table.release(client_b, test_ip1);
@@ -319,8 +340,13 @@ test "DHCP expiry reclaims multiple addresses while retaining a live lease" {
     _ = try table.offer(client_a, test_mac, test_ip1, .fromSeconds(60));
     _ = try table.offer(client_b, test_mac, test_ip2, .fromSeconds(60));
     try table.bindOrRenew(client_c, test_mac, test_ip3, .fromSeconds(60));
+    const replacement: DhcpTable.Client = .{ .id = "client-d" };
+    try std.testing.expect(try table.offer(replacement, test_mac, null, .fromSeconds(60)) == null);
+
     table.table.items(.deadline)[table.lookupByClient(client_a).?] = .fromNanoseconds(0);
     table.table.items(.deadline)[table.lookupByClient(client_b).?] = .fromNanoseconds(0);
+    try std.testing.expectEqual(test_ip1, try table.offer(replacement, test_mac, null, .fromSeconds(60)));
+    table.release(replacement, test_ip1);
 
     try std.testing.expect(table.lookupByClient(client_a) == null);
     try std.testing.expect(table.lookupByClient(client_b) == null);
@@ -348,9 +374,7 @@ test "DHCP decline excludes an address and release makes another address reusabl
     table.decline(client_a, test_ip1);
     try std.testing.expectEqual(@as(usize, 1), table.excluded_ips.items.len);
     try std.testing.expectEqual(test_ip1, table.excluded_ips.items[0]);
-    try std.testing.expectError(error.InvalidIP, table.offer(client_b, test_mac, test_ip1, .fromSeconds(60)));
-
-    _ = try table.offer(client_b, test_mac, test_ip2, .fromSeconds(60));
+    try std.testing.expectEqual(test_ip2, try table.offer(client_b, test_mac, test_ip1, .fromSeconds(60)));
     table.release(client_b, test_ip2);
     try std.testing.expectEqual(@as(usize, 1), table.ip_pool.items.len);
     try std.testing.expectEqual(test_ip2, table.ip_pool.items[0]);

@@ -13,6 +13,8 @@ const NatTable = Router.Tables.NatTable.NatTable;
 const State = Router.State;
 const ViewStack = Router.Protocols.ViewStack;
 
+const tickWan = Router.Protocols.DHCPv4.tickWan;
+
 const ARP_CAPACITY: u32 = 256;
 const ARP_TTL = std.Io.Duration.fromSeconds(300);
 const ARP_WAITERS_CAPACITY: usize = 256;
@@ -87,6 +89,11 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         State.arp_waiters_table.expire(mock_nic);
+        if (iface == .wan) {
+            tickWan(init.io, mock_nic) catch |err| {
+                std.debug.print("DHCPv4: {t}\n", .{err});
+            };
+        }
         const packet = mock_nic.receive(iface) orelse break;
         var views: ViewStack = .{};
         Ethernet.handle(packet, mock_nic, iface, &views) catch |err| {

@@ -4,20 +4,98 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const CsvParser = DHCPv4Fixtures.CsvParser;
 const DHCPv4Fixtures = Router.TestFixtures.DHCPv4;
+const DhcpTable = Router.Tables.DhcpTable.DhcpTable;
 const Ethernet = Router.Protocols.Ethernet;
+const EthernetFrameView = Router.Protocols.Ethernet.EthernetFrameView;
 const FixtureUtils = Router.TestFixtures.Utils;
 const Format = Router.Meta.Format;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
+const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
 const Mac = Router.Protocols.Ethernet.Mac;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
+const UdpPacketView = Router.Protocols.Udp.UdpPacketView;
 const UdpProtocol = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
+const classifyDestination = Router.Protocols.IPv4.classifyDestination;
 const expectHexBytes = FixtureUtils.expectHexBytes;
+const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
+
+const dhcp_table = &Router.State.dhcp_table;
+const lan_ip = &Router.State.lan_ip;
+const lan_subnet_mask = &Router.State.lan_subnet_mask;
+const wan_arp_table = &Router.State.wan_arp_table;
+const wan_lease = &Router.State.wan_lease;
+
+const ZERO_IP: IPv4 = .{ 0, 0, 0, 0 };
+const BROADCAST_IP: IPv4 = .{0xff} ** 4;
+const BROADCAST_MAC: Mac = .{0xff} ** 6;
+const DHCP_HEADER_LEN = 240;
+const MAX_OPTIONS_LEN = 576 - 20 - 8 - DHCP_HEADER_LEN;
+const MIN_OPTIONS_LEN = 300 - DHCP_HEADER_LEN;
+const LAN_DNS = [2]IPv4{ .{ 8, 8, 8, 8 }, .{ 8, 8, 4, 4 } };
+const LAN_LEASE = std.Io.Duration.fromSeconds(86_400);
+const OFFER_HOLD = std.Io.Duration.fromSeconds(30);
+const INITIAL_RETRY_SECONDS = 4;
+const MAX_RETRY_SECONDS = 64;
+
+const WAN_PARAMETER_REQUEST_LIST = [_]OptionType{
+    .subnet_mask,
+    .router,
+    .dns_servers,
+    .lease_time,
+    .server_id,
+    .renewal_time,
+    .rebinding_time,
+};
+
+const WanTransaction = struct {
+    xid: u32,
+    started_at: std.Io.Timestamp,
+    discover_secs: u16 = 0,
+    requested_ip: ?IPv4 = null,
+    expected_server: ?IPv4 = null,
+    request_sent_at: ?std.Io.Timestamp = null,
+    next_send: std.Io.Timestamp = .zero,
+    retry_seconds: i64 = INITIAL_RETRY_SECONDS,
+};
+
+const RxOptions = struct {
+    message_type: ?MessageType = null,
+    requested_ip_address: ?IPv4 = null,
+    server_id: ?IPv4 = null,
+    client_id: ?[]u8 = null,
+    subnet_mask: ?IPv4 = null,
+    router: ?IPv4 = null,
+    lease_time: ?std.Io.Duration = null,
+    renewal_time: ?std.Io.Duration = null,
+    rebinding_time: ?std.Io.Duration = null,
+};
+
+const Tx = struct {
+    kind: MessageType,
+    xid: u32,
+    mac: Mac,
+    client_id: ?[]u8 = null,
+    secs: u16 = 0,
+    ciaddr: IPv4 = ZERO_IP,
+    yiaddr: IPv4 = ZERO_IP,
+    server_id: ?IPv4 = null,
+    requested_ip: ?IPv4 = null,
+    lease_time: ?std.Io.Duration = null,
+    src_ip: IPv4 = ZERO_IP,
+    dst_ip: IPv4 = BROADCAST_IP,
+    dst_mac: Mac = BROADCAST_MAC,
+    arp_target: ?IPv4 = null,
+    broadcast: bool,
+    vlan_tags: []u8 = &.{},
+};
+
+var wan_transaction: ?WanTransaction = null;
 
 pub const DHCPv4Lease = struct {
     ip: IPv4,
@@ -224,6 +302,25 @@ pub fn parseOption(reader: *std.Io.Reader) !?OptionValue {
     }
 }
 
+fn serializeOption(code: OptionType, value: anytype, writer: *std.Io.Writer) !void {
+    const Value = @TypeOf(value);
+    const encoded = switch (@typeInfo(Value)) {
+        .int => std.mem.nativeToBig(Value, value),
+        .@"enum" => |info| std.mem.nativeToBig(info.tag_type, @intFromEnum(value)),
+        .array, .pointer => value,
+        else => @compileError("DHCP options expect integers, enums, or bytes"),
+    };
+    const bytes: []const u8 = switch (@typeInfo(@TypeOf(encoded))) {
+        .int => std.mem.asBytes(&encoded),
+        .array => &encoded,
+        .pointer => encoded,
+        else => unreachable,
+    };
+    const len = std.math.cast(u8, bytes.len) orelse return error.OptionTooLong;
+    try writer.writeAll(&.{ @intFromEnum(code), len });
+    try writer.writeAll(bytes);
+}
+
 pub fn handle(
     buffer: []u8,
     device: NicApi,
@@ -233,90 +330,382 @@ pub fn handle(
     const view = try parse(views.getView(.udp).get(.payload));
     Cli.enter(.dhcpv4, view);
 
-    var message_type_scanner: std.Io.Reader = .fixed(view.get(.options));
-    var maybe_message_type: ?MessageType = null;
-    while (try parseOption(&message_type_scanner)) |value| {
+    var options: RxOptions = .{};
+    var reader: std.Io.Reader = .fixed(view.get(.options));
+    while (try parseOption(&reader)) |value| {
         switch (value) {
             .message_type => |message_type| {
-                if (maybe_message_type != null) return error.DuplicateMessageType;
-                maybe_message_type = message_type;
+                if (options.message_type != null) return error.DuplicateMessageType;
+                options.message_type = message_type;
             },
+            .requested_ip_address => |ip| options.requested_ip_address = ip,
+            .server_id => |ip| options.server_id = ip,
+            .client_id => |id| options.client_id = id,
+            .subnet_mask => |mask| options.subnet_mask = mask,
+            .router => |routers| options.router = routers[0],
+            .lease_time => |time| options.lease_time = time,
+            .renewal_time => |time| options.renewal_time = time,
+            .rebinding_time => |time| options.rebinding_time = time,
             else => continue,
         }
     }
 
-    const message_type = maybe_message_type orelse return error.MissingMessageType;
+    const message_type = options.message_type orelse return error.MissingMessageType;
+    const mac = view.get(.client_hw_addr)[0..6].*;
+    const xid = view.get(.xid);
+
     switch (iface) {
         .lan => {
-            switch (message_type) {
-                .decline => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
-                },
-                .discover => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
-                },
-                .inform => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
-                },
-                .request => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
-                },
+            if (!view.fieldCmp(.op, .{ .eq = .BOOTREQUEST }) or
+                !view.fieldCmp(.relay_agent_ip, .{ .eq = ZERO_IP }))
+                return device.release(buffer);
 
+            const server = options.server_id orelse lan_ip.*;
+            if (!std.meta.eql(server, lan_ip.*)) return device.release(buffer);
+
+            const client: DhcpTable.Client = if (options.client_id) |id|
+                .{ .id = id }
+            else
+                .{ .mac = mac };
+            const ciaddr = view.get(.client_ip);
+            const has_ciaddr = !std.meta.eql(ciaddr, ZERO_IP);
+
+            var assigned_ip: ?IPv4 = null;
+            const reply: MessageType = switch (message_type) {
+                .decline => {
+                    const ip = options.requested_ip_address orelse return device.release(buffer);
+                    dhcp_table.decline(client, ip);
+                    return device.release(buffer);
+                },
+                .discover => offer: {
+                    assigned_ip = try dhcp_table.offer(
+                        client,
+                        mac,
+                        options.requested_ip_address,
+                        OFFER_HOLD,
+                    ) orelse return device.release(buffer);
+                    break :offer .offer;
+                },
+                .inform => if (has_ciaddr) .ack else return device.release(buffer),
                 .release => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
+                    dhcp_table.release(client, ciaddr);
+                    return device.release(buffer);
+                },
+                .request => request: {
+                    const requested = if (has_ciaddr)
+                        ciaddr
+                    else
+                        options.requested_ip_address orelse return device.release(buffer);
+
+                    if (!has_ciaddr and options.server_id == null and
+                        classifyDestination(requested) == .lan and
+                        dhcp_table.lookupByClient(client) == null)
+                        return device.release(buffer);
+
+                    dhcp_table.bindOrRenew(client, mac, requested, LAN_LEASE) catch |err| switch (err) {
+                        error.InvalidIP, error.InvalidMac => break :request .nak,
+                        else => return err,
+                    };
+                    assigned_ip = requested;
+                    break :request .ack;
                 },
                 else => {
                     std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
                         Format.enumLabel(message_type), @tagName(iface),
                     });
-                    device.release(buffer);
+                    return device.release(buffer);
                 },
-            }
+            };
+
+            const broadcast_flag = view.get(.broadcast_flag);
+            const unicast = reply != .nak and (has_ciaddr or !broadcast_flag);
+            const yiaddr = assigned_ip orelse ZERO_IP;
+            const client_ip = if (has_ciaddr) ciaddr else yiaddr;
+
+            try transmit(device, .lan, .{
+                .kind = reply,
+                .xid = xid,
+                .mac = mac,
+                .client_id = options.client_id,
+                .ciaddr = ciaddr,
+                .yiaddr = yiaddr,
+                .server_id = lan_ip.*,
+                .lease_time = if (assigned_ip != null) LAN_LEASE else null,
+                .src_ip = lan_ip.*,
+                .dst_ip = if (unicast) client_ip else BROADCAST_IP,
+                .dst_mac = if (unicast) mac else BROADCAST_MAC,
+                .broadcast = broadcast_flag,
+                .vlan_tags = views.getView(.ethernet).get(.vlan_tags),
+            });
         },
         .wan => {
+            const transaction = if (wan_transaction) |*pending| pending else return device.release(buffer);
+            if (!view.fieldCmp(.op, .{ .eq = .BOOTREPLY }) or xid != transaction.xid or
+                !std.meta.eql(mac, device.macAddress(.wan)))
+                return device.release(buffer);
+
+            const server = options.server_id orelse return device.release(buffer);
+            if (std.meta.eql(server, ZERO_IP)) return device.release(buffer);
+            const offered_ip = view.get(.your_ip);
+            const matches_server = if (transaction.expected_server) |expected|
+                std.meta.eql(server, expected)
+            else
+                true;
+            const request_sent_at = if (matches_server) transaction.request_sent_at else null;
+
             switch (message_type) {
                 .ack => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
+                    const sent_at = request_sent_at orelse return device.release(buffer);
+                    const requested_ip = transaction.requested_ip orelse return device.release(buffer);
+                    if (!std.meta.eql(offered_ip, requested_ip)) return device.release(buffer);
+
+                    const mask = options.subnet_mask orelse return device.release(buffer);
+                    const gateway = options.router orelse return device.release(buffer);
+                    const lifetime = options.lease_time orelse return device.release(buffer);
+                    const lease_ns = lifetime.toNanoseconds();
+                    const t1: std.Io.Duration = options.renewal_time orelse .fromNanoseconds(@divTrunc(lease_ns, 2));
+                    const t2: std.Io.Duration = options.rebinding_time orelse .fromNanoseconds(@divTrunc(lease_ns * 7, 8));
+                    if (t1.toNanoseconds() <= 0 or t1.toNanoseconds() >= t2.toNanoseconds() or
+                        t2.toNanoseconds() >= lease_ns)
+                        return device.release(buffer);
+
+                    wan_lease.* = .{
+                        .ip = offered_ip,
+                        .subnet_mask = mask,
+                        .router = gateway,
+                        .server_id = server,
+                        .renewal_deadline = sent_at.addDuration(t1),
+                        .rebinding_deadline = sent_at.addDuration(t2),
+                        .expiration_deadline = sent_at.addDuration(lifetime),
+                    };
+                    wan_transaction = null;
                 },
                 .nak => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
+                    if (request_sent_at == null) return device.release(buffer);
+                    wan_lease.* = null;
+                    wan_transaction = null;
                 },
                 .offer => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
+                    if (wan_lease.* != null or transaction.requested_ip != null or
+                        std.meta.eql(offered_ip, ZERO_IP))
+                        return device.release(buffer);
+
+                    transaction.requested_ip = offered_ip;
+                    transaction.expected_server = server;
+                    transaction.next_send = .zero;
+                    transaction.retry_seconds = INITIAL_RETRY_SECONDS;
                 },
-                else => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
-                    });
-                    device.release(buffer);
-                },
+                else => std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
+                    Format.enumLabel(message_type), @tagName(iface),
+                }),
             }
         },
     }
+
+    device.release(buffer);
+}
+
+pub fn tickWan(io: std.Io, device: NicApi) !void {
+    const now = std.Io.Timestamp.now(io, .boot);
+    const now_ns = now.toNanoseconds();
+
+    if (wan_lease.*) |lease| {
+        if (now_ns >= lease.expiration_deadline.toNanoseconds()) {
+            wan_lease.* = null;
+            wan_transaction = null;
+        } else if (now_ns < lease.renewal_deadline.toNanoseconds()) {
+            return;
+        }
+    }
+
+    const lease = wan_lease.*;
+    if (wan_transaction) |transaction| {
+        if (now_ns < transaction.next_send.toNanoseconds()) return;
+
+        const offer_timed_out = lease == null and transaction.requested_ip != null and
+            transaction.retry_seconds == MAX_RETRY_SECONDS;
+        if (offer_timed_out) wan_transaction = null;
+    }
+
+    if (wan_transaction == null) {
+        var xid: u32 = undefined;
+        io.random(std.mem.asBytes(&xid));
+        wan_transaction = .{ .xid = xid, .started_at = now };
+    }
+    const transaction = &wan_transaction.?;
+
+    var tx: Tx = .{
+        .kind = .request,
+        .xid = transaction.xid,
+        .mac = device.macAddress(.wan),
+        .secs = @intCast(@min(transaction.started_at.durationTo(now).toSeconds(), std.math.maxInt(u16))),
+        .broadcast = true,
+    };
+    var next_send = now.addDuration(.fromSeconds(transaction.retry_seconds));
+
+    if (lease) |active| {
+        tx.ciaddr = active.ip;
+        tx.src_ip = active.ip;
+        const renewing = now_ns < active.rebinding_deadline.toNanoseconds();
+        if (renewing) {
+            tx.dst_ip = active.server_id;
+            tx.broadcast = false;
+        }
+
+        const boundary = if (renewing) active.rebinding_deadline else active.expiration_deadline;
+        const remaining = now.durationTo(boundary).toSeconds();
+        const retry = now.addDuration(.fromSeconds(@max(60, @divTrunc(remaining, 2))));
+        next_send = if (retry.toNanoseconds() < boundary.toNanoseconds()) retry else boundary;
+    } else if (transaction.requested_ip) |requested| {
+        tx.secs = transaction.discover_secs;
+        tx.requested_ip = requested;
+        tx.server_id = transaction.expected_server;
+    } else {
+        tx.kind = .discover;
+    }
+
+    if (!tx.broadcast) {
+        const active = lease.?;
+        const mask: u32 = @bitCast(active.subnet_mask);
+        const local: u32 = @bitCast(active.ip);
+        const destination: u32 = @bitCast(tx.dst_ip);
+        const on_link = (local & mask) == (destination & mask);
+        const next_hop = if (on_link) tx.dst_ip else active.router;
+        const mac = wan_arp_table.lookup(next_hop);
+        tx.dst_mac = mac orelse .{0} ** 6;
+        if (mac == null) tx.arp_target = next_hop;
+    }
+
+    transaction.next_send = next_send;
+    try transmit(device, .wan, tx);
+
+    if (lease) |active| {
+        transaction.requested_ip = active.ip;
+        transaction.expected_server = if (tx.broadcast) null else active.server_id;
+    } else {
+        transaction.retry_seconds = @min(transaction.retry_seconds * 2, MAX_RETRY_SECONDS);
+    }
+
+    if (tx.kind == .discover) {
+        transaction.discover_secs = tx.secs;
+    } else if (transaction.request_sent_at == null) {
+        transaction.request_sent_at = now;
+    }
+}
+
+fn transmit(device: NicApi, iface: IFace, tx: Tx) !void {
+    var option_bytes = [_]u8{0} ** MAX_OPTIONS_LEN;
+    var option_writer: std.Io.Writer = .fixed(&option_bytes);
+    try serializeOption(.message_type, tx.kind, &option_writer);
+
+    if (tx.server_id) |ip| try serializeOption(.server_id, ip, &option_writer);
+    if (tx.requested_ip) |ip| try serializeOption(.requested_ip_address, ip, &option_writer);
+
+    if (iface == .wan) {
+        const client_id = [_]u8{1} ++ tx.mac;
+        try serializeOption(.client_id, client_id, &option_writer);
+        try serializeOption(
+            .parameter_request_list,
+            std.mem.asBytes(&WAN_PARAMETER_REQUEST_LIST),
+            &option_writer,
+        );
+    } else if (tx.client_id) |id| {
+        try serializeOption(.client_id, id, &option_writer);
+    }
+
+    if (tx.lease_time) |duration| {
+        const seconds: u32 = @intCast(duration.toSeconds());
+        try serializeOption(.lease_time, seconds, &option_writer);
+    }
+    if (iface == .lan and tx.kind != .nak) {
+        try serializeOption(.subnet_mask, lan_subnet_mask.*, &option_writer);
+        try serializeOption(.router, tx.src_ip, &option_writer);
+        try serializeOption(.dns_servers, std.mem.asBytes(&LAN_DNS), &option_writer);
+    }
+    try option_writer.writeByte(@intFromEnum(OptionType.end));
+    const options_len = @max(option_writer.end, MIN_OPTIONS_LEN);
+    const udp_length: u16 = @intCast(8 + DHCP_HEADER_LEN + options_len);
+
+    const tx_buffer = device.nextTxBuffer(iface);
+    errdefer device.release(tx_buffer);
+    var writer: std.Io.Writer = .fixed(tx_buffer);
+
+    try EthernetFrameView.serialize(.{
+        .dst_mac = tx.dst_mac,
+        .src_mac = device.macAddress(iface),
+        .vlan_tags = tx.vlan_tags,
+        .ethertype = .ipv4,
+        .payload = &.{},
+    }, &writer);
+
+    const ip_start = writer.end;
+    try IPv4PacketView.serialize(.{
+        .version = 4,
+        .ihl = 5,
+        .dscp = 0,
+        .ecn = 0,
+        .total_length = 20 + udp_length,
+        .identification = 0,
+        .reserved = 0,
+        .dont_fragment = true,
+        .more_fragments = false,
+        .fragment_offset = 0,
+        .ttl = 64,
+        .protocol = .udp,
+        .header_checksum = 0,
+        .src = tx.src_ip,
+        .dst = tx.dst_ip,
+        .options = &.{},
+        .payload = &.{},
+    }, &writer);
+    try UdpPacketView.serialize(.{
+        .src_port = if (iface == .wan) 68 else 67,
+        .dst_port = if (iface == .wan) 67 else 68,
+        .length = udp_length,
+        .checksum = 0,
+        .payload = &.{},
+    }, &writer);
+
+    var client_hw_addr = [_]u8{0} ** 16;
+    client_hw_addr[0..6].* = tx.mac;
+    try DHCPv4PacketView.serialize(.{
+        .op = if (iface == .wan) .BOOTREQUEST else .BOOTREPLY,
+        .xid = tx.xid,
+        .secs = tx.secs,
+        .broadcast_flag = tx.broadcast,
+        .client_ip = if (tx.kind == .nak) ZERO_IP else tx.ciaddr,
+        .your_ip = tx.yiaddr,
+        .next_server_ip = ZERO_IP,
+        .relay_agent_ip = ZERO_IP,
+        .client_hw_addr = client_hw_addr,
+        .server_name = .{0} ** 64,
+        .file = .{0} ** 128,
+        .options = option_bytes[0..options_len],
+    }, &writer);
+
+    var reader: std.Io.Reader = .fixed(tx_buffer[ip_start..writer.end]);
+    var ip: IPv4PacketView = undefined;
+    try ip.takeFields(.version, .dst, &reader);
+    try ip.takeBytes(.options, 0, &reader);
+
+    var udp: UdpPacketView = undefined;
+    try udp.takeFields(.src_port, .checksum, &reader);
+    try udp.takeBytes(.payload, reader.bufferedLen(), &reader);
+
+    var ip_checksum = ip.checksum();
+    ip_checksum.addFields(.version, .options);
+    ip.set(.header_checksum, ip_checksum.finish());
+
+    var udp_checksum = udp.checksum();
+    try udp_checksum.addPseudoheader(ip);
+    udp_checksum.addFields(.src_port, .payload);
+    const checksum = udp_checksum.finish();
+    udp.set(.checksum, if (checksum == 0) 0xffff else checksum);
+
+    const frame = tx_buffer[0..writer.end];
+    if (tx.arp_target) |target_ip|
+        return queueForArpResolution(frame, device, .{ .iface = iface, .ip = target_ip });
+    device.transmit(frame);
 }
 
 const test_packet = blk: {
