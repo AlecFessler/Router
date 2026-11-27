@@ -17,13 +17,11 @@ const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
 const classifyDestination = Router.Protocols.IPv4.classifyDestination;
-const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
+const forward = Router.Protocols.IPv4.forward;
+const forwardFirstFragment = Router.Protocols.IPv4.forwardFirstFragment;
 
-const lan_arp_table = &Router.State.lan_arp_table;
-const lan_ip = &Router.State.lan_ip;
 const nat_table = &Router.State.nat_table;
 const wan_lease = &Router.State.wan_lease;
-const wan_arp_table = &Router.State.wan_arp_table;
 
 const NAT_TIMEOUT = std.Io.Duration.fromSeconds(7440);
 
@@ -68,11 +66,13 @@ pub fn parse(buffer: []const u8, ip_view: IPv4PacketView) !TcpPacketView {
 
     try view.validate(.data_offset, .{ .gte = 5 });
     const header_bytes = @as(usize, view.get(.data_offset)) * 4;
+    if (header_bytes > buffer.len) return error.EndOfStream;
+
     const options_bytes = header_bytes - 20;
     try view.takeBytes(.options, options_bytes, &reader);
     try view.takeBytes(.payload, reader.bufferedLen(), &reader);
 
-    try validate(view, ip_view);
+    if (!ip_view.get(.more_fragments)) try validate(view, ip_view);
     return view;
 }
 
@@ -82,17 +82,12 @@ pub fn handle(
     iface: IFace,
     views: *ViewStack,
 ) !void {
-    const ethernet_view = views.getView(.ethernet);
     const ip_view = views.getView(.ipv4);
+    const first_fragment = ip_view.get(.more_fragments);
+
     var view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.tcp, view);
     views.setView(.tcp, &view);
-
-    const ttl = ip_view.get(.ttl);
-    if (ttl <= 1) {
-        device.release(buffer);
-        return;
-    }
 
     const lease = wan_lease.* orelse {
         device.release(buffer);
@@ -101,8 +96,7 @@ pub fn handle(
 
     switch (iface) {
         .lan => {
-            const dst = ip_view.get(.dst);
-            if (classifyDestination(dst) != .wan) {
+            if (classifyDestination(ip_view.get(.dst)) != .wan) {
                 device.release(buffer);
                 return;
             }
@@ -113,36 +107,33 @@ pub fn handle(
                 .port = view.get(.src_port),
             };
 
-            const src_ip, const src_port = if (nat_table.outboundLookup(key, lease.ip)) |existing| hit: {
+            const mapping = if (nat_table.outboundEntry(key, lease.ip)) |existing| hit: {
                 try nat_table.refresh(key, NAT_TIMEOUT);
                 break :hit existing;
-            } else miss: {
-                const entry = try nat_table.insert(
-                    &port_allocator,
-                    key,
-                    lease.ip,
-                    NAT_TIMEOUT,
-                );
-                break :miss .{
-                    entry.outside.ip,
-                    entry.outside.port,
-                };
-            };
+            } else try nat_table.insert(
+                &port_allocator,
+                key,
+                lease.ip,
+                NAT_TIMEOUT,
+            );
 
-            ip_view.setUpdateChecksum(.src, src_ip, views);
-            view.setUpdateChecksum(.src_port, src_port, views);
-            ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
+            view.setUpdateChecksum(.src_port, mapping.outside.port, views);
 
-            ethernet_view.set(.src_mac, device.macAddress(.wan));
-            const gateway_mac = wan_arp_table.lookup(lease.router) orelse
-                return queueForArpResolution(
+            if (first_fragment) {
+                return forwardFirstFragment(
                     buffer,
                     device,
-                    .{ .iface = .wan, .ip = lease.router },
+                    .wan,
+                    lease.router,
+                    views,
+                    key,
+                    mapping.generation,
+                    mapping.outside.ip,
                 );
-            ethernet_view.set(.dst_mac, gateway_mac);
+            }
 
-            device.transmit(buffer);
+            ip_view.setUpdateChecksum(.src, mapping.outside.ip, views);
+            return forward(buffer, device, .wan, lease.router, views);
         },
         .wan => {
             if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
@@ -150,29 +141,34 @@ pub fn handle(
                 return;
             }
 
-            const dst_ip, const dst_port = nat_table.inboundLookup(.{
+            const key: NatTable.Key = .{
+                .protocol = .tcp,
                 .ip = ip_view.get(.dst),
                 .port = view.get(.dst_port),
-                .protocol = .tcp,
-            }) orelse {
+            };
+
+            const inside, const mapping = nat_table.inboundEntry(key) orelse {
                 device.release(buffer);
                 return;
             };
 
-            ip_view.setUpdateChecksum(.dst, dst_ip, views);
-            view.setUpdateChecksum(.dst_port, dst_port, views);
-            ip_view.setUpdateChecksum(.ttl, ttl - 1, views);
+            view.setUpdateChecksum(.dst_port, inside.port, views);
 
-            ethernet_view.set(.src_mac, device.macAddress(.lan));
-            const dst_mac = lan_arp_table.lookup(dst_ip) orelse
-                return queueForArpResolution(
+            if (first_fragment) {
+                return forwardFirstFragment(
                     buffer,
                     device,
-                    .{ .iface = .lan, .ip = dst_ip },
+                    .lan,
+                    inside.ip,
+                    views,
+                    key,
+                    mapping.generation,
+                    inside.ip,
                 );
-            ethernet_view.set(.dst_mac, dst_mac);
+            }
 
-            device.transmit(buffer);
+            ip_view.setUpdateChecksum(.dst, inside.ip, views);
+            return forward(buffer, device, .lan, inside.ip, views);
         },
     }
 }

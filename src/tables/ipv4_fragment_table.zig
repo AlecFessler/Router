@@ -20,6 +20,7 @@ pub const IPv4FragmentTable = struct {
         nat_key: NatTable.Key,
         nat_generation: u64,
         identification: u16,
+        first_payload_len: usize,
     };
 
     pub const Batch = struct {
@@ -47,6 +48,8 @@ pub const IPv4FragmentTable = struct {
     io: std.Io,
     capacity: u32,
     timeout: std.Io.Duration,
+    next_identification: u16 = 0,
+    id_reuse_after: std.Io.Timestamp = .zero,
     table: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
 
     pub fn init(
@@ -114,6 +117,29 @@ pub const IPv4FragmentTable = struct {
         return batch;
     }
 
+    pub fn get(self: *const IPv4FragmentTable, key: Key) ?Translation {
+        const entry = self.table.getPtr(key) orelse return null;
+        const now = std.Io.Timestamp.now(self.io, .boot);
+        if (entry.deadline.durationTo(now).toNanoseconds() >= 0) return null;
+
+        return switch (entry.state) {
+            .waiting => null,
+            .resolved => |translation| translation,
+        };
+    }
+
+    pub fn allocateIdentification(self: *IPv4FragmentTable) !u16 {
+        const now = std.Io.Timestamp.now(self.io, .boot);
+        const identification = self.next_identification;
+        if (identification == 0 and self.id_reuse_after.durationTo(now).toNanoseconds() < 0) {
+            return error.FragmentIdentificationExhausted;
+        }
+
+        self.next_identification +%= 1;
+        if (self.next_identification == 0) self.id_reuse_after = now.addDuration(self.timeout);
+        return identification;
+    }
+
     fn getOrCreate(self: *IPv4FragmentTable, key: Key, device: NicApi) !*Entry {
         const now = std.Io.Timestamp.now(self.io, .boot);
         var entries = self.table.iterator();
@@ -175,6 +201,7 @@ test "fragment table drains queued buffers and reclaims expired entries" {
         .nat_key = .{ .ip = key.src, .protocol = .tcp, .port = 50000 },
         .nat_generation = 1,
         .identification = 42,
+        .first_payload_len = 24,
     };
 
     var first: [1]u8 = undefined;

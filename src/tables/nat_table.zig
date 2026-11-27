@@ -58,12 +58,14 @@ pub const NatTable = struct {
 
     pub const Entry = struct {
         outside: Key,
+        generation: u64,
         deadline: std.Io.Timestamp,
         port_allocator: *PortAllocator,
     };
 
     io: std.Io,
     capacity: usize,
+    next_generation: u64 = 0,
     inside: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
     outside: std.AutoHashMapUnmanaged(Key, Key) = .empty,
 
@@ -94,6 +96,11 @@ pub const NatTable = struct {
         self: *NatTable,
         key: Key,
     ) ?IpPort {
+        const inside_key, _ = self.inboundEntry(key) orelse return null;
+        return .{ inside_key.ip, inside_key.port };
+    }
+
+    pub fn inboundEntry(self: *NatTable, key: Key) ?struct { Key, Entry } {
         const inside_key = self.outside.get(key) orelse return null;
         const entry = self.inside.get(inside_key) orelse unreachable;
         const now = std.Io.Timestamp.now(self.io, .boot);
@@ -101,7 +108,7 @@ pub const NatTable = struct {
             self.remove(inside_key);
             return null;
         }
-        return .{ inside_key.ip, inside_key.port };
+        return .{ inside_key, entry };
     }
 
     pub fn outboundLookup(
@@ -109,13 +116,18 @@ pub const NatTable = struct {
         key: Key,
         outside_ip: IPv4,
     ) ?IpPort {
+        const entry = self.outboundEntry(key, outside_ip) orelse return null;
+        return .{ entry.outside.ip, entry.outside.port };
+    }
+
+    pub fn outboundEntry(self: *NatTable, key: Key, outside_ip: IPv4) ?Entry {
         const entry = self.inside.get(key) orelse return null;
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (!std.mem.eql(u8, &entry.outside.ip, &outside_ip) or isExpired(entry.deadline, now)) {
             self.remove(key);
             return null;
         }
-        return .{ entry.outside.ip, entry.outside.port };
+        return entry;
     }
 
     pub fn insert(
@@ -152,12 +164,14 @@ pub const NatTable = struct {
         };
         const entry: Entry = .{
             .outside = .{ .protocol = key.protocol, .ip = outside_ip, .port = outside_port },
+            .generation = self.next_generation,
             .deadline = now.addDuration(duration),
             .port_allocator = port_allocator,
         };
         std.debug.assert(!self.outside.contains(entry.outside));
         self.inside.putAssumeCapacityNoClobber(key, entry);
         self.outside.putAssumeCapacityNoClobber(entry.outside, key);
+        self.next_generation +%= 1;
         return entry;
     }
 

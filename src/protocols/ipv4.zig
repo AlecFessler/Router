@@ -8,6 +8,8 @@ const Format = Router.Meta.Format;
 const ICMPv4 = Router.Protocols.ICMPv4;
 const IFace = Router.Nic.Api.IFace;
 const IPv4Fixtures = Router.TestFixtures.IPv4;
+const IPv4FragmentTable = Router.Tables.IPv4FragmentTable.IPv4FragmentTable;
+const NatTable = Router.Tables.NatTable.NatTable;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const Tcp = Router.Protocols.Tcp;
@@ -15,8 +17,15 @@ const Udp = Router.Protocols.Udp;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
+const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
+
+const lan_arp_table = &Router.State.lan_arp_table;
+const lan_fragment_table = &Router.State.lan_fragment_table;
 const lan_ip = &Router.State.lan_ip;
 const lan_subnet_mask = &Router.State.lan_subnet_mask;
+const nat_table = &Router.State.nat_table;
+const wan_arp_table = &Router.State.wan_arp_table;
+const wan_fragment_table = &Router.State.wan_fragment_table;
 const wan_lease = &Router.State.wan_lease;
 
 pub const IPv4 = [4]u8;
@@ -63,7 +72,12 @@ pub fn validate(view: IPv4PacketView) !void {
     try view.validate(.total_length, .{ .gte = @intCast(ihl * 4) });
 
     const more_fragments = view.get(.more_fragments);
+    const offset = @as(usize, view.get(.fragment_offset)) * 8;
     const payload_bytes = view.get(.total_length) - (ihl * 4);
+    if (more_fragments or offset != 0) {
+        if (view.get(.dont_fragment) or payload_bytes == 0) return error.InvalidField;
+        if (offset + payload_bytes > std.math.maxInt(u16) - 20) return error.InvalidField;
+    }
     if (more_fragments and payload_bytes % 8 != 0) return error.InvalidField;
 
     var checksum = view.checksum();
@@ -101,7 +115,52 @@ pub fn handle(
     var view = try parse(packet);
     Cli.enter(.ipv4, view);
     views.setView(.ipv4, &view);
+
+    if (view.get(.ttl) <= 1) {
+        device.release(buffer);
+        return;
+    }
+
     const protocol = view.get(.protocol);
+    const offset = view.get(.fragment_offset);
+
+    if (offset != 0) {
+        const lease = wan_lease.* orelse {
+            device.release(buffer);
+            return;
+        };
+        const should_forward = switch (iface) {
+            .lan => classifyDestination(view.get(.dst)) == .wan,
+            .wan => view.fieldCmp(.dst, .{ .eq = lease.ip }),
+        };
+        if (!should_forward) {
+            device.release(buffer);
+            return;
+        }
+
+        const table = switch (iface) {
+            .lan => lan_fragment_table,
+            .wan => wan_fragment_table,
+        };
+        const key: IPv4FragmentTable.Key = .{
+            .src = view.get(.src),
+            .dst = view.get(.dst),
+            .identification = view.get(.identification),
+            .protocol = protocol,
+        };
+
+        switch (try table.append(key, buffer, device)) {
+            .queued => return,
+            .resolved => |translation| return forwardFragment(
+                buffer,
+                device,
+                iface,
+                views,
+                translation,
+            ),
+        }
+    }
+
     switch (protocol) {
         .icmp => try ICMPv4.handle(buffer, device, iface, views),
         .tcp => try Tcp.handle(buffer, device, iface, views),
@@ -114,6 +173,164 @@ pub fn handle(
             device.release(buffer);
         },
     }
+}
+
+pub fn forwardFirstFragment(
+    buffer: []u8,
+    device: NicApi,
+    egress: IFace,
+    next_hop: IPv4,
+    views: *ViewStack,
+    nat_key: NatTable.Key,
+    generation: u64,
+    translated_ip: IPv4,
+) !void {
+    const ip_view = views.getView(.ipv4);
+    const ingress: IFace = if (egress == .wan) .lan else .wan;
+    const table = switch (ingress) {
+        .lan => lan_fragment_table,
+        .wan => wan_fragment_table,
+    };
+    const key: IPv4FragmentTable.Key = .{
+        .src = ip_view.get(.src),
+        .dst = ip_view.get(.dst),
+        .identification = ip_view.get(.identification),
+        .protocol = ip_view.get(.protocol),
+    };
+
+    const payload_len = ip_view.get(.payload).len;
+    const translation = if (table.get(key)) |existing| blk: {
+        if (existing.nat_generation != generation or existing.first_payload_len != payload_len) {
+            device.release(buffer);
+            return;
+        }
+
+        break :blk existing;
+    } else IPv4FragmentTable.Translation{
+        .nat_key = nat_key,
+        .nat_generation = generation,
+        .identification = try table.allocateIdentification(),
+        .first_payload_len = payload_len,
+    };
+
+    const batch = try table.resolve(key, translation, device);
+    errdefer for (batch.buffers[0..batch.len]) |queued_buffer| device.release(queued_buffer);
+
+    ip_view.setUpdateChecksum(.identification, translation.identification, views);
+    switch (egress) {
+        .wan => ip_view.setUpdateChecksum(.src, translated_ip, views),
+        .lan => ip_view.setUpdateChecksum(.dst, translated_ip, views),
+    }
+    try forward(buffer, device, egress, next_hop, views);
+
+    for (batch.buffers[0..batch.len]) |queued_buffer| {
+        var ethernet_view = Ethernet.parse(queued_buffer) catch {
+            device.release(queued_buffer);
+            continue;
+        };
+        var queued_ip = parse(ethernet_view.get(.payload)) catch {
+            device.release(queued_buffer);
+            continue;
+        };
+
+        var queued_views: ViewStack = .{};
+        queued_views.setView(.ethernet, &ethernet_view);
+        queued_views.setView(.ipv4, &queued_ip);
+
+        forwardFragment(queued_buffer, device, ingress, &queued_views, translation) catch {
+            device.release(queued_buffer);
+        };
+    }
+}
+
+pub fn forwardFragment(
+    buffer: []u8,
+    device: NicApi,
+    iface: IFace,
+    views: *ViewStack,
+    translation: IPv4FragmentTable.Translation,
+) !void {
+    const ip_view = views.getView(.ipv4);
+    const offset = @as(usize, ip_view.get(.fragment_offset)) * 8;
+
+    if (offset < translation.first_payload_len) {
+        device.release(buffer);
+        return;
+    }
+
+    const lease = wan_lease.* orelse {
+        device.release(buffer);
+        return;
+    };
+
+    const ip, const generation = switch (iface) {
+        .lan => blk: {
+            const entry = nat_table.outboundEntry(translation.nat_key, lease.ip) orelse {
+                device.release(buffer);
+                return;
+            };
+
+            break :blk .{ entry.outside.ip, entry.generation };
+        },
+        .wan => blk: {
+            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
+                device.release(buffer);
+                return;
+            }
+
+            const inside, const entry = nat_table.inboundEntry(translation.nat_key) orelse {
+                device.release(buffer);
+                return;
+            };
+
+            break :blk .{ inside.ip, entry.generation };
+        },
+    };
+
+    if (generation != translation.nat_generation) {
+        device.release(buffer);
+        return;
+    }
+
+    ip_view.setUpdateChecksum(.identification, translation.identification, views);
+    switch (iface) {
+        .lan => {
+            ip_view.setUpdateChecksum(.src, ip, views);
+            return forward(buffer, device, .wan, lease.router, views);
+        },
+        .wan => {
+            ip_view.setUpdateChecksum(.dst, ip, views);
+            return forward(buffer, device, .lan, ip, views);
+        },
+    }
+}
+
+pub fn forward(
+    buffer: []u8,
+    device: NicApi,
+    egress: IFace,
+    next_hop: IPv4,
+    views: *ViewStack,
+) !void {
+    const ip_view = views.getView(.ipv4);
+    ip_view.setUpdateChecksum(.ttl, ip_view.get(.ttl) - 1, views);
+
+    const arp_table = switch (egress) {
+        .lan => lan_arp_table,
+        .wan => wan_arp_table,
+    };
+    const ethernet_view = views.getView(.ethernet);
+    ethernet_view.set(.src_mac, device.macAddress(egress));
+
+    const mac = arp_table.lookup(next_hop) orelse
+        return queueForArpResolution(
+            buffer,
+            device,
+            .{ .iface = egress, .ip = next_hop },
+        );
+
+    ethernet_view.set(.dst_mac, mac);
+    device.transmit(buffer);
 }
 
 pub const DstClass = enum {
@@ -256,7 +473,8 @@ test "parse() rejects invalid metadata fields" {
         .{ .offset = 0, .value = 0x44 }, // IHL below five words
         .{ .offset = 6, .value = 0xc0 }, // reserved flag set
         .{ .offset = 3, .value = 0x13 }, // total length below header length
-        .{ .offset = 6, .value = 0x60 }, // more fragments with a four-byte payload
+        .{ .offset = 6, .value = 0x20 }, // more fragments with a four-byte payload
+        .{ .offset = 7, .value = 0x01 },
     };
 
     for (invalid_fields) |invalid| {
