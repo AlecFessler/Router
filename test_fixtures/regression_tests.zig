@@ -296,6 +296,7 @@ pub const Harness = struct {
         State.lan_subnet_mask = options.lan_subnet_mask;
         State.wan_lease = options.wan_lease;
         State.nat_filtering_mode = options.nat_filtering_mode;
+        State.wan_transaction = null;
 
         State.lan_arp_table = try ArpTable.init(alloc, io, options.arp_capacity, options.arp_ttl);
         self.ready.lan_arp = true;
@@ -377,6 +378,7 @@ pub const Harness = struct {
         }
         State.wan_lease = null;
         State.nat_filtering_mode = .address_restricted;
+        State.wan_transaction = null;
         self.nic.deinit();
     }
 
@@ -3208,4 +3210,37 @@ test "an ARP request must not overwrite an existing neighbour mapping" {
     }
     try std.testing.expectEqual(@as(usize, 1), h.txCount());
     try std.testing.expectEqual(lan_victim_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
+}
+
+test "DHCP client must reject an ACK whose router option is an unusable next-hop" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{});
+    defer h.deinit();
+
+    const server_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const mask: IPv4 = .{ 255, 255, 255, 0 };
+    const offered_ip: IPv4 = .{ 203, 0, 113, 50 };
+
+    // Positive control: a normal gateway is installed.
+    try runWanDhcpHandshake(&h, alloc, offered_ip, server_ip, mask, server_ip, 3_600);
+    try std.testing.expectEqual(
+        @as(?IPv4, server_ip),
+        if (State.wan_lease) |lease| lease.router else null,
+    );
+
+    // A DHCP server must not be able to install 0.0.0.0 (or another
+    // non-unicast/loopback address) as the default next-hop. The client
+    // currently accepts it and every subsequent WAN forward uses it as the
+    // ARP next hop, blackholing (or redirecting) all WAN traffic.
+    h.setWanLease(null);
+    h.nic.resetLogs();
+    try runWanDhcpHandshake(&h, alloc, offered_ip, server_ip, mask, .{ 0, 0, 0, 0 }, 3_600);
+    const zero_ip: IPv4 = .{ 0, 0, 0, 0 };
+    try std.testing.expectEqual(
+        @as(?IPv4, null),
+        if (State.wan_lease) |lease|
+            (if (std.meta.eql(lease.router, zero_ip)) lease.router else null)
+        else
+            null,
+    );
 }

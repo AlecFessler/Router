@@ -26,6 +26,7 @@ const expectHexBytes = FixtureUtils.expectHexBytes;
 const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
 
 const dhcp_table = &Router.State.dhcp_table;
+const wan_transaction = &Router.State.wan_transaction;
 const lan_arp_table = &Router.State.lan_arp_table;
 const lan_ip = &Router.State.lan_ip;
 const nat_table = &Router.State.nat_table;
@@ -55,7 +56,7 @@ const WAN_PARAMETER_REQUEST_LIST = [_]OptionType{
     .rebinding_time,
 };
 
-const WanTransaction = struct {
+pub const WanTransaction = struct {
     xid: u32,
     started_at: std.Io.Timestamp,
     discover_secs: u16 = 0,
@@ -96,8 +97,6 @@ const Tx = struct {
     broadcast: bool,
     vlan_tags: []u8 = &.{},
 };
-
-var wan_transaction: ?WanTransaction = null;
 
 pub const DHCPv4Lease = struct {
     ip: IPv4,
@@ -335,6 +334,14 @@ fn isUsableWanAddress(ip: IPv4) bool {
     return true;
 }
 
+fn isUsableNextHop(gateway: IPv4, offered: IPv4, mask: IPv4) bool {
+    if (!isUsableWanAddress(gateway)) return false;
+    const gateway_bits: u32 = @bitCast(gateway);
+    const offered_bits: u32 = @bitCast(offered);
+    const mask_bits: u32 = @bitCast(mask);
+    return (gateway_bits & mask_bits) == (offered_bits & mask_bits);
+}
+
 pub fn handle(
     buffer: []u8,
     device: NicApi,
@@ -458,7 +465,7 @@ pub fn handle(
             });
         },
         .wan => {
-            const transaction = if (wan_transaction) |*pending| pending else return device.release(buffer);
+            const transaction = if (wan_transaction.*) |*pending| pending else return device.release(buffer);
             if (!view.fieldCmp(.op, .{ .eq = .BOOTREPLY }) or xid != transaction.xid or
                 !std.meta.eql(mac, device.macAddress(.wan)))
                 return device.release(buffer);
@@ -481,6 +488,8 @@ pub fn handle(
 
                     const mask = options.subnet_mask orelse return device.release(buffer);
                     const gateway = options.router orelse return device.release(buffer);
+                    if (!isUsableNextHop(gateway, offered_ip, mask))
+                        return device.release(buffer);
                     const lifetime = options.lease_time orelse return device.release(buffer);
                     const lease_ns = lifetime.toNanoseconds();
                     const t1: std.Io.Duration = options.renewal_time orelse .fromNanoseconds(@divTrunc(lease_ns, 2));
@@ -498,12 +507,12 @@ pub fn handle(
                         .rebinding_deadline = sent_at.addDuration(t2),
                         .expiration_deadline = sent_at.addDuration(lifetime),
                     };
-                    wan_transaction = null;
+                    wan_transaction.* = null;
                 },
                 .nak => {
                     if (request_sent_at == null) return device.release(buffer);
                     wan_lease.* = null;
-                    wan_transaction = null;
+                    wan_transaction.* = null;
                 },
                 .offer => {
                     if (wan_lease.* != null or transaction.requested_ip != null or
@@ -532,27 +541,27 @@ pub fn tickWan(io: std.Io, device: NicApi) !void {
     if (wan_lease.*) |lease| {
         if (now_ns >= lease.expiration_deadline.toNanoseconds()) {
             wan_lease.* = null;
-            wan_transaction = null;
+            wan_transaction.* = null;
         } else if (now_ns < lease.renewal_deadline.toNanoseconds()) {
             return;
         }
     }
 
     const lease = wan_lease.*;
-    if (wan_transaction) |transaction| {
+    if (wan_transaction.*) |transaction| {
         if (now_ns < transaction.next_send.toNanoseconds()) return;
 
         const offer_timed_out = lease == null and transaction.requested_ip != null and
             transaction.retry_seconds == MAX_RETRY_SECONDS;
-        if (offer_timed_out) wan_transaction = null;
+        if (offer_timed_out) wan_transaction.* = null;
     }
 
-    if (wan_transaction == null) {
+    if (wan_transaction.* == null) {
         var xid: u32 = undefined;
         io.random(std.mem.asBytes(&xid));
-        wan_transaction = .{ .xid = xid, .started_at = now };
+        wan_transaction.* = .{ .xid = xid, .started_at = now };
     }
-    const transaction = &wan_transaction.?;
+    const transaction = &wan_transaction.*.?;
 
     var tx: Tx = .{
         .kind = .request,
