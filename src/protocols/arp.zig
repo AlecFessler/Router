@@ -94,11 +94,7 @@ pub fn handle(
     const my_mac = device.macAddress(iface);
 
     if (my_ip == null) return device.release(buffer);
-
-    // IEEE 802.3 requires a unicast source address. A group sender MAC is
-    // never a valid neighbour: do not answer it and never cache it.
     if (view.get(.sender_mac)[0] & 1 != 0) return device.release(buffer);
-
     if (view.fieldCmp(.sender_mac, .{ .eq = my_mac })) return device.release(buffer);
 
     if (view.fieldCmp(.sender_ip, .{ .eq = my_ip.? })) {
@@ -141,15 +137,20 @@ pub fn handle(
             if (!view.fieldCmp(.target_mac, .{ .eq = my_mac })) return;
             if (view.fieldCmp(.sender_ip, .{ .eq = IPv4{ 0, 0, 0, 0 } })) return;
             if (view.fieldCmp(.target_ip, .{ .eq = my_ip.? })) {
+                const sender_ip = view.get(.sender_ip);
                 const mac = view.get(.sender_mac);
-                table.cache(view.get(.sender_ip), mac);
-
                 const pending = arp_waiters_table.get(
-                    .{ .iface = iface, .ip = view.get(.sender_ip) },
+                    .{ .iface = iface, .ip = sender_ip },
                     device,
-                ) orelse return;
+                );
 
-                for (pending.buffers[0..pending.len]) |queued_buffer| {
+                if (table.lookup(sender_ip)) |existing| {
+                    if (!std.meta.eql(existing, mac) and pending == null) return;
+                }
+
+                table.cache(sender_ip, mac);
+                const batch = pending orelse return;
+                for (batch.buffers[0..batch.len]) |queued_buffer| {
                     queued_buffer[0..mac.len].* = mac;
                     device.transmit(queued_buffer);
                 }

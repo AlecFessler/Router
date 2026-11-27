@@ -2000,3 +2000,76 @@ test "ARP must not learn a group sender MAC as a neighbour" {
     const tx_eth = try Ethernet.parse(tx.bytes);
     try std.testing.expectEqual(group_gateway_mac, tx_eth.get(.dst_mac));
 }
+
+test "an unsolicited ARP reply must not overwrite the cached gateway mapping" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .wan_lease = testWanLease(std.testing.io),
+    });
+    defer h.deinit();
+
+    const lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const remote_ip: IPv4 = .{ 8, 8, 8, 8 };
+    const attacker_mac: Mac = .{ 0x02, 0x66, 0x66, 0x66, 0x66, 0x66 };
+
+    // The router has learned the real gateway MAC (e.g. from a solicited reply).
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+
+    const udp_bytes = try Packets.udp(alloc, client_ip, remote_ip, .{
+        .src_port = 40_000,
+        .dst_port = 53,
+        .payload = "one",
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = client_ip,
+        .dst = remote_ip,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = udp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    const frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = client_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+    defer alloc.free(frame);
+
+    try h.inject(.lan, frame);
+    _ = h.runAll(.lan);
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(0).bytes)).get(.dst_mac));
+
+    // An off-path WAN host sends an unsolicited ARP reply binding the gateway's
+    // IP to its own MAC. The router never asked for this mapping.
+    const spoofed_arp = try Packets.arp(alloc, .{
+        .opcode = 2, // reply
+        .sender_mac = attacker_mac,
+        .sender_ip = gateway_ip,
+        .target_mac = RecordingNic.wan_mac,
+        .target_ip = lease_ip,
+    });
+    defer alloc.free(spoofed_arp);
+    const spoofed_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.wan_mac,
+        .src = attacker_mac,
+        .ethertype = 0x0806,
+        .payload = spoofed_arp,
+    });
+    defer alloc.free(spoofed_frame);
+
+    try h.inject(.wan, spoofed_frame);
+    _ = h.runAll(.wan);
+
+    // The legitimate gateway mapping must be retained...
+    try std.testing.expectEqual(gateway_mac, State.wan_arp_table.lookup(gateway_ip).?);
+
+    // ...so subsequent WAN traffic still goes to the real gateway, not the attacker.
+    try h.inject(.lan, frame);
+    _ = h.runAll(.lan);
+    try std.testing.expectEqual(@as(usize, 2), h.txCount());
+    try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(1).bytes)).get(.dst_mac));
+}
