@@ -12,6 +12,7 @@ const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
+const NatTable = Router.Tables.NatTable.NatTable;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const TimeExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded;
@@ -138,20 +139,30 @@ pub fn forwardQuotedError(
                 !quote.fieldCmp(.src, .{ .eq = lease.ip }))
                 return device.release(buffer);
 
-            const client_ip, const client_port = nat_table.inboundLookup(.{
+            const inside, const mapping = nat_table.inboundEntry(.{
                 .protocol = protocol,
                 .ip = quote.get(.src),
                 .port = transport.get(.src_port),
             }) orelse return device.release(buffer);
 
-            rewriteQuotedEndpoint(&quote, &transport, .src, client_ip, client_port);
-            outer.setUpdateChecksum(.dst, client_ip, views);
-            break :wan .{ IFace.lan, client_ip };
+            const quoted_peer: NatTable.Peer = .{
+                .ip = quote.get(.dst),
+                .port = transport.get(.dst_port),
+            };
+            if (!mapping.acceptsPeer(quoted_peer))
+                return device.release(buffer);
+
+            rewriteQuotedEndpoint(&quote, &transport, .src, inside.ip, inside.port);
+            outer.setUpdateChecksum(.dst, inside.ip, views);
+            break :wan .{ IFace.lan, inside.ip };
         },
         .lan => lan: {
             const remote_ip = outer.get(.dst);
             if (classifyDestination(remote_ip) != .wan or
                 !quote.fieldCmp(.src, .{ .eq = remote_ip }))
+                return device.release(buffer);
+
+            if (!quote.fieldCmp(.dst, .{ .eq = outer.get(.src) }))
                 return device.release(buffer);
 
             const public_ip, const public_port = nat_table.outboundLookup(.{

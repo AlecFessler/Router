@@ -1435,3 +1435,268 @@ test "a NAT mapping only accepts inbound packets from the peer the inside host s
     try std.testing.expectEqual(@as(usize, 0), h.txCount());
     try std.testing.expectEqual(@as(usize, 1), h.dropCount());
 }
+
+const conflict_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const conflict_gateway: IPv4 = .{ 203, 0, 113, 1 };
+const conflict_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const conflict_client_ip: IPv4 = .{ 192, 168, 86, 42 };
+const conflict_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+const conflict_other_client_ip: IPv4 = .{ 192, 168, 86, 43 };
+const conflict_other_client_mac: Mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x44 };
+const conflict_peer_ip: IPv4 = .{ 8, 8, 8, 8 };
+const conflict_other_ip: IPv4 = .{ 198, 51, 100, 99 };
+const conflict_client_port: u16 = 40_000;
+const conflict_other_client_port: u16 = 40_001;
+
+fn conflictQuotedUdp(
+    alloc: std.mem.Allocator,
+    src: IPv4,
+    dst: IPv4,
+    src_port: u16,
+    dst_port: u16,
+) ![]u8 {
+    var header: [8]u8 = .{0} ** 8;
+    std.mem.writeInt(u16, header[0..2], src_port, .big);
+    std.mem.writeInt(u16, header[2..4], dst_port, .big);
+    std.mem.writeInt(u16, header[4..6], 8, .big);
+    return Packets.ipv4(alloc, .{
+        .src = src,
+        .dst = dst,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = &header,
+    });
+}
+
+fn conflictIcmpErrorFrame(
+    alloc: std.mem.Allocator,
+    iface: IFace,
+    eth_src: Mac,
+    outer_src: IPv4,
+    outer_dst: IPv4,
+    icmp_type: u8,
+    icmp_code: u8,
+    mtu: u16,
+    quoted: []const u8,
+) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, &.{ 0, 0, @intCast(mtu >> 8), @intCast(mtu & 0xff) });
+    try body.appendSlice(alloc, quoted);
+    const icmp_bytes = try Packets.icmp(alloc, .{
+        .message_type = icmp_type,
+        .code = icmp_code,
+        .body = body.items,
+    });
+    defer alloc.free(icmp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = outer_src,
+        .dst = outer_dst,
+        .protocol = 1,
+        .dont_fragment = true,
+        .payload = icmp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    return Packets.eth(alloc, .{
+        .dst = switch (iface) {
+            .lan => RecordingNic.lan_mac,
+            .wan => RecordingNic.wan_mac,
+        },
+        .src = eth_src,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+}
+
+fn conflictUdpFrame(
+    alloc: std.mem.Allocator,
+    src_ip: IPv4,
+    src_mac: Mac,
+    dst_ip: IPv4,
+    src_port: u16,
+    dst_port: u16,
+    payload: []const u8,
+) ![]u8 {
+    const udp_bytes = try Packets.udp(alloc, src_ip, dst_ip, .{
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .payload = payload,
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = src_ip,
+        .dst = dst_ip,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = udp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    return Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = src_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+}
+
+test "ICMP errors quoting a packet outside the sender's flow must not be forwarded" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+    h.cacheArp(.wan, conflict_gateway, conflict_gateway_mac);
+    h.cacheArp(.lan, conflict_client_ip, conflict_client_mac);
+    h.cacheArp(.lan, conflict_other_client_ip, conflict_other_client_mac);
+
+    // Two independent LAN clients each open one UDP flow:
+    //   192.168.86.42:40000 -> 8.8.8.8:53  (public 203.0.113.50:40000)
+    //   192.168.86.43:40001 -> 8.8.8.8:53  (public 203.0.113.50:40001)
+    {
+        const frame_a = try conflictUdpFrame(alloc, conflict_client_ip, conflict_client_mac, conflict_peer_ip, conflict_client_port, 53, "flow-a");
+        defer alloc.free(frame_a);
+        try h.inject(.lan, frame_a);
+        _ = h.runAll(.lan);
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+
+        const frame_b = try conflictUdpFrame(alloc, conflict_other_client_ip, conflict_other_client_mac, conflict_peer_ip, conflict_other_client_port, 53, "flow-b");
+        defer alloc.free(frame_b);
+        try h.inject(.lan, frame_b);
+        _ = h.runAll(.lan);
+        try std.testing.expectEqual(@as(usize, 2), h.txCount());
+        h.nic.resetLogs();
+    }
+
+    // LAN-origin mirror: client .42 forges an ICMP fragmentation-needed that
+    // quotes client .43's flow. It is not .42's packet, so the router must not
+    // relay it to 8.8.8.8 on .42's behalf.
+    {
+        const quoted = try conflictQuotedUdp(alloc, conflict_peer_ip, conflict_other_client_ip, 53, conflict_other_client_port);
+        defer alloc.free(quoted);
+        const frame = try conflictIcmpErrorFrame(
+            alloc,
+            .lan,
+            conflict_client_mac,
+            conflict_client_ip,
+            conflict_peer_ip,
+            3,
+            4,
+            1200,
+            quoted,
+        );
+        defer alloc.free(frame);
+
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+
+        try std.testing.expectEqual(@as(usize, 0), h.txCount());
+        try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+        h.nic.resetLogs();
+    }
+
+    // WAN-origin: an ICMP error may quote only the datagram it reports on. This
+    // quote has the client's public source (so the (protocol, ip, port) NAT
+    // lookup succeeds) but a destination the client never sent anything to, so
+    // it cannot belong to any flow the client owns. The router must drop it
+    // (RFC 4787 REQ-10) instead of rewriting it and delivering it to the client.
+    {
+        const quoted = try conflictQuotedUdp(alloc, conflict_lease_ip, conflict_other_ip, conflict_client_port, 53);
+        defer alloc.free(quoted);
+        const frame = try conflictIcmpErrorFrame(
+            alloc,
+            .wan,
+            conflict_gateway_mac,
+            conflict_peer_ip,
+            conflict_lease_ip,
+            3,
+            3,
+            0,
+            quoted,
+        );
+        defer alloc.free(frame);
+
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+
+        try std.testing.expectEqual(@as(usize, 0), h.txCount());
+        try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+        h.nic.resetLogs();
+    }
+
+    // Positive control (LAN): the owner of the quoted flow may report an error
+    // about it; it is translated to the public identity and sent to the peer.
+    {
+        const quoted = try conflictQuotedUdp(alloc, conflict_peer_ip, conflict_other_client_ip, 53, conflict_other_client_port);
+        defer alloc.free(quoted);
+        const frame = try conflictIcmpErrorFrame(
+            alloc,
+            .lan,
+            conflict_other_client_mac,
+            conflict_other_client_ip,
+            conflict_peer_ip,
+            3,
+            4,
+            1200,
+            quoted,
+        );
+        defer alloc.free(frame);
+
+        try h.inject(.lan, frame);
+        _ = h.runAll(.lan);
+
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.wan, tx.iface);
+        const tx_eth = try Ethernet.parse(tx.bytes);
+        const tx_ip = try Router.Protocols.IPv4.parse(tx_eth.get(.payload));
+        try std.testing.expectEqual(conflict_lease_ip, tx_ip.get(.src));
+        const tx_icmp = try Router.Protocols.ICMPv4.parse(tx_ip.get(.payload));
+        const tx_msg = try Router.Protocols.ICMPv4Messages.DestinationUnreachable.parse(tx_icmp);
+        const quote = try Router.Protocols.IPv4.parseQuoted(tx_msg.get(.quoted_packet));
+        try std.testing.expectEqual(conflict_peer_ip, quote.get(.src));
+        try std.testing.expectEqual(conflict_lease_ip, quote.get(.dst));
+        try std.testing.expectEqual(
+            @as(u16, conflict_other_client_port),
+            std.mem.readInt(u16, quote.get(.payload)[2..4], .big),
+        );
+        h.nic.resetLogs();
+    }
+
+    // Positive control (WAN): an ICMP error that quotes the client's real flow
+    // (203.0.113.50:40000 -> 8.8.8.8:53) is still translated and delivered.
+    {
+        const quoted = try conflictQuotedUdp(alloc, conflict_lease_ip, conflict_peer_ip, conflict_client_port, 53);
+        defer alloc.free(quoted);
+        const frame = try conflictIcmpErrorFrame(
+            alloc,
+            .wan,
+            conflict_gateway_mac,
+            conflict_peer_ip,
+            conflict_lease_ip,
+            3,
+            3,
+            0,
+            quoted,
+        );
+        defer alloc.free(frame);
+
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.lan, tx.iface);
+        const tx_eth = try Ethernet.parse(tx.bytes);
+        const tx_ip = try Router.Protocols.IPv4.parse(tx_eth.get(.payload));
+        try std.testing.expectEqual(conflict_client_ip, tx_ip.get(.dst));
+        const tx_icmp = try Router.Protocols.ICMPv4.parse(tx_ip.get(.payload));
+        const tx_msg = try Router.Protocols.ICMPv4Messages.DestinationUnreachable.parse(tx_icmp);
+        const quote = try Router.Protocols.IPv4.parseQuoted(tx_msg.get(.quoted_packet));
+        try std.testing.expectEqual(conflict_client_ip, quote.get(.src));
+        try std.testing.expectEqual(conflict_peer_ip, quote.get(.dst));
+        try std.testing.expectEqual(
+            @as(u16, conflict_client_port),
+            std.mem.readInt(u16, quote.get(.payload)[0..2], .big),
+        );
+    }
+}
