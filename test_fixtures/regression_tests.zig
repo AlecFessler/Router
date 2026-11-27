@@ -1769,3 +1769,89 @@ test "one LAN host exhausting the NAT table must not deny NAT service to other h
     try std.testing.expectEqual(@as(usize, 0), h.errorCount());
     try std.testing.expectEqual(@as(usize, 0), h.dropCount());
 }
+
+const echo_lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+const echo_gateway_mac: Mac = .{ 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 };
+const echo_broadcast_mac: Mac = .{0xff} ** 6;
+
+fn echoEchoRequestFrame(
+    alloc: std.mem.Allocator,
+    src_mac: Mac,
+    src_ip: IPv4,
+    data: []const u8,
+) ![]u8 {
+    const icmp_bytes = try Packets.echo(alloc, .{
+        .message_type = 8,
+        .identifier = 0x5151,
+        .sequence_number = 1,
+        .data = data,
+    });
+    defer alloc.free(icmp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = src_ip,
+        .dst = echo_lease_ip,
+        .protocol = 1,
+        .dont_fragment = true,
+        .payload = icmp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    return Packets.eth(alloc, .{
+        .dst = RecordingNic.wan_mac,
+        .src = src_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+}
+
+test "ICMP echo requests from broadcast, multicast, or martian sources must not be answered" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var h = try Harness.init(alloc, io, .{ .wan_lease = testWanLease(io) });
+    defer h.deinit();
+
+    // A reply is an IP datagram back to the request's source address and the
+    // request's Ethernet source address. If either source is a group (or
+    // otherwise non-routable) address the reply itself is a broadcast/
+    // multicast transmission - a reflector an attacker can aim at an ISP
+    // segment - and an Ethernet source with the I/G bit set is invalid.
+    const forbidden = [_]struct { src_mac: Mac, src_ip: IPv4, label: []const u8 }{
+        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 255, 255, 255, 255 }, .label = "limited broadcast source IP" },
+        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 224, 0, 0, 1 }, .label = "multicast source IP" },
+        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 0, 0, 0, 0 }, .label = "this-network source IP" },
+        .{ .src_mac = echo_broadcast_mac, .src_ip = .{ 8, 8, 8, 8 }, .label = "broadcast source MAC" },
+    };
+
+    for (forbidden) |case| {
+        h.nic.resetLogs();
+        const frame = try echoEchoRequestFrame(alloc, case.src_mac, case.src_ip, "reflect-me");
+        defer alloc.free(frame);
+
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+
+        // No reply may be emitted for a non-unicast/invalid source.
+        try std.testing.expectEqual(@as(usize, 0), h.txCount());
+        try std.testing.expectEqual(@as(usize, 1), h.dropCount());
+    }
+
+    // Positive control: a normal unicast request to the router's WAN address
+    // must still be answered on the WAN interface.
+    {
+        h.nic.resetLogs();
+        const frame = try echoEchoRequestFrame(alloc, echo_gateway_mac, .{ 8, 8, 8, 8 }, "ping");
+        defer alloc.free(frame);
+        try h.inject(.wan, frame);
+        _ = h.runAll(.wan);
+
+        try std.testing.expectEqual(@as(usize, 1), h.txCount());
+        const tx = h.txAt(0);
+        try std.testing.expectEqual(IFace.wan, tx.iface);
+        const tx_eth = try Ethernet.parse(tx.bytes);
+        try std.testing.expectEqual(echo_gateway_mac, tx_eth.get(.dst_mac));
+        const tx_ip = try Router.Protocols.IPv4.parse(tx_eth.get(.payload));
+        try std.testing.expectEqual(IPv4{ 8, 8, 8, 8 }, tx_ip.get(.dst));
+        const tx_icmp = try Router.Protocols.ICMPv4.parse(tx_ip.get(.payload));
+        try std.testing.expectEqual(Router.Protocols.ICMPv4.MessageType.echo_reply, tx_icmp.get(.message_type));
+    }
+}

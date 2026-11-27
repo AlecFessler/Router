@@ -15,6 +15,7 @@ const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
+const classifyDestination = Router.Protocols.IPv4.classifyDestination;
 const forwardNat = Router.Protocols.IPv4.forwardNat;
 
 const lan_ip = &Router.State.lan_ip;
@@ -88,6 +89,13 @@ pub fn handle(
 
     const ethernet_view = views.getView(.ethernet);
     const sender_ip = ip_view.get(.src);
+    const sender_class = classifyDestination(sender_ip);
+    if (ethernet_view.get(.src_mac)[0] & 1 != 0 or
+        sender_class == .broadcast or
+        sender_class == .multicast or
+        sender_class == .drop)
+        return device.release(buffer);
+
     const frame_len = buffer.len - ethernet_view.get(.payload).len + ip_view.get(.total_length);
 
     ethernet_view.set(.dst_mac, ethernet_view.get(.src_mac));
