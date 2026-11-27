@@ -4,17 +4,25 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const CsvParser = ICMPv4Fixtures.TimeExceededCsvParser;
 const Ethernet = Router.Protocols.Ethernet;
+const EthernetFrameView = Router.Protocols.Ethernet.EthernetFrameView;
 const ICMPv4 = Router.Protocols.ICMPv4;
 const ICMPv4Fixtures = Router.TestFixtures.ICMPv4;
 const ICMPv4PacketView = Router.Protocols.ICMPv4.ICMPv4PacketView;
 const IFace = Router.Nic.Api.IFace;
+const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
+const classifyDestination = Router.Protocols.IPv4.classifyDestination;
 const forwardQuotedError = Router.Protocols.ICMPv4.forwardQuotedError;
+
+const lan_ip = &Router.State.lan_ip;
+const wan_lease = &Router.State.wan_lease;
+
+const MAX_QUOTE_LEN = 576 - 20 - 8;
 
 pub const Code = enum(u8) {
     ttl_exceeded = 0,
@@ -60,6 +68,93 @@ pub fn handle(
         views,
         view.get(.quoted_packet),
     );
+}
+
+pub fn sendTtlExceeded(
+    buffer: []u8,
+    device: NicApi,
+    iface: IFace,
+    views: *ViewStack,
+) !void {
+    const ethernet = views.getView(.ethernet);
+    const ip = views.getView(.ipv4);
+    const sender_mac = ethernet.get(.src_mac);
+    const sender_ip = ip.get(.src);
+
+    if (ethernet.get(.dst_mac)[0] & 1 != 0 or sender_mac[0] & 1 != 0 or
+        sender_ip[0] == 0 or sender_ip[0] == 127 or sender_ip[0] >= 224 or
+        classifyDestination(sender_ip) == .broadcast)
+        return device.release(buffer);
+
+    const reply_ip = switch (iface) {
+        .lan => lan_ip.*,
+        .wan => (wan_lease.* orelse return device.release(buffer)).ip,
+    };
+    const quote_len = @min(ip.get(.total_length), MAX_QUOTE_LEN);
+    const quote = ethernet.get(.payload)[0..quote_len];
+
+    const tx_buffer = device.nextTxBuffer(iface);
+    errdefer device.release(tx_buffer);
+
+    var writer: std.Io.Writer = .fixed(tx_buffer);
+    try EthernetFrameView.serialize(.{
+        .dst_mac = sender_mac,
+        .src_mac = device.macAddress(iface),
+        .vlan_tags = ethernet.get(.vlan_tags),
+        .ethertype = .ipv4,
+        .payload = &.{},
+    }, &writer);
+
+    const ip_start = writer.end;
+    try IPv4PacketView.serialize(.{
+        .version = 4,
+        .ihl = 5,
+        .dscp = 0,
+        .ecn = 0,
+        .total_length = 20 + 8 + quote_len,
+        .identification = 0,
+        .reserved = 0,
+        .dont_fragment = true,
+        .more_fragments = false,
+        .fragment_offset = 0,
+        .ttl = 64,
+        .protocol = .icmp,
+        .header_checksum = 0,
+        .src = reply_ip,
+        .dst = sender_ip,
+        .options = &.{},
+        .payload = &.{},
+    }, &writer);
+    try ICMPv4PacketView.serialize(.{
+        .message_type = .time_exceeded,
+        .code = @intFromEnum(Code.ttl_exceeded),
+        .checksum = 0,
+        .payload = &.{},
+    }, &writer);
+    try TimeExceededMsgView.serialize(.{
+        .reserved = 0,
+        .quoted_packet = quote,
+    }, &writer);
+
+    var reader: std.Io.Reader = .fixed(tx_buffer[ip_start..writer.end]);
+    var reply: IPv4PacketView = undefined;
+    try reply.takeFields(.version, .dst, &reader);
+    try reply.takeBytes(.options, 0, &reader);
+
+    var icmp: ICMPv4PacketView = undefined;
+    try icmp.takeFields(.message_type, .checksum, &reader);
+    try icmp.takeBytes(.payload, reader.bufferedLen(), &reader);
+
+    var ip_checksum = reply.checksum();
+    ip_checksum.addFields(.version, .options);
+    reply.set(.header_checksum, ip_checksum.finish());
+
+    var icmp_checksum = icmp.checksum();
+    icmp_checksum.addFields(.message_type, .payload);
+    icmp.set(.checksum, icmp_checksum.finish());
+
+    device.transmit(tx_buffer[0..writer.end]);
+    device.release(buffer);
 }
 
 test "parse() on synthetic captured frames matches Wireshark's fields" {

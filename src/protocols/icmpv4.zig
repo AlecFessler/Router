@@ -103,8 +103,10 @@ pub fn forwardQuotedError(
     views: *ViewStack,
     quoted_packet: []u8,
 ) !void {
-    const lease = wan_lease.* orelse return device.release(buffer);
     const outer = views.getView(.ipv4);
+    if (outer.get(.ttl) <= 1) return device.release(buffer);
+
+    const lease = wan_lease.* orelse return device.release(buffer);
     const icmp = views.getView(.icmpv4);
 
     var quote = try parseQuoted(quoted_packet);

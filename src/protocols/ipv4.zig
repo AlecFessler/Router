@@ -19,6 +19,7 @@ const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
 const queueForArpResolution = Router.Protocols.Arp.queueForArpResolution;
+const sendTtlExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded.sendTtlExceeded;
 
 const lan_arp_table = &Router.State.lan_arp_table;
 const lan_fragment_table = &Router.State.lan_fragment_table;
@@ -129,15 +130,12 @@ pub fn handle(
     Cli.enter(.ipv4, view);
     views.setView(.ipv4, &view);
 
-    if (view.get(.ttl) <= 1) {
-        device.release(buffer);
-        return;
-    }
-
     const protocol = view.get(.protocol);
     const offset = view.get(.fragment_offset);
 
     if (offset != 0) {
+        if (view.get(.ttl) <= 1) return device.release(buffer);
+
         const lease = wan_lease.* orelse {
             device.release(buffer);
             return;
@@ -216,6 +214,10 @@ pub fn forwardNat(
                 return;
             }
 
+            if (ip_view.get(.ttl) <= 1) {
+                return sendTtlExceeded(buffer, device, iface, views);
+            }
+
             const key: NatTable.Key = .{
                 .protocol = ip_view.get(.protocol),
                 .ip = ip_view.get(.src),
@@ -266,6 +268,10 @@ pub fn forwardNat(
                 device.release(buffer);
                 return;
             };
+
+            if (ip_view.get(.ttl) <= 1) {
+                return sendTtlExceeded(buffer, device, iface, views);
+            }
 
             transport_view.setUpdateChecksum(fields.wan, inside.port, views);
 
