@@ -41,10 +41,6 @@ pub const PortAllocator = struct {
         std.debug.assert(port >= first_port and self.used.isSet(port));
         self.used.unset(port);
     }
-
-    pub fn isAllocated(self: *const PortAllocator, port: u16) bool {
-        return self.used.isSet(port);
-    }
 };
 
 pub const NatTable = struct {
@@ -141,14 +137,6 @@ pub const NatTable = struct {
 
     fn isExpired(deadline: std.Io.Timestamp, now: std.Io.Timestamp) bool {
         return deadline.durationTo(now).toNanoseconds() >= 0;
-    }
-
-    pub fn inboundLookup(
-        self: *NatTable,
-        key: Key,
-    ) ?IpPort {
-        const inside_key, _ = self.inboundEntry(key) orelse return null;
-        return .{ inside_key.ip, inside_key.port };
     }
 
     pub fn inboundEntry(self: *NatTable, key: Key) ?struct { Key, Entry } {
@@ -301,21 +289,21 @@ test "NAT mappings resolve in both directions, refresh, and release their port" 
     const entry = try table.insert(&port_allocator, inside, outside_ip, .fromSeconds(60));
     try std.testing.expectEqualDeep(outside_ip, entry.outside.ip);
     try std.testing.expectEqual(inside.port, entry.outside.port);
-    try std.testing.expect(port_allocator.isAllocated(entry.outside.port));
+    try std.testing.expect(port_allocator.used.isSet(entry.outside.port));
     const outbound_ip, const outbound_port = table.outboundLookup(inside, outside_ip).?;
     try std.testing.expectEqualDeep(outside_ip, outbound_ip);
     try std.testing.expectEqual(entry.outside.port, outbound_port);
-    const inbound = table.inboundLookup(entry.outside).?;
-    try std.testing.expectEqualDeep(inside.ip, inbound[0]);
-    try std.testing.expectEqual(inside.port, inbound[1]);
+    const inbound, _ = table.inboundEntry(entry.outside).?;
+    try std.testing.expectEqualDeep(inside.ip, inbound.ip);
+    try std.testing.expectEqual(inside.port, inbound.port);
 
     try table.refresh(inside, .fromSeconds(120));
     try std.testing.expect(table.inside.get(inside).?.deadline.toNanoseconds() > entry.deadline.toNanoseconds());
 
     table.remove(inside);
-    try std.testing.expect(!port_allocator.isAllocated(entry.outside.port));
+    try std.testing.expect(!port_allocator.used.isSet(entry.outside.port));
     try std.testing.expect(table.outboundLookup(inside, outside_ip) == null);
-    try std.testing.expect(table.inboundLookup(entry.outside) == null);
+    try std.testing.expect(table.inboundEntry(entry.outside) == null);
     try std.testing.expectError(error.NotFound, table.refresh(inside, .fromSeconds(60)));
 }
 
@@ -329,8 +317,8 @@ test "NAT outbound lookup removes mappings for the old WAN IP" {
 
     const old = try table.insert(&port_allocator, inside, .{ 203, 0, 113, 5 }, .fromSeconds(60));
     try std.testing.expectEqual(null, table.outboundLookup(inside, current_ip));
-    try std.testing.expectEqual(null, table.inboundLookup(old.outside));
-    try std.testing.expect(!port_allocator.isAllocated(old.outside.port));
+    try std.testing.expectEqual(null, table.inboundEntry(old.outside));
+    try std.testing.expect(!port_allocator.used.isSet(old.outside.port));
 
     const replacement = try table.insert(&port_allocator, inside, current_ip, .fromSeconds(60));
     try std.testing.expectEqual(old.outside.port, replacement.outside.port);
@@ -350,9 +338,9 @@ test "NAT insert uses another occupied port and keeps protocol spaces separate" 
     try std.testing.expectError(error.InsideKeyInUse, table.insert(&tcp_port_allocator, inside_a, outside_ip, .fromSeconds(60)));
     const second = try table.insert(&tcp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
     try std.testing.expect(first.outside.port != second.outside.port);
-    const inbound_ip, const inbound_port = table.inboundLookup(second.outside).?;
-    try std.testing.expectEqualDeep(inside_b.ip, inbound_ip);
-    try std.testing.expectEqual(inside_b.port, inbound_port);
+    const inbound, _ = table.inboundEntry(second.outside).?;
+    try std.testing.expectEqualDeep(inside_b.ip, inbound.ip);
+    try std.testing.expectEqual(inside_b.port, inbound.port);
 
     const udp_inside: NatTable.Key = .{ .protocol = .udp, .ip = inside_a.ip, .port = inside_a.port };
     const udp_entry = try table.insert(&udp_port_allocator, udp_inside, outside_ip, .fromSeconds(60));
@@ -361,9 +349,9 @@ test "NAT insert uses another occupied port and keeps protocol spaces separate" 
     try std.testing.expectEqual(@as(usize, 3), table.outside.count());
 
     table.remove(inside_a);
-    try std.testing.expect(!tcp_port_allocator.isAllocated(first.outside.port));
-    try std.testing.expect(udp_port_allocator.isAllocated(udp_entry.outside.port));
-    try std.testing.expect(table.inboundLookup(udp_entry.outside) != null);
+    try std.testing.expect(!tcp_port_allocator.used.isSet(first.outside.port));
+    try std.testing.expect(udp_port_allocator.used.isSet(udp_entry.outside.port));
+    try std.testing.expect(table.inboundEntry(udp_entry.outside) != null);
 }
 
 test "NAT lookups release expired ports and insertion reclaims capacity" {
@@ -379,26 +367,26 @@ test "NAT lookups release expired ports and insertion reclaims capacity" {
     const tcp_inside: NatTable.Key = .{ .protocol = .tcp, .ip = .{ 192, 168, 1, 13 }, .port = 50003 };
 
     const expired = try table.insert(&udp_port_allocator, inside_a, outside_ip, .zero);
-    try std.testing.expect(table.inboundLookup(expired.outside) == null);
-    try std.testing.expect(!udp_port_allocator.isAllocated(expired.outside.port));
+    try std.testing.expect(table.inboundEntry(expired.outside) == null);
+    try std.testing.expect(!udp_port_allocator.used.isSet(expired.outside.port));
     try std.testing.expectEqual(@as(usize, 0), table.inside.count());
 
     const live = try table.insert(&udp_port_allocator, inside_b, outside_ip, .fromSeconds(60));
     const expired_tcp = try table.insert(&tcp_port_allocator, tcp_inside, outside_ip, .zero);
     const replacement = try table.insert(&udp_port_allocator, inside_c, outside_ip, .fromSeconds(60));
-    try std.testing.expect(!tcp_port_allocator.isAllocated(expired_tcp.outside.port));
-    try std.testing.expect(udp_port_allocator.isAllocated(live.outside.port));
-    try std.testing.expect(udp_port_allocator.isAllocated(replacement.outside.port));
+    try std.testing.expect(!tcp_port_allocator.used.isSet(expired_tcp.outside.port));
+    try std.testing.expect(udp_port_allocator.used.isSet(live.outside.port));
+    try std.testing.expect(udp_port_allocator.used.isSet(replacement.outside.port));
     try std.testing.expectEqual(@as(usize, 2), table.inside.count());
     try std.testing.expect(table.outboundLookup(tcp_inside, outside_ip) == null);
-    try std.testing.expect(table.inboundLookup(live.outside) != null);
-    try std.testing.expect(table.inboundLookup(replacement.outside) != null);
+    try std.testing.expect(table.inboundEntry(live.outside) != null);
+    try std.testing.expect(table.inboundEntry(replacement.outside) != null);
 
     _ = try table.insert(&tcp_port_allocator, tcp_inside, outside_ip, .fromSeconds(60));
     try std.testing.expect(table.outboundLookup(tcp_inside, outside_ip) != null);
     try std.testing.expectEqual(@as(usize, 2), table.outside.count());
-    try std.testing.expect(table.inboundLookup(live.outside) == null or
-        table.inboundLookup(replacement.outside) == null);
+    try std.testing.expect(table.inboundEntry(live.outside) == null or
+        table.inboundEntry(replacement.outside) == null);
 }
 
 test "NAT initialization fails without storage" {
@@ -414,9 +402,9 @@ test "NAT deinit releases ports held by live mappings" {
     var port_allocator: PortAllocator = .{};
     const inside: NatTable.Key = .{ .protocol = .icmp, .ip = .{ 192, 168, 1, 10 }, .port = 1234 };
     _ = try table.insert(&port_allocator, inside, .{ 203, 0, 113, 5 }, .fromSeconds(60));
-    try std.testing.expect(port_allocator.isAllocated(inside.port));
+    try std.testing.expect(port_allocator.used.isSet(inside.port));
     table.deinit(alloc);
-    try std.testing.expect(!port_allocator.isAllocated(inside.port));
+    try std.testing.expect(!port_allocator.used.isSet(inside.port));
 }
 
 test "NAT expired mapping gives its port to a new mapping at capacity" {
@@ -432,9 +420,9 @@ test "NAT expired mapping gives its port to a new mapping at capacity" {
     const new_entry = try table.insert(&port_allocator, new_key, outside_ip, .fromSeconds(60));
     try std.testing.expectEqual(old_entry.outside.port, new_entry.outside.port);
     try std.testing.expect(table.outboundLookup(old_key, outside_ip) == null);
-    const inbound_ip, const inbound_port = table.inboundLookup(new_entry.outside).?;
-    try std.testing.expectEqualDeep(new_key.ip, inbound_ip);
-    try std.testing.expectEqual(new_key.port, inbound_port);
+    const inbound, _ = table.inboundEntry(new_entry.outside).?;
+    try std.testing.expectEqualDeep(new_key.ip, inbound.ip);
+    try std.testing.expectEqual(new_key.port, inbound.port);
 }
 
 test "PortAllocator reuses a released preferred port" {
@@ -443,10 +431,10 @@ test "PortAllocator reuses a released preferred port" {
     try std.testing.expectEqual(preferred, try port_allocator.allocate(preferred));
     const alternate = try port_allocator.allocate(preferred);
     try std.testing.expect(alternate != preferred);
-    try std.testing.expect(port_allocator.isAllocated(alternate));
+    try std.testing.expect(port_allocator.used.isSet(alternate));
 
     port_allocator.release(preferred);
-    try std.testing.expect(!port_allocator.isAllocated(preferred));
+    try std.testing.expect(!port_allocator.used.isSet(preferred));
     try std.testing.expectEqual(preferred, try port_allocator.allocate(preferred));
 }
 
@@ -454,7 +442,7 @@ test "PortAllocator chooses a port in range for a low preference" {
     var port_allocator: PortAllocator = .{};
     const selected = try port_allocator.allocate(53);
     try std.testing.expect(selected >= PortAllocator.first_port);
-    try std.testing.expect(port_allocator.isAllocated(selected));
+    try std.testing.expect(port_allocator.used.isSet(selected));
 }
 
 test "NAT filtering modes accept only the configured peers" {

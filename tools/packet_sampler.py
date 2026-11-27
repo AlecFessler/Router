@@ -115,7 +115,6 @@ def read_exact(stream, length: int) -> bytes | None:
 class Collector:
     def __init__(self, args, global_header: bytes):
         self.args = args
-        self.global_header = global_header
         self.buckets: dict[str, Bucket] = {}
         self.total_seen = 0
         self.total_kept = 0
@@ -417,7 +416,7 @@ def main() -> int:
     if not sys.stderr.isatty():
         print(f"samples: {args.output}", file=sys.stderr)
 
-    def interrupt_once(signum, frame):
+    def interrupt_once(_signum, _frame):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         raise KeyboardInterrupt
 

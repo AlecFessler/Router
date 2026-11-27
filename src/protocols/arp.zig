@@ -19,7 +19,6 @@ const ArpWaitersTable = Router.Tables.ArpWaitersTable.ArpWaitersTable;
 const Cli = Router.Debug.Cli;
 const CsvParser = ArpFixtures.CsvParser;
 const Ethernet = Router.Protocols.Ethernet;
-const EthernetFrame = Router.Protocols.Ethernet.EthernetFrame;
 const EthernetFrameView = Router.Protocols.Ethernet.EthernetFrameView;
 const IFace = Router.Nic.Api.IFace;
 const IPv4 = Router.Protocols.IPv4.IPv4;
@@ -257,7 +256,7 @@ const invalid_fields = [_]struct { offset: usize, value: u8 }{
 test "parse() reads ARP fields from wire bytes" {
     const expected = ArpPacket{};
     const view = try parse(&test_packet);
-    try std.testing.expect(view.isEqual(&expected));
+    try Router.TestFixtures.Utils.expectHeaderFields(expected, view);
 }
 
 test "parse() rejects truncated packets and accepts trailing bytes" {
@@ -269,7 +268,7 @@ test "parse() rejects truncated packets and accepts trailing bytes" {
 
     const expected = ArpPacket{};
     const view = try parse(&buffer);
-    try std.testing.expect(view.isEqual(&expected));
+    try Router.TestFixtures.Utils.expectHeaderFields(expected, view);
 }
 
 test "parse() rejects invalid metadata fields" {
@@ -294,7 +293,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
         const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
         try std.testing.expectEqual(Ethernet.Ethertype.arp, frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
-        try std.testing.expect(view.isEqual(&ws_packet));
+        try Router.TestFixtures.Utils.expectHeaderFields(ws_packet, view);
     }
 }
 

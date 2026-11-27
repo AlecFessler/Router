@@ -277,7 +277,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
         const ip_view = try IPv4Protocol.parse(frame.get(.payload));
         try std.testing.expectEqual(IPv4Protocol.Protocol.icmp, ip_view.get(.protocol));
         const view = try parse(ip_view.get(.payload));
-        try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet));
+        try Router.TestFixtures.Utils.expectHeaderFields(ws_packet, view);
     }
 }
 

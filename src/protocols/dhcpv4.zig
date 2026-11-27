@@ -878,7 +878,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
         try std.testing.expectEqual(IPv4Protocol.Protocol.udp, ip_view.get(.protocol));
         const udp_view = try UdpProtocol.parse(ip_view.get(.payload), ip_view);
         const view = try parse(udp_view.get(.payload));
-        try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet.packet));
+        try Router.TestFixtures.Utils.expectHeaderFields(ws_packet.packet, view);
 
         var options_reader: std.Io.Reader = .fixed(view.get(.options));
         var types = std.mem.splitScalar(u8, ws_packet.option_types, ';');

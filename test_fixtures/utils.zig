@@ -1,5 +1,19 @@
 const std = @import("std");
 
+/// Wireshark CSV fixtures omit the variable-length fields of a packet.
+pub fn expectHeaderFields(expected: anytype, view: anytype) !void {
+    inline for (std.meta.fields(@TypeOf(expected))) |field| {
+        const T = switch (@typeInfo(field.type)) {
+            .optional => |optional| optional.child,
+            else => field.type,
+        };
+        if (@typeInfo(T) != .pointer) {
+            const actual = view.get(@field(@TypeOf(view).Field, field.name));
+            try std.testing.expectEqual(@field(expected, field.name), actual);
+        }
+    }
+}
+
 pub fn expectHexBytes(bytes: []const u8, hex: []const u8) !void {
     try std.testing.expectEqual(bytes.len * 2, hex.len);
     for (bytes, 0..) |byte, i| {

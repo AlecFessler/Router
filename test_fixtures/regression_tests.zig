@@ -17,12 +17,7 @@ const PcapParser = Router.TestFixtures.PcapParser;
 const State = Router.State;
 const ViewStack = Router.Protocols.ViewStack;
 
-const checksumContribution = Router.Meta.Checksum.checksumContribution;
-
-/// Recording test NIC.
-///
-/// RX and TX buffers are tracked by allocation so tests can detect leaked,
-/// double-released, or untracked buffers without tripping the testing allocator.
+/// Records transmitted frames and owns the backing buffers for test packets.
 pub const RecordingNic = struct {
     /// Large enough for any IPv4 frame the parser accepts (65535-byte payload).
     pub const TX_BUFFER_SIZE: usize = 65_550;
@@ -39,23 +34,13 @@ pub const RecordingNic = struct {
         bytes: []u8,
     };
 
-    pub const ErrorRecord = struct {
-        iface: IFace,
-        name: []const u8,
-    };
-
     alloc: std.mem.Allocator,
     outstanding: std.ArrayList(Outstanding) = .empty,
     rx_lan: std.ArrayList([]u8) = .empty,
     rx_wan: std.ArrayList([]u8) = .empty,
     tx_log: std.ArrayList(TxRecord) = .empty,
-    errors: std.ArrayList(ErrorRecord) = .empty,
-    rx_count: usize = 0,
-    tx_count: usize = 0,
+    error_count: usize = 0,
     drop_count: usize = 0,
-    unexpected_releases: usize = 0,
-    unexpected_transmits: usize = 0,
-    outstanding_at_deinit: usize = 0,
 
     pub const lan_mac: Mac = .{ 0x02, 0, 0, 0, 0, 0x01 };
     pub const wan_mac: Mac = .{ 0x02, 0, 0, 0, 0, 0x02 };
@@ -71,8 +56,6 @@ pub const RecordingNic = struct {
         self.rx_wan.deinit(self.alloc);
         for (self.tx_log.items) |record| self.alloc.free(record.bytes);
         self.tx_log.deinit(self.alloc);
-        self.errors.deinit(self.alloc);
-        self.outstanding_at_deinit = self.outstanding.items.len;
         for (self.outstanding.items) |entry| self.alloc.free(entry.allocation);
         self.outstanding.deinit(self.alloc);
     }
@@ -109,20 +92,11 @@ pub const RecordingNic = struct {
         return self.tx_log.items[self.tx_log.items.len - 1];
     }
 
-    pub fn lastError(self: *const RecordingNic) ?ErrorRecord {
-        if (self.errors.items.len == 0) return null;
-        return self.errors.items[self.errors.items.len - 1];
-    }
-
     pub fn resetLogs(self: *RecordingNic) void {
         for (self.tx_log.items) |record| self.alloc.free(record.bytes);
         self.tx_log.clearRetainingCapacity();
-        self.errors.clearRetainingCapacity();
-        self.rx_count = 0;
-        self.tx_count = 0;
+        self.error_count = 0;
         self.drop_count = 0;
-        self.unexpected_releases = 0;
-        self.unexpected_transmits = 0;
     }
 
     fn originFor(iface: IFace) Origin {
@@ -136,13 +110,6 @@ pub const RecordingNic = struct {
         return switch (iface) {
             .lan => .tx_lan,
             .wan => .tx_wan,
-        };
-    }
-
-    fn originIface(origin: Origin) IFace {
-        return switch (origin) {
-            .rx_lan, .tx_lan => .lan,
-            .rx_wan, .tx_wan => .wan,
         };
     }
 
@@ -175,7 +142,6 @@ pub const RecordingNic = struct {
         if (queue.items.len == 0) return null;
         const frame = queue.orderedRemove(0);
         self.track(frame, originFor(iface));
-        self.rx_count += 1;
         return frame;
     }
 
@@ -195,10 +161,7 @@ pub const RecordingNic = struct {
 
     fn release(ctx: *anyopaque, buffer: []u8) void {
         const self: *RecordingNic = @ptrCast(@alignCast(ctx));
-        const entry = self.take(buffer) orelse {
-            self.unexpected_releases += 1;
-            return;
-        };
+        const entry = self.take(buffer) orelse return;
         switch (entry.origin) {
             .rx_lan, .rx_wan => self.drop_count += 1,
             .tx_lan, .tx_wan => {},
@@ -208,10 +171,7 @@ pub const RecordingNic = struct {
 
     fn transmit(ctx: *anyopaque, buffer: []u8) void {
         const self: *RecordingNic = @ptrCast(@alignCast(ctx));
-        const entry = self.take(buffer) orelse {
-            self.unexpected_transmits += 1;
-            return;
-        };
+        const entry = self.take(buffer) orelse return;
         // A buffer received on one interface is forwarded out the other; a
         // freshly allocated TX buffer is sent on the interface it came from.
         const egress: IFace = switch (entry.origin) {
@@ -222,7 +182,6 @@ pub const RecordingNic = struct {
         };
         const copy = self.alloc.dupe(u8, buffer) catch unreachable;
         self.tx_log.append(self.alloc, .{ .iface = egress, .bytes = copy }) catch unreachable;
-        self.tx_count += 1;
         self.alloc.free(entry.allocation);
     }
 };
@@ -247,7 +206,6 @@ pub const Harness = struct {
     };
 
     alloc: std.mem.Allocator,
-    io: std.Io,
     nic: RecordingNic,
     ready: struct {
         lan_arp: bool = false,
@@ -262,7 +220,6 @@ pub const Harness = struct {
     pub fn init(alloc: std.mem.Allocator, io: std.Io, options: Options) !Harness {
         var self: Harness = .{
             .alloc = alloc,
-            .io = io,
             .nic = RecordingNic.init(alloc),
         };
         errdefer self.deinit();
@@ -374,14 +331,11 @@ pub const Harness = struct {
     pub fn runOne(self: *Harness, iface: IFace) bool {
         const packet = self.nic.api().receive(iface) orelse return false;
         var views: ViewStack = .{};
-        Ethernet.handle(packet, self.nic.api(), iface, &views) catch |err| {
+        Ethernet.handle(packet, self.nic.api(), iface, &views) catch {
             // Mirror the production loop: the caller owns the RX buffer when
             // the handler returns an error.
             self.nic.api().release(packet);
-            self.nic.errors.append(self.alloc, .{
-                .iface = iface,
-                .name = @errorName(err),
-            }) catch unreachable;
+            self.nic.error_count += 1;
         };
         return true;
     }
@@ -391,12 +345,6 @@ pub const Harness = struct {
         var count: usize = 0;
         while (self.runOne(iface)) count += 1;
         return count;
-    }
-
-    /// Drain LAN, then WAN.
-    pub fn run(self: *Harness) void {
-        _ = self.runAll(.lan);
-        _ = self.runAll(.wan);
     }
 
     pub fn txCount(self: *const Harness) usize {
@@ -416,11 +364,7 @@ pub const Harness = struct {
     }
 
     pub fn errorCount(self: *const Harness) usize {
-        return self.nic.errors.items.len;
-    }
-
-    pub fn lastError(self: *const Harness) ?RecordingNic.ErrorRecord {
-        return self.nic.lastError();
+        return self.nic.error_count;
     }
 
     pub fn cacheArp(self: *Harness, iface: IFace, ip: IPv4, mac: Mac) void {
@@ -898,13 +842,13 @@ test "harness smoke: LAN to WAN UDP is NATed, checksummed, and transmitted on WA
     try std.testing.expectEqual(@as(u16, 53), tx_udp.get(.dst_port));
     try std.testing.expectEqualStrings("hello", tx_udp.get(.payload));
 
-    const inside_ip, const inside_port = State.nat_table.inboundLookup(.{
+    const inside, _ = State.nat_table.inboundEntry(.{
         .protocol = .udp,
         .ip = lease_ip,
         .port = 40_000,
     }).?;
-    try std.testing.expectEqual(client_ip, inside_ip);
-    try std.testing.expectEqual(@as(u16, 40_000), inside_port);
+    try std.testing.expectEqual(client_ip, inside.ip);
+    try std.testing.expectEqual(@as(u16, 40_000), inside.port);
 
     try std.testing.expectEqual(@as(usize, 0), h.dropCount());
     try std.testing.expectEqual(@as(usize, 0), h.errorCount());
@@ -1342,7 +1286,7 @@ test "a NAT mapping only accepts inbound packets from the peer the inside host s
     const out_ip = try Router.Protocols.IPv4.parse((try Ethernet.parse(h.txAt(0).bytes)).get(.payload));
     const out_udp = try Router.Protocols.Udp.parse(out_ip.get(.payload), out_ip);
     const outside_port = out_udp.get(.src_port);
-    try std.testing.expect(State.nat_table.inboundLookup(.{
+    try std.testing.expect(State.nat_table.inboundEntry(.{
         .protocol = .udp,
         .ip = lease_ip,
         .port = outside_port,
@@ -1792,11 +1736,11 @@ test "ICMP echo requests from broadcast, multicast, or martian sources must not 
     // otherwise non-routable) address the reply itself is a broadcast/
     // multicast transmission - a reflector an attacker can aim at an ISP
     // segment - and an Ethernet source with the I/G bit set is invalid.
-    const forbidden = [_]struct { src_mac: Mac, src_ip: IPv4, label: []const u8 }{
-        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 255, 255, 255, 255 }, .label = "limited broadcast source IP" },
-        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 224, 0, 0, 1 }, .label = "multicast source IP" },
-        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 0, 0, 0, 0 }, .label = "this-network source IP" },
-        .{ .src_mac = echo_broadcast_mac, .src_ip = .{ 8, 8, 8, 8 }, .label = "broadcast source MAC" },
+    const forbidden = [_]struct { src_mac: Mac, src_ip: IPv4 }{
+        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 255, 255, 255, 255 } }, // limited broadcast source IP
+        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 224, 0, 0, 1 } }, // multicast source IP
+        .{ .src_mac = echo_gateway_mac, .src_ip = .{ 0, 0, 0, 0 } }, // this-network source IP
+        .{ .src_mac = echo_broadcast_mac, .src_ip = .{ 8, 8, 8, 8 } }, // broadcast source MAC
     };
 
     for (forbidden) |case| {
@@ -2352,7 +2296,7 @@ test "UDP checksum must be validated over the UDP length, not the IPv4 payload l
     try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
 
     try std.testing.expectEqual(@as(usize, 0), h.txCount());
-    try std.testing.expect(State.nat_table.inboundLookup(.{
+    try std.testing.expect(State.nat_table.inboundEntry(.{
         .protocol = .udp,
         .ip = .{ 203, 0, 113, 50 },
         .port = 40_001,
@@ -2425,7 +2369,7 @@ test "NAT mappings for a LAN address are invalidated when its DHCP lease is rele
 
     // The released address must not keep forwarding state from its previous
     // owner: the NAT mapping (and hence its inbound traffic) must be gone.
-    try std.testing.expect(State.nat_table.inboundLookup(.{
+    try std.testing.expect(State.nat_table.inboundEntry(.{
         .protocol = .udp,
         .ip = lease_ip,
         .port = outside_port,
@@ -2610,12 +2554,6 @@ test "ingress 802.1Q tags must not be carried across interfaces when forwarding"
             try std.testing.expectEqual(@as(usize, 0), tx_eth.get(.vlan_tags).len);
         }
     }
-}
-
-fn dhcpAppendU16(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u16) !void {
-    var bytes: [2]u8 = undefined;
-    std.mem.writeInt(u16, &bytes, value, .big);
-    try list.appendSlice(alloc, &bytes);
 }
 
 fn dhcpAppendU32(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
@@ -3248,7 +3186,7 @@ test "a LAN host spoofing another host's source address must not create NAT pinh
         _ = h.runAll(.lan);
     }
     try std.testing.expectEqual(@as(usize, 1), h.txCount());
-    try std.testing.expect(State.nat_table.inboundLookup(.{ .protocol = .udp, .ip = lease_ip, .port = 9090 }) != null);
+    try std.testing.expect(State.nat_table.inboundEntry(.{ .protocol = .udp, .ip = lease_ip, .port = 9090 }) != null);
 
     // Attack: a different link-layer host sends a datagram whose IP source is
     // the victim's address (and a port the victim never used). The router must
@@ -3264,7 +3202,7 @@ test "a LAN host spoofing another host's source address must not create NAT pinh
         try h.inject(.lan, frame);
         _ = h.runAll(.lan);
     }
-    try std.testing.expect(State.nat_table.inboundLookup(.{ .protocol = .udp, .ip = lease_ip, .port = 8080 }) == null);
+    try std.testing.expect(State.nat_table.inboundEntry(.{ .protocol = .udp, .ip = lease_ip, .port = 8080 }) == null);
     try std.testing.expectEqual(@as(usize, 0), h.txCount());
     try std.testing.expectEqual(@as(usize, 1), h.dropCount());
 

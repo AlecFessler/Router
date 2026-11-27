@@ -6,7 +6,6 @@ const EchoMsg = Router.Protocols.ICMPv4Messages.Echo.EchoMsg;
 const ICMPv4Protocol = Router.Protocols.ICMPv4;
 const IPv4Packet = Router.Protocols.IPv4.IPv4Packet;
 const IPv4Protocol = Router.Protocols.IPv4;
-const StructField = std.builtin.Type.StructField;
 const TcpProtocol = Router.Protocols.Tcp;
 const UdpPacket = Router.Protocols.Udp.UdpPacket;
 const UdpProtocol = Router.Protocols.Udp;
@@ -198,12 +197,6 @@ pub fn View(Base: type) type {
 
         fields: ViewFields,
         bit_group: []u8 = undefined,
-
-        pub const EqualityMode = enum {
-            shallow,
-            deep,
-            ignore_slices,
-        };
 
         pub fn takeField(
             self: *@This(),
@@ -591,77 +584,6 @@ pub fn View(Base: type) type {
             }
         }
 
-        fn readField(source: anytype, comptime field: FieldEnum) FieldType(Base, field) {
-            const T = @TypeOf(source);
-            const name = @tagName(field);
-
-            if (T == Base) return @field(source, name);
-            if (T == *Base or T == *const Base) return @field(source.*, name);
-            if (T == @This()) return source.get(field);
-            if (T == *@This() or T == *const @This()) return source.get(field);
-
-            @compileError("Expected Base or View(Base)");
-        }
-
-        pub fn compare(a: anytype, b: anytype, comptime mode: EqualityMode) bool {
-            @setEvalBranchQuota(10000);
-            inline for (fields) |field| {
-                field_check: {
-                    const T = UnderlyingType(field.type);
-                    const field_enum = @field(FieldEnum, field.name);
-
-                    if (mode == .ignore_slices and @typeInfo(T) == .pointer)
-                        break :field_check;
-
-                    const left_value = readField(a, field_enum);
-                    const right_value = readField(b, field_enum);
-
-                    if (@typeInfo(field.type) == .optional) {
-                        if (left_value == null and right_value == null)
-                            break :field_check;
-                        if (left_value == null or right_value == null)
-                            return false;
-                    }
-
-                    const left = if (@typeInfo(field.type) == .optional)
-                        left_value.?
-                    else
-                        left_value;
-                    const right = if (@typeInfo(field.type) == .optional)
-                        right_value.?
-                    else
-                        right_value;
-
-                    switch (@typeInfo(T)) {
-                        .pointer => {
-                            if (mode == .deep) {
-                                if (!std.mem.eql(u8, left, right)) return false;
-                            } else {
-                                if (left.ptr != right.ptr or left.len != right.len)
-                                    return false;
-                            }
-                        },
-                        else => {
-                            if (!std.meta.eql(left, right)) return false;
-                        },
-                    }
-                }
-            }
-            return true;
-        }
-
-        pub fn isEqual(self: *const @This(), other: anytype) bool {
-            return compare(self, other, .shallow);
-        }
-
-        pub fn isDeepEqual(self: *const @This(), other: anytype) bool {
-            return compare(self, other, .deep);
-        }
-
-        pub fn isEqualIgnoringSlices(self: *const @This(), other: anytype) bool {
-            return compare(self, other, .ignore_slices);
-        }
-
         fn printValue(comptime T: type, value: T, left_pad: usize) void {
             switch (@typeInfo(T)) {
                 .optional => |info| {
@@ -777,56 +699,6 @@ pub fn View(Base: type) type {
             inline for (fields) |field| {
                 @field(result, field.name) = self.get(@field(FieldEnum, field.name));
             }
-            return result;
-        }
-
-        pub fn deepCopy(
-            self: *@This(),
-            alloc: std.mem.Allocator,
-        ) !Base {
-            var result: Base = undefined;
-            var initialized: usize = 0;
-
-            errdefer {
-                inline for (fields, 0..) |field, i| {
-                    const T = UnderlyingType(field.type);
-                    const is_slice = switch (@typeInfo(T)) {
-                        .pointer => |info| info.size == .slice,
-                        else => false,
-                    };
-
-                    if (is_slice and i < initialized) {
-                        const slice = @field(result, field.name);
-
-                        if (@typeInfo(field.type) == .optional) {
-                            if (slice) |present| alloc.free(present);
-                        } else {
-                            alloc.free(slice);
-                        }
-                    }
-                }
-            }
-
-            inline for (fields) |field| {
-                const T = UnderlyingType(field.type);
-                const value = self.get(@field(FieldEnum, field.name));
-
-                if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
-                    if (comptime @typeInfo(field.type) == .optional) {
-                        @field(result, field.name) = if (value) |slice|
-                            try alloc.dupe(u8, slice)
-                        else
-                            null;
-                    } else {
-                        @field(result, field.name) = try alloc.dupe(u8, value);
-                    }
-                } else {
-                    @field(result, field.name) = value;
-                }
-
-                initialized += 1;
-            }
-
             return result;
         }
     };
@@ -1190,47 +1062,6 @@ test "View.set() clears optional fields without changing the wire buffer" {
     try std.testing.expectEqualSlices(u8, &test_buffer, &buffer);
 }
 
-test "View.compare() supports views, bases, and all equality modes" {
-    var first_buffer = test_buffer;
-    var second_buffer = test_buffer;
-    var first = parseTestBuffer(&first_buffer);
-    var second = parseTestBuffer(&second_buffer);
-    const base = first.copy();
-
-    try std.testing.expect(first.isEqual(&first));
-    try std.testing.expect(!first.isEqual(&second));
-    try std.testing.expect(first.isDeepEqual(&second));
-    try std.testing.expect(first.isEqualIgnoringSlices(&second));
-    try std.testing.expect(first.isEqual(&base));
-    try std.testing.expect(TestView.compare(base, first, .shallow));
-    try std.testing.expect(TestView.compare(&base, &second, .deep));
-    try std.testing.expect(TestView.compare(base, base, .shallow));
-    try std.testing.expect(TestView.compare(&first, base, .ignore_slices));
-
-    second.set(.test_slice, &.{ 0xAA, 0xBB });
-    second.set(.test_optional_slice, null);
-    try std.testing.expect(!first.isDeepEqual(second));
-    try std.testing.expect(!first.isEqual(second));
-    try std.testing.expect(first.isEqualIgnoringSlices(second));
-
-    second.set(.test_int, 0x1234);
-    try std.testing.expect(!first.isEqualIgnoringSlices(second));
-
-    var changed_base = base;
-    changed_base.test_array[0] = 0xFF;
-    try std.testing.expect(!TestView.compare(base, changed_base, .deep));
-
-    changed_base = base;
-    changed_base.test_optional_int = null;
-    try std.testing.expect(!TestView.compare(&first, &changed_base, .ignore_slices));
-
-    changed_base = base;
-    changed_base.test_slice = second.get(.test_slice);
-    try std.testing.expect(!TestView.compare(base, changed_base, .shallow));
-    try std.testing.expect(!TestView.compare(base, changed_base, .deep));
-    try std.testing.expect(TestView.compare(base, changed_base, .ignore_slices));
-}
-
 test "View.validate() handles optional field presence and values" {
     const default = TestBase{};
     var buffer = test_buffer;
@@ -1443,36 +1274,6 @@ test "View() generated copy() copies non-owned slices" {
         @intFromPtr(view.get(.test_optional_slice).?.ptr),
         @intFromPtr(copied.test_optional_slice.?.ptr),
     );
-    try std.testing.expectEqual(
-        @as(?u16, null),
-        copied.test_absent_int,
-    );
-    try std.testing.expectEqual(
-        @as(?[]const u8, null),
-        copied.test_absent_slice,
-    );
-}
-
-test "View() generated deepCopy() copies into owned slices" {
-    const expected = TestBase{};
-    var buffer = test_buffer;
-    var view = parseTestBuffer(&buffer);
-
-    const copied = try view.deepCopy(std.testing.allocator);
-    defer std.testing.allocator.free(copied.test_slice);
-    defer std.testing.allocator.free(copied.test_optional_slice.?);
-
-    try std.testing.expectEqualDeep(expected, copied);
-
-    try std.testing.expect(
-        @intFromPtr(view.get(.test_slice).ptr) !=
-            @intFromPtr(copied.test_slice.ptr),
-    );
-    try std.testing.expect(
-        @intFromPtr(view.get(.test_optional_slice).?.ptr) !=
-            @intFromPtr(copied.test_optional_slice.?.ptr),
-    );
-
     try std.testing.expectEqual(
         @as(?u16, null),
         copied.test_absent_int,

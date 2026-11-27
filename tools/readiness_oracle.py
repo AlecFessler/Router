@@ -138,7 +138,6 @@ class Oracle:
         self.engine = engine
         self.matcher = matcher
         self.packet_id = 0
-        self.lan = IPv4Network((config.lan_ip, 24), strict=False)
         self.arp_refreshed = {}
         self.replay_arp("wan", config.wan_gateway.packed, config.wan_gateway_mac, float("-inf"))
 
@@ -379,7 +378,6 @@ def live(args, oracle, log, checkpoint, stop, lan_connected, stack):
         return proc
 
     def wifi(listener):
-        last_offset = None
         while not stop.is_set():
             try:
                 conn, _ = listener.accept()

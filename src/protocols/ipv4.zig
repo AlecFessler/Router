@@ -663,7 +663,7 @@ test "parse() on wireshark captured frames matches wireshark's parsed output" {
         const frame = try Ethernet.parse(parsed_pcap.packet_bytes[i]);
         try std.testing.expectEqual(Ethernet.Ethertype.ipv4, frame.get(.ethertype));
         const view = try parse(frame.get(.payload));
-        try std.testing.expect(view.isEqualIgnoringSlices(&ws_packet));
+        try Router.TestFixtures.Utils.expectHeaderFields(ws_packet, view);
     }
 }
 
