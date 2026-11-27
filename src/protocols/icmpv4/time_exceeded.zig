@@ -4,7 +4,6 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const CsvParser = ICMPv4Fixtures.TimeExceededCsvParser;
 const Ethernet = Router.Protocols.Ethernet;
-const Format = Router.Meta.Format;
 const ICMPv4 = Router.Protocols.ICMPv4;
 const ICMPv4Fixtures = Router.TestFixtures.ICMPv4;
 const ICMPv4PacketView = Router.Protocols.ICMPv4.ICMPv4PacketView;
@@ -14,6 +13,8 @@ const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
+
+const forwardQuotedError = Router.Protocols.ICMPv4.forwardQuotedError;
 
 pub const Code = enum(u8) {
     ttl_exceeded = 0,
@@ -51,18 +52,14 @@ pub fn handle(
     const icmpv4_view = views.getView(.icmpv4);
     const view = try parse(icmpv4_view.*);
     Cli.enter(.time_exceeded, view);
-    const code: Code = @enumFromInt(icmpv4_view.get(.code));
-    switch (code) {
-        .ttl_exceeded => std.debug.print(
-            "ICMPv4: {f} unhandled by {s} interface\n",
-            .{ Format.enumLabel(code), @tagName(iface) },
-        ),
-        .fragment_reassembly_timeout => std.debug.print(
-            "ICMPv4: {f} unhandled by {s} interface\n",
-            .{ Format.enumLabel(code), @tagName(iface) },
-        ),
-    }
-    device.release(buffer);
+
+    return forwardQuotedError(
+        buffer,
+        device,
+        iface,
+        views,
+        view.get(.quoted_packet),
+    );
 }
 
 test "parse() on synthetic captured frames matches Wireshark's fields" {
