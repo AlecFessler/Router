@@ -172,9 +172,10 @@ pub fn handle(
         .tcp => try Tcp.handle(buffer, device, iface, views),
         .udp => try Udp.handle(buffer, device, iface, views),
         else => {
-            std.debug.print(
-                "IPv4: packet with protocol: {f} unhandled by {s} interface\n",
-                .{ Format.enumLabel(protocol), @tagName(iface) },
+            Router.Debug.Unhandled.report(
+                iface,
+                "IPv4: packet with protocol: {f} unhandled",
+                .{Format.enumLabel(protocol)},
             );
             device.release(buffer);
         },

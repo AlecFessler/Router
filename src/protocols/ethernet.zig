@@ -161,9 +161,10 @@ pub fn handle(
         .ipv4 => try IPv4.handle(buffer, device, iface, views),
         .arp => try Arp.handle(buffer, device, iface, views),
         else => {
-            std.debug.print(
-                "Ethernet: packet with ethertype {f} unhandled by {s} interface\n",
-                .{ Format.enumLabel(ethertype), @tagName(iface) },
+            Router.Debug.Unhandled.report(
+                iface,
+                "Ethernet: packet with ethertype {f} unhandled",
+                .{Format.enumLabel(ethertype)},
             );
             device.release(buffer);
         },

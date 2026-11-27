@@ -3452,3 +3452,73 @@ test "L2 bytes after the IP packet must not be forwarded across interfaces" {
         );
     }
 }
+
+fn expectDhcpMessage(frame: []const u8, kind: Router.Protocols.DHCPv4.MessageType) !Router.Protocols.DHCPv4.DHCPv4PacketView {
+    const packet = try dhcpPacketOf(frame);
+    var reader: std.Io.Reader = .fixed(packet.get(.options));
+    while (try Router.Protocols.DHCPv4.parseOption(&reader)) |opt| {
+        if (opt == .message_type) {
+            try std.testing.expectEqual(kind, opt.message_type);
+            return packet;
+        }
+    }
+    return error.MissingMessageType;
+}
+
+test "readiness from cold start negotiates WAN and LAN leases and resolves gateway before NAT forwarding" {
+    const alloc = std.testing.allocator;
+    const outside: IPv4 = .{ 203, 0, 113, 50 };
+    const gateway: IPv4 = .{ 203, 0, 113, 1 };
+    const peer: IPv4 = .{ 198, 51, 100, 2 };
+    var h = try Harness.init(alloc, std.testing.io, .{ .dhcp_pool = &.{client_ip} });
+    defer h.deinit();
+    try std.testing.expect(State.wan_lease == null);
+    try runWanDhcpHandshake(&h, alloc, outside, gateway, .{ 255, 255, 255, 0 }, gateway, 3600);
+    try std.testing.expectEqual(outside, State.wan_lease.?.ip);
+    _ = try expectDhcpMessage(h.txAt(0).bytes, .discover);
+    _ = try expectDhcpMessage(h.txAt(1).bytes, .request);
+    h.nic.resetLogs();
+
+    const discover = try DhcpClient.frame(alloc, client_mac, .{ .message_type = 1, .xid = 123 });
+    defer alloc.free(discover);
+    try h.inject(.lan, discover);
+    _ = h.runAll(.lan);
+    const offer = try expectDhcpMessage(h.txAt(0).bytes, .offer);
+    const offered = offer.get(.your_ip);
+    const request = try DhcpClient.frame(alloc, client_mac, .{
+        .message_type = 3,
+        .xid = 123,
+        .requested_ip = offered,
+        .server_id = State.lan_ip,
+    });
+    defer alloc.free(request);
+    try h.inject(.lan, request);
+    _ = h.runAll(.lan);
+    const ack = try expectDhcpMessage(h.txAt(1).bytes, .ack);
+    try std.testing.expectEqual(client_ip, ack.get(.your_ip));
+    try std.testing.expect(State.dhcp_table.lookupByIp(client_ip) != null);
+    h.nic.resetLogs();
+
+    const data = try lanUdpFrame(alloc, client_ip, client_mac, peer, 41000, 53);
+    defer alloc.free(data);
+    try h.inject(.lan, data);
+    _ = h.runAll(.lan);
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    const arp_eth = try Ethernet.parse(h.txAt(0).bytes);
+    try std.testing.expectEqual(Ethernet.Ethertype.arp, arp_eth.get(.ethertype));
+    const solicitation = try Router.Protocols.Arp.parse(arp_eth.get(.payload));
+    try std.testing.expectEqual(gateway, solicitation.get(.target_ip));
+    const reply = try Packets.arp(alloc, .{ .opcode = 2, .sender_ip = gateway, .sender_mac = gateway_mac, .target_ip = outside, .target_mac = RecordingNic.wan_mac });
+    defer alloc.free(reply);
+    const frame = try Packets.eth(alloc, .{ .dst = RecordingNic.wan_mac, .src = gateway_mac, .ethertype = 0x0806, .payload = reply });
+    defer alloc.free(frame);
+    try h.inject(.wan, frame);
+    _ = h.runAll(.wan);
+    try std.testing.expectEqual(@as(usize, 2), h.txCount());
+    const forwarded = try Ethernet.parse(h.txAt(1).bytes);
+    try std.testing.expectEqual(gateway_mac, forwarded.get(.dst_mac));
+    const ip = try Router.Protocols.IPv4.parse(forwarded.get(.payload));
+    try std.testing.expectEqual(outside, ip.get(.src));
+    try std.testing.expectEqual(peer, ip.get(.dst));
+    _ = try Router.Protocols.Udp.parse(ip.get(.payload), ip);
+}

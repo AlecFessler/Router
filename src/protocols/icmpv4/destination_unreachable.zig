@@ -69,9 +69,10 @@ pub fn handle(
             );
         },
         else => {
-            std.debug.print(
-                "ICMPv4: {f} unhandled by {s} interface\n",
-                .{ Format.enumLabel(code), @tagName(iface) },
+            Router.Debug.Unhandled.report(
+                iface,
+                "ICMPv4: {f} unhandled",
+                .{Format.enumLabel(code)},
             );
             device.release(buffer);
         },

@@ -17,6 +17,7 @@ import argparse
 from collections import Counter
 import getpass
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -26,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 
 from packet_sampler import Collector, FIELDS, PCAP_MAGIC, classify, read_exact
@@ -308,7 +309,7 @@ def stop_process(proc: subprocess.Popen) -> None:
     proc.stdout.close()
 
 
-def process(stream, args, key_directory: pathlib.Path) -> Collector:
+def process(stream, args, key_directory: pathlib.Path) -> Collector | None:
     header = read_exact(stream, 24)
     if header is None or header[:4] not in PCAP_MAGIC:
         hint = f"; see {args.output / 'capture.log'}" if not args.pcap else ""
@@ -318,7 +319,12 @@ def process(stream, args, key_directory: pathlib.Path) -> Collector:
     if linktype not in (DLT_IEEE802_11, DLT_IEEE802_11_RADIO):
         raise ValueError(f"expected raw 802.11 or radiotap pcap, got linktype {linktype}")
     ethernet_header = header[:20] + struct.pack(endian + "I", 1)
-    collector = Collector(args, ethernet_header)
+    forward = sys.stdout.buffer if args.ethernet_stream else None
+    collector = None if forward else Collector(args, ethernet_header)
+    if forward:
+        forward.write(ethernet_header)
+        forward.flush()
+    last_stream_checkpoint = time.monotonic()
     observed = protected = decrypted = converted = 0
     handshake_messages = {number: 0 for number in range(1, 5)}
     handshakes_by_client: dict[bytes, Counter] = {}
@@ -333,46 +339,52 @@ def process(stream, args, key_directory: pathlib.Path) -> Collector:
             (pathlib.Path("/sys/class/net") / args.source_interface / "address")
             .read_text().strip().replace(":", "")
         )
-    collector.status_line = "Radio frames 0 | protected data 0 | decrypted 0"
-    collector.extra_manifest = {}
     env = dict(os.environ, WIRESHARK_CONFIG_DIR=str(key_directory))
     decoder_cmd = [
         "tshark", "-n", "-l", "-r", "-", "-o", "wlan.enable_decryption:TRUE",
         "-T", "text", "-P", "-x", "--hexdump", "noascii", "-S", END_MARKER,
     ]
+    if forward:
+        # Keep link-layer decryption while avoiding long-lived IP conversations.
+        decoder_cmd.extend(("--disable-protocol", "ip", "--disable-protocol", "ipv6"))
     classifier_cmd = ["tshark", "-n", "-l", "-r", "-", "-T", "fields"]
     for field in FIELDS:
         classifier_cmd.extend(("-e", field))
+    classifier_log = (args.output / "classify.log") if collector else None
     with (args.output / "decrypt.log").open("wb") as decrypt_log, \
-         (args.output / "classify.log").open("wb") as classify_log:
+         (classifier_log.open("wb") if classifier_log else nullcontext()) as classify_log:
         try:
             decoder = subprocess.Popen(
                 decoder_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=decrypt_log, env=env, bufsize=0,
             )
-            classifier = subprocess.Popen(
-                classifier_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=classify_log, bufsize=0,
-            )
+            classifier = None
+            if collector:
+                classifier = subprocess.Popen(
+                    classifier_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=classify_log, bufsize=0,
+                )
         except BaseException:
             if "decoder" in locals():
                 decoder.terminate()
                 decoder.wait()
-            collector.close()
+            if collector:
+                collector.close()
             raise
         sent_ethernet_header = False
 
         def update_progress() -> None:
+            nonlocal last_stream_checkpoint
             target_protected = sum(protected_by_bssid[bssid] for bssid in target_bssids)
             target_decrypted = sum(decrypted_by_bssid[bssid] for bssid in target_bssids)
             own_handshakes = handshakes_by_client.get(own_mac, Counter())
-            collector.status_line = (
+            status_line = (
                 f"{args.ssid} protected/decrypted {target_protected}/{target_decrypted} | "
                 f"this PC {protected_by_client[own_mac]}/{decrypted_by_client[own_mac]} "
                 f"HS {own_handshakes[1]}/{own_handshakes[2]}/"
                 f"{own_handshakes[3]}/{own_handshakes[4]}"
             )
-            collector.extra_manifest = {
+            manifest = {
                 "radio_frames_seen": observed,
                 "protected_data_frames_seen": protected,
                 "decrypted_data_frames_seen": decrypted,
@@ -398,6 +410,14 @@ def process(stream, args, key_directory: pathlib.Path) -> Collector:
                 "channel": None if args.pcap else args.channel,
                 "direction": args.direction,
             }
+            if collector:
+                collector.status_line = status_line
+                collector.extra_manifest = manifest
+            elif time.monotonic() - last_stream_checkpoint >= args.checkpoint_seconds:
+                temp = args.output / "stream-status.tmp"
+                temp.write_text(json.dumps(manifest, indent=2) + "\n")
+                temp.replace(args.output / "stream-status.json")
+                last_stream_checkpoint = time.monotonic()
 
         try:
             while True:
@@ -447,6 +467,11 @@ def process(stream, args, key_directory: pathlib.Path) -> Collector:
                             if len(frame) > args.max_packet_bytes:
                                 continue
                             synthetic_header = record_header[:8] + struct.pack(endian + "II", len(frame), len(frame))
+                            if forward:
+                                forward.write(synthetic_header + frame)
+                                forward.flush()
+                                converted += 1
+                                continue
                             try:
                                 classifier.stdin.write(
                                     (ethernet_header if not sent_ethernet_header else b"")
@@ -466,27 +491,37 @@ def process(stream, args, key_directory: pathlib.Path) -> Collector:
                             converted += 1
                             update_progress()
                             collector.add(f"{direction[0]}/{classify(values)}", observed, synthetic_header + frame)
-                update_progress()
-                if time.monotonic() - collector.last_checkpoint >= args.checkpoint_seconds:
-                    collector.checkpoint()
-                if time.monotonic() - collector.last_refresh >= args.refresh_seconds:
-                    collector.render()
+                if collector:
+                    update_progress()
+                    if time.monotonic() - collector.last_checkpoint >= args.checkpoint_seconds:
+                        collector.checkpoint()
+                    if time.monotonic() - collector.last_refresh >= args.refresh_seconds:
+                        collector.render()
+                elif time.monotonic() - last_stream_checkpoint >= args.checkpoint_seconds:
+                    update_progress()
         finally:
+            last_stream_checkpoint = float("-inf")
             update_progress()
             try:
-                stop_process(decoder)
-                stop_process(classifier)
+                try:
+                    stop_process(decoder)
+                finally:
+                    if classifier:
+                        stop_process(classifier)
             finally:
-                collector.close()
+                if collector:
+                    collector.close()
         if decoder.returncode:
             raise RuntimeError(f"Wi-Fi TShark exited with {decoder.returncode}; see decrypt.log")
-        if classifier.returncode:
+        if classifier and classifier.returncode:
             raise RuntimeError(f"Ethernet TShark exited with {classifier.returncode}; see classify.log")
     return collector
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ethernet-stream", action="store_true",
+                        help="write decrypted Ethernet pcap to stdout for the readiness oracle")
     parser.add_argument("--pcap", type=pathlib.Path, help="read a local raw 802.11 or radiotap classic pcap")
     parser.add_argument("--source-interface", default="wlp8s0", help="radio on which to create monitor interface")
     parser.add_argument("--channel", type=int, default=149)
@@ -537,7 +572,7 @@ def main() -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    if not sys.stderr.isatty():
+    if collector and not sys.stderr.isatty():
         print(f"done: {collector.total_seen} Ethernet frames classified", file=sys.stderr)
     return 0
 

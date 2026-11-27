@@ -436,8 +436,8 @@ pub fn handle(
                     break :request .ack;
                 },
                 else => {
-                    std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                        Format.enumLabel(message_type), @tagName(iface),
+                    Router.Debug.Unhandled.report(iface, "DHCPv4: message type {f} unhandled", .{
+                        Format.enumLabel(message_type),
                     });
                     return device.release(buffer);
                 },
@@ -524,8 +524,8 @@ pub fn handle(
                     transaction.next_send = .zero;
                     transaction.retry_seconds = INITIAL_RETRY_SECONDS;
                 },
-                else => std.debug.print("DHCPv4: message type {f} unhandled by {s}\n", .{
-                    Format.enumLabel(message_type), @tagName(iface),
+                else => Router.Debug.Unhandled.report(iface, "DHCPv4: message type {f} unhandled", .{
+                    Format.enumLabel(message_type),
                 }),
             }
         },

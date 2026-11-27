@@ -28,6 +28,17 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("router", router);
     b.installArtifact(exe);
 
+    const shadow = b.addExecutable(.{
+        .name = "router-shadow",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shadow_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    shadow.root_module.addImport("router", router);
+    b.installArtifact(shadow);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 

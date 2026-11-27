@@ -354,8 +354,10 @@ fn shouldPause(entrypoint: EntryPoint, ptr: usize) bool {
     };
 }
 
+pub var enabled = true;
+
 pub fn enter(entrypoint: EntryPoint, data: anytype) void {
-    if (builtin.is_test or builtin.mode != .Debug) return;
+    if (builtin.is_test or builtin.mode != .Debug or !enabled) return;
     const ptr = dataPointer(data);
     if (entrypoint == .rx) {
         rx_count += 1;

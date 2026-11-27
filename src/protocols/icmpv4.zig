@@ -87,9 +87,10 @@ pub fn handle(
             try TimeExceeded.handle(buffer, device, iface, views);
         },
         else => {
-            std.debug.print(
-                "ICMPv4: packet with type: {f} unhandled by {s} interface\n",
-                .{ Format.enumLabel(message_type), @tagName(iface) },
+            Router.Debug.Unhandled.report(
+                iface,
+                "ICMPv4: packet with type: {f} unhandled",
+                .{Format.enumLabel(message_type)},
             );
             device.release(buffer);
         },
