@@ -64,10 +64,7 @@ pub fn handle(
     const message_type = icmpv4_view.get(.message_type);
     const my_ip = switch (iface) {
         .lan => lan_ip.*,
-        .wan => (wan_lease.* orelse {
-            device.release(buffer);
-            return;
-        }).ip,
+        .wan => (wan_lease.* orelse return device.release(buffer)).ip,
     };
     const addressed_to_me = ip_view.fieldCmp(.dst, .{ .eq = my_ip });
 
@@ -87,10 +84,7 @@ pub fn handle(
             NAT_TIMEOUT,
         );
     }
-    if (message_type != .echo_request or !addressed_to_me) {
-        device.release(buffer);
-        return;
-    }
+    if (message_type != .echo_request or !addressed_to_me) return device.release(buffer);
 
     const ethernet_view = views.getView(.ethernet);
     const sender_ip = ip_view.get(.src);

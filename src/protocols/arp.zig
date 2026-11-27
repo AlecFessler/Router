@@ -93,21 +93,14 @@ pub fn handle(
     };
     const my_mac = device.macAddress(iface);
 
-    if (my_ip == null) {
-        device.release(buffer);
-        return;
-    }
+    if (my_ip == null) return device.release(buffer);
 
-    if (view.fieldCmp(.sender_mac, .{ .eq = my_mac })) {
-        device.release(buffer);
-        return;
-    }
+    if (view.fieldCmp(.sender_mac, .{ .eq = my_mac })) return device.release(buffer);
 
     if (view.fieldCmp(.sender_ip, .{ .eq = my_ip.? })) {
         // TODO: defend this interface's IP against a conflicting MAC.
         // Queue at most one ARP announcement every 10 seconds.
-        device.release(buffer);
-        return;
+        return device.release(buffer);
     }
 
     const opcode = view.get(.opcode);
@@ -192,10 +185,7 @@ pub fn queueForArpResolution(
     );
 
     const should_send_request = try arp_waiters_table.register(key, buffer, device);
-    if (!should_send_request) {
-        device.release(tx_buffer);
-        return;
-    }
+    if (!should_send_request) return device.release(tx_buffer);
 
     device.transmit(tx_buffer[0..writer.end]);
 }

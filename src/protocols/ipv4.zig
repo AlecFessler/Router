@@ -136,18 +136,12 @@ pub fn handle(
     if (offset != 0) {
         if (view.get(.ttl) <= 1) return device.release(buffer);
 
-        const lease = wan_lease.* orelse {
-            device.release(buffer);
-            return;
-        };
+        const lease = wan_lease.* orelse return device.release(buffer);
         const should_forward = switch (iface) {
             .lan => classifyDestination(view.get(.dst)) == .wan,
             .wan => view.fieldCmp(.dst, .{ .eq = lease.ip }),
         };
-        if (!should_forward) {
-            device.release(buffer);
-            return;
-        }
+        if (!should_forward) return device.release(buffer);
 
         const table = switch (iface) {
             .lan => lan_fragment_table,
@@ -202,17 +196,12 @@ pub fn forwardNat(
     const ip_view = views.getView(.ipv4);
     const first_fragment = ip_view.get(.more_fragments);
 
-    const lease = wan_lease.* orelse {
-        device.release(buffer);
-        return;
-    };
+    const lease = wan_lease.* orelse return device.release(buffer);
 
     switch (iface) {
         .lan => {
-            if (classifyDestination(ip_view.get(.dst)) != .wan) {
-                device.release(buffer);
-                return;
-            }
+            if (classifyDestination(ip_view.get(.dst)) != .wan)
+                return device.release(buffer);
 
             if (ip_view.get(.ttl) <= 1) {
                 return sendTtlExceeded(buffer, device, iface, views);
@@ -253,10 +242,8 @@ pub fn forwardNat(
             return forward(buffer, device, .wan, lease.router, views);
         },
         .wan => {
-            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
-                device.release(buffer);
-                return;
-            }
+            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip }))
+                return device.release(buffer);
 
             const key: NatTable.Key = .{
                 .protocol = ip_view.get(.protocol),
@@ -264,10 +251,8 @@ pub fn forwardNat(
                 .port = transport_view.get(fields.wan),
             };
 
-            const inside, const mapping = nat_table.inboundEntry(key) orelse {
-                device.release(buffer);
-                return;
-            };
+            const inside, const mapping = nat_table.inboundEntry(key) orelse
+                return device.release(buffer);
 
             if (ip_view.get(.ttl) <= 1) {
                 return sendTtlExceeded(buffer, device, iface, views);
@@ -319,10 +304,8 @@ fn forwardFirstFragment(
 
     const payload_len = ip_view.get(.payload).len;
     const translation = if (table.get(key)) |existing| blk: {
-        if (existing.nat_generation != generation or existing.first_payload_len != payload_len) {
-            device.release(buffer);
-            return;
-        }
+        if (existing.nat_generation != generation or existing.first_payload_len != payload_len)
+            return device.release(buffer);
 
         break :blk existing;
     } else IPv4FragmentTable.Translation{
@@ -372,44 +355,29 @@ pub fn forwardFragment(
     const ip_view = views.getView(.ipv4);
     const offset = @as(usize, ip_view.get(.fragment_offset)) * 8;
 
-    if (offset < translation.first_payload_len) {
-        device.release(buffer);
-        return;
-    }
+    if (offset < translation.first_payload_len) return device.release(buffer);
 
-    const lease = wan_lease.* orelse {
-        device.release(buffer);
-        return;
-    };
+    const lease = wan_lease.* orelse return device.release(buffer);
 
     const ip, const generation = switch (iface) {
         .lan => blk: {
-            const entry = nat_table.outboundEntry(translation.nat_key, lease.ip) orelse {
-                device.release(buffer);
-                return;
-            };
+            const entry = nat_table.outboundEntry(translation.nat_key, lease.ip) orelse
+                return device.release(buffer);
 
             break :blk .{ entry.outside.ip, entry.generation };
         },
         .wan => blk: {
-            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip })) {
-                device.release(buffer);
-                return;
-            }
+            if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip }))
+                return device.release(buffer);
 
-            const inside, const entry = nat_table.inboundEntry(translation.nat_key) orelse {
-                device.release(buffer);
-                return;
-            };
+            const inside, const entry = nat_table.inboundEntry(translation.nat_key) orelse
+                return device.release(buffer);
 
             break :blk .{ inside.ip, entry.generation };
         },
     };
 
-    if (generation != translation.nat_generation) {
-        device.release(buffer);
-        return;
-    }
+    if (generation != translation.nat_generation) return device.release(buffer);
 
     ip_view.setUpdateChecksum(.identification, translation.identification, views);
     switch (iface) {
