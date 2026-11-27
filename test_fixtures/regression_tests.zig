@@ -32,6 +32,7 @@ const IPv4 = Router.Protocols.IPv4.IPv4;
 const IPv4FragmentTable = Router.Tables.IPv4FragmentTable.IPv4FragmentTable;
 const Mac = Router.Protocols.Ethernet.Mac;
 const NatTable = Router.Tables.NatTable.NatTable;
+const NatFilteringMode = Router.Tables.NatTable.NatTable.FilteringMode;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const State = Router.State;
@@ -267,6 +268,7 @@ pub const Harness = struct {
         /// `null` uses `192.168.86.2 ..= 192.168.86.254` like `src/main.zig`.
         dhcp_pool: ?[]const IPv4 = null,
         wan_lease: ?DHCPv4Lease = null,
+        nat_filtering_mode: NatFilteringMode = .address_restricted,
     };
 
     alloc: std.mem.Allocator,
@@ -293,6 +295,7 @@ pub const Harness = struct {
         State.lan_ip = options.lan_ip;
         State.lan_subnet_mask = options.lan_subnet_mask;
         State.wan_lease = options.wan_lease;
+        State.nat_filtering_mode = options.nat_filtering_mode;
 
         State.lan_arp_table = try ArpTable.init(alloc, io, options.arp_capacity, options.arp_ttl);
         self.ready.lan_arp = true;
@@ -373,6 +376,7 @@ pub const Harness = struct {
             self.ready.wan_arp = false;
         }
         State.wan_lease = null;
+        State.nat_filtering_mode = .address_restricted;
         self.nic.deinit();
     }
 
@@ -1309,4 +1313,125 @@ test "LAN datagrams to loopback, this-network, link-local, or reserved destinati
 
     // Dropping the datagrams must not create any additional NAT state.
     try std.testing.expectEqual(@as(usize, 1), State.nat_table.inside.count());
+}
+
+test "a NAT mapping only accepts inbound packets from the peer the inside host sent to" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .wan_lease = testWanLease(std.testing.io),
+    });
+    defer h.deinit();
+
+    const lease_ip: IPv4 = .{ 203, 0, 113, 50 };
+    const gateway_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const inside_ip: IPv4 = client_ip; // 192.168.86.42
+    const inside_mac = client_mac;
+    const query_peer: IPv4 = .{ 8, 8, 8, 8 };
+    const other_peer: IPv4 = .{ 6, 6, 6, 6 };
+    const inside_port: u16 = 40_000;
+
+    // The router can reach both the inside host and the WAN gateway.
+    h.cacheArp(.wan, gateway_ip, gateway_mac);
+    h.cacheArp(.lan, inside_ip, inside_mac);
+
+    // Inside host opens a UDP flow to 8.8.8.8:53; the NAT mapping is created.
+    const query = try Packets.udp(alloc, inside_ip, query_peer, .{
+        .src_port = inside_port,
+        .dst_port = 53,
+        .payload = "dns-query",
+    });
+    defer alloc.free(query);
+    const query_ip = try Packets.ipv4(alloc, .{
+        .src = inside_ip,
+        .dst = query_peer,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = query,
+    });
+    defer alloc.free(query_ip);
+    const query_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.lan_mac,
+        .src = inside_mac,
+        .ethertype = 0x0800,
+        .payload = query_ip,
+    });
+    defer alloc.free(query_frame);
+
+    try h.inject(.lan, query_frame);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+
+    // Recover the external port the router chose for this mapping.
+    const out_ip = try Router.Protocols.IPv4.parse((try Ethernet.parse(h.txAt(0).bytes)).get(.payload));
+    const out_udp = try Router.Protocols.Udp.parse(out_ip.get(.payload), out_ip);
+    const outside_port = out_udp.get(.src_port);
+    try std.testing.expect(State.nat_table.inboundLookup(.{
+        .protocol = .udp,
+        .ip = lease_ip,
+        .port = outside_port,
+    }) != null);
+
+    // Positive control: a reply from the peer the inside host contacted is
+    // still delivered, so the drop below is a peer check rather than a
+    // blanket WAN-ingress drop.
+    {
+        const reply = try Packets.udp(alloc, query_peer, lease_ip, .{
+            .src_port = 53,
+            .dst_port = outside_port,
+            .payload = "dns-reply",
+        });
+        defer alloc.free(reply);
+        const reply_ip = try Packets.ipv4(alloc, .{
+            .src = query_peer,
+            .dst = lease_ip,
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = reply,
+        });
+        defer alloc.free(reply_ip);
+        const reply_frame = try Packets.eth(alloc, .{
+            .dst = RecordingNic.wan_mac,
+            .src = gateway_mac,
+            .ethertype = 0x0800,
+            .payload = reply_ip,
+        });
+        defer alloc.free(reply_frame);
+        try h.inject(.wan, reply_frame);
+        try std.testing.expectEqual(@as(usize, 1), h.runAll(.wan));
+        try std.testing.expectEqual(@as(usize, 2), h.txCount());
+        try std.testing.expectEqual(IFace.lan, h.txAt(1).iface);
+        h.nic.resetLogs();
+    }
+
+    // An unrelated WAN peer (different address AND port) sends a datagram to
+    // the router's external port. The mapping's remote endpoint is 8.8.8.8:53,
+    // so this unsolicited packet must not be delivered to the inside host.
+    const injected = try Packets.udp(alloc, other_peer, lease_ip, .{
+        .src_port = 1234,
+        .dst_port = outside_port,
+        .payload = "injected",
+    });
+    defer alloc.free(injected);
+    const injected_ip = try Packets.ipv4(alloc, .{
+        .src = other_peer,
+        .dst = lease_ip,
+        .protocol = 17,
+        .dont_fragment = true,
+        .payload = injected,
+    });
+    defer alloc.free(injected_ip);
+    const injected_frame = try Packets.eth(alloc, .{
+        .dst = RecordingNic.wan_mac,
+        .src = gateway_mac,
+        .ethertype = 0x0800,
+        .payload = injected_ip,
+    });
+    defer alloc.free(injected_frame);
+
+    try h.inject(.wan, injected_frame);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.wan));
+
+    // No packet may be forwarded to the LAN for this unsolicited peer.
+    try std.testing.expectEqual(@as(usize, 0), h.txCount());
+    try std.testing.expectEqual(@as(usize, 1), h.dropCount());
 }
