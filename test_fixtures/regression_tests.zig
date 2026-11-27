@@ -2073,3 +2073,73 @@ test "an unsolicited ARP reply must not overwrite the cached gateway mapping" {
     try std.testing.expectEqual(@as(usize, 2), h.txCount());
     try std.testing.expectEqual(gateway_mac, (try Ethernet.parse(h.txAt(1).bytes)).get(.dst_mac));
 }
+
+test "a fragmented ICMPv4 echo must not be answered from its first fragment" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{});
+    defer h.deinit();
+
+    // 8-byte ICMP header + 8 bytes of data = 16 bytes, a whole number of
+    // 8-byte fragment units, so an MF=1 first fragment is well-formed IPv4.
+    const icmp_bytes = try Packets.echo(alloc, .{
+        .identifier = 0x5150,
+        .sequence_number = 9,
+        .data = "fragping",
+    });
+    defer alloc.free(icmp_bytes);
+
+    const buildFrame = struct {
+        fn build(alloc_: std.mem.Allocator, icmp: []const u8, more_fragments: bool) ![]u8 {
+            const ip_bytes = try Packets.ipv4(alloc_, .{
+                .src = client_ip,
+                .dst = .{ 192, 168, 86, 1 },
+                .protocol = 1,
+                .dont_fragment = false,
+                .more_fragments = more_fragments,
+                .fragment_offset = 0,
+                .identification = 0x7777,
+                .payload = icmp,
+            });
+            defer alloc_.free(ip_bytes);
+            return Packets.eth(alloc_, .{
+                .dst = RecordingNic.lan_mac,
+                .src = client_mac,
+                .ethertype = 0x0800,
+                .payload = ip_bytes,
+            });
+        }
+    };
+
+    // Positive control: the same complete echo request is answered.
+    const complete = try buildFrame.build(alloc, icmp_bytes, false);
+    defer alloc.free(complete);
+    try h.inject(.lan, complete);
+    _ = h.runAll(.lan);
+    try std.testing.expectEqual(@as(usize, 1), h.txCount());
+    {
+        const tx_eth = try Ethernet.parse(h.txAt(0).bytes);
+        const tx_ip = try Router.Protocols.IPv4.parse(tx_eth.get(.payload));
+        const tx_icmp = try Router.Protocols.ICMPv4.parse(tx_ip.get(.payload));
+        try std.testing.expectEqual(Router.Protocols.ICMPv4.MessageType.echo_reply, tx_icmp.get(.message_type));
+        try std.testing.expect(!tx_ip.get(.more_fragments));
+    }
+
+    // A first fragment (MF=1) of an echo request is not a complete ICMP
+    // message. The router must not treat its bytes as the whole message and
+    // answer it, and it must never emit a *fragmented* echo reply generated
+    // from a single fragment (receivers will wait for fragments that never
+    // arrive; the fragment also carries attacker-chosen payload/ID).
+    h.nic.resetLogs();
+    const fragmented = try buildFrame.build(alloc, icmp_bytes, true);
+    defer alloc.free(fragmented);
+    try h.inject(.lan, fragmented);
+    try std.testing.expectEqual(@as(usize, 1), h.runAll(.lan));
+
+    // Safe: no reply, or a complete (non-fragmented) reply after reassembly.
+    if (h.lastTx()) |tx| {
+        const tx_eth = try Ethernet.parse(tx.bytes);
+        const tx_ip = try Router.Protocols.IPv4.parse(tx_eth.get(.payload));
+        try std.testing.expect(!tx_ip.get(.more_fragments));
+        try std.testing.expectEqual(@as(u13, 0), tx_ip.get(.fragment_offset));
+    }
+}

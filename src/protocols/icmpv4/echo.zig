@@ -88,6 +88,11 @@ pub fn handle(
     }
     if (message_type != .echo_request or !addressed_to_me) return device.release(buffer);
 
+    // TODO: reassemble locally-addressed fragments in a dedicated reassembly
+    // table (keyed by src/dst/id/protocol, with a timeout and size cap) and
+    // answer a complete echo request instead of dropping it.
+    if (ip_view.get(.more_fragments)) return device.release(buffer);
+
     const ethernet_view = views.getView(.ethernet);
     const sender_ip = ip_view.get(.src);
     const sender_class = classifyDestination(sender_ip);
