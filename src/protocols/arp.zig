@@ -138,8 +138,14 @@ pub fn handle(
                 device.transmit(tx_buffer[0..writer.end]);
                 defer device.release(buffer);
 
+                const sender_ip = view.get(.sender_ip);
+                const sender_mac = view.get(.sender_mac);
                 if (view.fieldCmp(.sender_ip, .{ .eq = IPv4{ 0, 0, 0, 0 } })) return;
-                table.cache(view.get(.sender_ip), view.get(.sender_mac));
+                if (!senderIsOnLink(iface, my_ip.?, sender_ip)) return;
+                if (table.lookup(sender_ip)) |existing| {
+                    if (!std.meta.eql(existing, sender_mac)) return;
+                }
+                table.cache(sender_ip, sender_mac);
             } else {
                 device.release(buffer);
             }
