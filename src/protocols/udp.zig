@@ -85,6 +85,7 @@ pub fn handle(
         iface,
         views,
         &view,
+        .{ .lan = .src_port, .wan = .dst_port },
         &port_allocator,
         UDP_NAT_TIMEOUT,
     );

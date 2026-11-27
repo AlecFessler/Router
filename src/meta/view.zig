@@ -2,6 +2,7 @@ const std = @import("std");
 const Router = @import("router");
 
 const ChecksumModule = Router.Meta.Checksum;
+const EchoMsg = Router.Protocols.ICMPv4Messages.Echo.EchoMsg;
 const ICMPv4Protocol = Router.Protocols.ICMPv4;
 const IPv4Packet = Router.Protocols.IPv4.IPv4Packet;
 const IPv4Protocol = Router.Protocols.IPv4;
@@ -529,22 +530,25 @@ pub fn View(Base: type) type {
             value: FieldType(Base, field),
             views: *ViewStack,
         ) void {
-            const checksum_field: FieldEnum = if (comptime @hasField(Base, "header_checksum"))
+            const checksum_view = if (comptime Base == EchoMsg) views.getView(.icmpv4) else self;
+            const ChecksumView = @TypeOf(checksum_view.*);
+            const ChecksumBase = ChecksumView.BaseType;
+            const checksum_field: ChecksumView.Field = if (comptime @hasField(ChecksumBase, "header_checksum"))
                 .header_checksum
-            else if (comptime @hasField(Base, "checksum"))
+            else if (comptime @hasField(ChecksumBase, "checksum"))
                 .checksum
             else
                 @compileError("setUpdateChecksum() requires a checksum field");
-            if (comptime field == checksum_field)
+            if (comptime ChecksumView == @This() and field == checksum_field)
                 @compileError("setUpdateChecksum() cannot set the checksum field itself");
-            if (comptime @FieldType(Base, @tagName(checksum_field)) != u16)
+            if (comptime @FieldType(ChecksumBase, @tagName(checksum_field)) != u16)
                 @compileError("setUpdateChecksum() requires a u16 checksum field");
             if (comptime Base == IPv4Packet) {
                 if (comptime field == .ihl or field == .total_length or field == .protocol)
                     @compileError("setUpdateChecksum() cannot change IPv4 pseudoheader length or protocol");
             }
 
-            const old_checksum = self.get(checksum_field);
+            const old_checksum = checksum_view.get(checksum_field);
             const affected = self.checksumAffectedBytes(field);
             const old_sum = ChecksumModule.checksumContribution(affected);
             self.set(field, value);
@@ -559,7 +563,7 @@ pub fn View(Base: type) type {
             if (comptime Base == UdpPacket) {
                 if (new_checksum == 0) new_checksum = 0xffff;
             }
-            self.set(checksum_field, new_checksum);
+            checksum_view.set(checksum_field, new_checksum);
 
             if (comptime Base == IPv4Packet) {
                 if (comptime field == .src or field == .dst) {

@@ -182,6 +182,10 @@ pub fn forwardNat(
     iface: IFace,
     views: *ViewStack,
     transport_view: anytype,
+    comptime fields: struct {
+        lan: @TypeOf(transport_view.*).Field,
+        wan: @TypeOf(transport_view.*).Field,
+    },
     port_allocator: *PortAllocator,
     timeout: std.Io.Duration,
 ) !void {
@@ -203,7 +207,7 @@ pub fn forwardNat(
             const key: NatTable.Key = .{
                 .protocol = ip_view.get(.protocol),
                 .ip = ip_view.get(.src),
-                .port = transport_view.get(.src_port),
+                .port = transport_view.get(fields.lan),
             };
 
             const mapping = if (nat_table.outboundEntry(key, lease.ip)) |existing| hit: {
@@ -216,7 +220,7 @@ pub fn forwardNat(
                 timeout,
             );
 
-            transport_view.setUpdateChecksum(.src_port, mapping.outside.port, views);
+            transport_view.setUpdateChecksum(fields.lan, mapping.outside.port, views);
 
             if (first_fragment) {
                 return forwardFirstFragment(
@@ -243,7 +247,7 @@ pub fn forwardNat(
             const key: NatTable.Key = .{
                 .protocol = ip_view.get(.protocol),
                 .ip = ip_view.get(.dst),
-                .port = transport_view.get(.dst_port),
+                .port = transport_view.get(fields.wan),
             };
 
             const inside, const mapping = nat_table.inboundEntry(key) orelse {
@@ -251,7 +255,7 @@ pub fn forwardNat(
                 return;
             };
 
-            transport_view.setUpdateChecksum(.dst_port, inside.port, views);
+            transport_view.setUpdateChecksum(fields.wan, inside.port, views);
 
             if (first_fragment) {
                 return forwardFirstFragment(

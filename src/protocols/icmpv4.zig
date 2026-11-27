@@ -14,12 +14,9 @@ const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
-const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const TimeExceeded = Router.Protocols.ICMPv4Messages.TimeExceeded;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
-
-var port_allocator: PortAllocator = .{};
 
 pub const MessageType = enum(u8) {
     echo_reply = 0,

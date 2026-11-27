@@ -11,8 +11,19 @@ const IFace = Router.Nic.Api.IFace;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
+const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
+
+const forwardNat = Router.Protocols.IPv4.forwardNat;
+
+const lan_ip = &Router.State.lan_ip;
+const wan_lease = &Router.State.wan_lease;
+
+const NAT_TIMEOUT = std.Io.Duration.fromSeconds(60);
+const REPLY_TTL: u8 = 64;
+
+var port_allocator: PortAllocator = .{};
 
 pub const EchoMsg = struct {
     identifier: u16,
@@ -46,13 +57,58 @@ pub fn handle(
     views: *ViewStack,
 ) !void {
     const icmpv4_view = views.getView(.icmpv4);
-    const view = try parse(icmpv4_view.*);
+    var view = try parse(icmpv4_view.*);
     Cli.enter(.echo, view);
-    switch (icmpv4_view.get(.message_type)) {
-        .echo_request => std.debug.print("ICMPv4 echo request unhandled by {s} interface\n", .{@tagName(iface)}),
-        .echo_reply => std.debug.print("ICMPv4 echo reply unhandled by {s} interface\n", .{@tagName(iface)}),
-        else => unreachable,
+
+    const ip_view = views.getView(.ipv4);
+    const message_type = icmpv4_view.get(.message_type);
+    const my_ip = switch (iface) {
+        .lan => lan_ip.*,
+        .wan => (wan_lease.* orelse {
+            device.release(buffer);
+            return;
+        }).ip,
+    };
+    const addressed_to_me = ip_view.fieldCmp(.dst, .{ .eq = my_ip });
+
+    const should_forward = switch (iface) {
+        .lan => message_type == .echo_request and !addressed_to_me,
+        .wan => message_type == .echo_reply,
+    };
+    if (should_forward) {
+        return forwardNat(
+            buffer,
+            device,
+            iface,
+            views,
+            &view,
+            .{ .lan = .identifier, .wan = .identifier },
+            &port_allocator,
+            NAT_TIMEOUT,
+        );
     }
+    if (message_type != .echo_request or !addressed_to_me) {
+        device.release(buffer);
+        return;
+    }
+
+    const ethernet_view = views.getView(.ethernet);
+    const sender_ip = ip_view.get(.src);
+    const frame_len = buffer.len - ethernet_view.get(.payload).len + ip_view.get(.total_length);
+
+    ethernet_view.set(.dst_mac, ethernet_view.get(.src_mac));
+    ethernet_view.set(.src_mac, device.macAddress(iface));
+    ip_view.setUpdateChecksum(.src, my_ip, views);
+    ip_view.setUpdateChecksum(.dst, sender_ip, views);
+    ip_view.setUpdateChecksum(.ttl, REPLY_TTL, views);
+    icmpv4_view.setUpdateChecksum(.message_type, .echo_reply, views);
+
+    const tx_buffer = device.nextTxBuffer(iface);
+    errdefer device.release(tx_buffer);
+
+    var writer: std.Io.Writer = .fixed(tx_buffer);
+    try writer.writeAll(buffer[0..frame_len]);
+    device.transmit(tx_buffer[0..writer.end]);
     device.release(buffer);
 }
 
