@@ -982,3 +982,228 @@ test "harness smoke: ICMP echo request to the LAN IP gets a LAN echo reply" {
     try std.testing.expectEqual(@as(usize, 1), h.dropCount());
     try std.testing.expectEqual(@as(usize, 0), h.errorCount());
 }
+
+/// Minimal DHCPv4 client message builder used by the state-table regressions.
+const DhcpClient = struct {
+    pub const Opts = struct {
+        message_type: u8,
+        xid: u32 = 0x1122_3344,
+        ciaddr: IPv4 = .{ 0, 0, 0, 0 },
+        client_id: ?[]const u8 = null,
+        requested_ip: ?IPv4 = null,
+        server_id: ?IPv4 = null,
+        broadcast_flag: bool = false,
+        secs: u16 = 0,
+        /// Overrides the payload chaddr while leaving the Ethernet source
+        /// address as `mac`; used to prove chaddr is not an authorisation.
+        chaddr: ?Mac = null,
+    };
+
+    fn u16be(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u16) !void {
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, value, .big);
+        try list.appendSlice(alloc, &bytes);
+    }
+
+    fn u32be(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, value, .big);
+        try list.appendSlice(alloc, &bytes);
+    }
+
+    fn option(list: *std.ArrayList(u8), alloc: std.mem.Allocator, code: u8, data: []const u8) !void {
+        try list.append(alloc, code);
+        try list.append(alloc, @intCast(data.len));
+        try list.appendSlice(alloc, data);
+    }
+
+    /// Build the DHCPv4 payload (fixed BOOTP header + options).
+    pub fn payload(
+        alloc: std.mem.Allocator,
+        mac: Mac,
+        opts: Opts,
+    ) ![]u8 {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(alloc);
+
+        try list.append(alloc, 1); // BOOTREQUEST
+        try list.append(alloc, 1); // Ethernet
+        try list.append(alloc, 6); // hardware address length
+        try list.append(alloc, 0); // hops
+        try u32be(&list, alloc, opts.xid);
+        try u16be(&list, alloc, opts.secs);
+        try u16be(&list, alloc, if (opts.broadcast_flag) 0x8000 else 0);
+        try list.appendSlice(alloc, &opts.ciaddr);
+        try list.appendSlice(alloc, &([_]u8{0} ** 4)); // yiaddr
+        try list.appendSlice(alloc, &([_]u8{0} ** 4)); // siaddr
+        try list.appendSlice(alloc, &([_]u8{0} ** 4)); // giaddr
+        try list.appendSlice(alloc, &(opts.chaddr orelse mac));
+        try list.appendSlice(alloc, &([_]u8{0} ** 10)); // chaddr padding
+        try list.appendSlice(alloc, &([_]u8{0} ** 64)); // sname
+        try list.appendSlice(alloc, &([_]u8{0} ** 128)); // file
+        try list.appendSlice(alloc, &.{ 0x63, 0x82, 0x53, 0x63 });
+
+        const message_type = [_]u8{opts.message_type};
+        try option(&list, alloc, 53, &message_type);
+        if (opts.client_id) |id| try option(&list, alloc, 61, id);
+        if (opts.requested_ip) |ip| try option(&list, alloc, 50, &ip);
+        if (opts.server_id) |ip| try option(&list, alloc, 54, &ip);
+        try list.append(alloc, 255); // end
+
+        return list.toOwnedSlice(alloc);
+    }
+
+    /// Build a full Ethernet/IPv4/UDP DHCP client frame (68 -> 67).
+    pub fn frame(
+        alloc: std.mem.Allocator,
+        mac: Mac,
+        opts: Opts,
+    ) ![]u8 {
+        const dhcp = try payload(alloc, mac, opts);
+        defer alloc.free(dhcp);
+
+        const udp_bytes = try Packets.udp(alloc, .{ 0, 0, 0, 0 }, .{ 255, 255, 255, 255 }, .{
+            .src_port = 68,
+            .dst_port = 67,
+            .checksum = 0,
+            .payload = dhcp,
+        });
+        defer alloc.free(udp_bytes);
+
+        const ip_bytes = try Packets.ipv4(alloc, .{
+            .src = .{ 0, 0, 0, 0 },
+            .dst = .{ 255, 255, 255, 255 },
+            .protocol = 17,
+            .dont_fragment = true,
+            .payload = udp_bytes,
+        });
+        defer alloc.free(ip_bytes);
+
+        return Packets.eth(alloc, .{
+            .dst = .{0xff} ** 6,
+            .src = mac,
+            .ethertype = 0x0800,
+            .payload = ip_bytes,
+        });
+    }
+};
+
+test "a DHCPDECLINE from a different client MAC must not delete another client's lease" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .dhcp_pool = &[_]IPv4{
+            .{ 192, 168, 86, 10 },
+            .{ 192, 168, 86, 11 },
+            .{ 192, 168, 86, 12 },
+        },
+    });
+    defer h.deinit();
+
+    const victim_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x01 };
+    const attacker_mac: Mac = .{ 0x02, 0xbb, 0x00, 0x00, 0x00, 0x02 };
+    const victim_id = "victim-client";
+    const victim_ip: IPv4 = .{ 192, 168, 86, 10 };
+    const lan_ip: IPv4 = .{ 192, 168, 86, 1 };
+
+    // The victim obtains a normal lease: DISCOVER -> OFFER -> REQUEST -> ACK.
+    const discover = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 1,
+        .xid = 0x0a0b_0c0d,
+        .client_id = victim_id,
+    });
+    defer alloc.free(discover);
+    try h.inject(.lan, discover);
+    _ = h.runAll(.lan);
+
+    const request = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 3,
+        .xid = 0x0a0b_0c0d,
+        .client_id = victim_id,
+        .requested_ip = victim_ip,
+        .server_id = lan_ip,
+    });
+    defer alloc.free(request);
+    try h.inject(.lan, request);
+    _ = h.runAll(.lan);
+
+    // Sanity: the victim's lease is bound to the victim's address.
+    try std.testing.expect(State.dhcp_table.lookupByIp(victim_ip) != null);
+    try std.testing.expect(State.dhcp_table.lookupByClient(.{ .id = victim_id }) != null);
+    try std.testing.expectEqual(@as(usize, 0), State.dhcp_table.excluded_ips.items.len);
+
+    // Attack: a different MAC sends DHCPDECLINE while claiming the victim's
+    // client identifier and address. A lease is bound to both the client id and
+    // the MAC (see DhcpTable.bindOrRenew), so this must be ignored.
+    const decline = try DhcpClient.frame(alloc, attacker_mac, .{
+        .message_type = 4,
+        .xid = 0x0e0f_1011,
+        .client_id = victim_id,
+        .requested_ip = victim_ip,
+        .server_id = lan_ip,
+    });
+    defer alloc.free(decline);
+    try h.inject(.lan, decline);
+    _ = h.runAll(.lan);
+
+    // The victim must still own its lease and the address must remain usable.
+    try std.testing.expect(State.dhcp_table.lookupByClient(.{ .id = victim_id }) != null);
+    try std.testing.expect(State.dhcp_table.lookupByIp(victim_ip) != null);
+    try std.testing.expectEqual(@as(usize, 0), State.dhcp_table.excluded_ips.items.len);
+}
+
+test "a DHCPDECLINE with a spoofed chaddr from another Ethernet source must be rejected" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{
+        .dhcp_pool = &[_]IPv4{
+            .{ 192, 168, 86, 10 },
+            .{ 192, 168, 86, 11 },
+        },
+    });
+    defer h.deinit();
+
+    const victim_mac: Mac = .{ 0x02, 0xaa, 0x00, 0x00, 0x00, 0x01 };
+    const attacker_mac: Mac = .{ 0x02, 0xbb, 0x00, 0x00, 0x00, 0x02 };
+    const victim_id = "victim-client";
+    const victim_ip: IPv4 = .{ 192, 168, 86, 10 };
+    const lan_ip: IPv4 = .{ 192, 168, 86, 1 };
+
+    const discover = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 1,
+        .xid = 0x1111_2222,
+        .client_id = victim_id,
+    });
+    defer alloc.free(discover);
+    try h.inject(.lan, discover);
+    _ = h.runAll(.lan);
+
+    const request = try DhcpClient.frame(alloc, victim_mac, .{
+        .message_type = 3,
+        .xid = 0x1111_2222,
+        .client_id = victim_id,
+        .requested_ip = victim_ip,
+        .server_id = lan_ip,
+    });
+    defer alloc.free(request);
+    try h.inject(.lan, request);
+    _ = h.runAll(.lan);
+    try std.testing.expect(State.dhcp_table.lookupByIp(victim_ip) != null);
+
+    // The attacker knows the victim's client id *and* copies its chaddr into
+    // the payload, but its Ethernet source address is its own. The handler
+    // must reject the DECLINE on the link-layer identity.
+    const decline = try DhcpClient.frame(alloc, attacker_mac, .{
+        .message_type = 4,
+        .xid = 0x3333_4444,
+        .client_id = victim_id,
+        .requested_ip = victim_ip,
+        .server_id = lan_ip,
+        .chaddr = victim_mac,
+    });
+    defer alloc.free(decline);
+    try h.inject(.lan, decline);
+    _ = h.runAll(.lan);
+
+    try std.testing.expect(State.dhcp_table.lookupByClient(.{ .id = victim_id }) != null);
+    try std.testing.expect(State.dhcp_table.lookupByIp(victim_ip) != null);
+    try std.testing.expectEqual(@as(usize, 0), State.dhcp_table.excluded_ips.items.len);
+}
