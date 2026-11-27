@@ -204,6 +204,18 @@ pub fn forwardNat(
             if (classifyDestination(ip_view.get(.dst)) != .wan)
                 return device.release(buffer);
 
+            // A LAN source must look like a LAN host, and when an ARP
+            // binding exists it must come from that MAC. This stops one host
+            // from creating NAT state for another host's address.
+            const source_ip = ip_view.get(.src);
+            if (classifyDestination(source_ip) != .lan)
+                return device.release(buffer);
+            const source_mac = views.getView(.ethernet).get(.src_mac);
+            if (lan_arp_table.lookup(source_ip)) |cached| {
+                if (!std.meta.eql(cached, source_mac))
+                    return device.release(buffer);
+            }
+
             if (ip_view.get(.ttl) <= 1) {
                 return sendTtlExceeded(buffer, device, iface, views);
             }
