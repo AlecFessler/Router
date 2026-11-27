@@ -2634,3 +2634,179 @@ test "ingress 802.1Q tags must not be carried across interfaces when forwarding"
         }
     }
 }
+
+fn dhcpAppendU16(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u16) !void {
+    var bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &bytes, value, .big);
+    try list.appendSlice(alloc, &bytes);
+}
+
+fn dhcpAppendU32(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .big);
+    try list.appendSlice(alloc, &bytes);
+}
+
+/// DHCP server options used by the client handshake below.
+fn dhcpServerOptions(
+    alloc: std.mem.Allocator,
+    message_type: u8,
+    server_ip: IPv4,
+    mask: IPv4,
+    gateway: IPv4,
+    lease_seconds: u32,
+) ![]u8 {
+    var options: std.ArrayList(u8) = .empty;
+    errdefer options.deinit(alloc);
+    try options.appendSlice(alloc, &.{ 53, 1, message_type });
+    try options.appendSlice(alloc, &.{ 54, 4 });
+    try options.appendSlice(alloc, &server_ip);
+    try options.appendSlice(alloc, &.{ 1, 4 });
+    try options.appendSlice(alloc, &mask);
+    try options.appendSlice(alloc, &.{ 3, 4 });
+    try options.appendSlice(alloc, &gateway);
+    try options.appendSlice(alloc, &.{ 51, 4 });
+    try dhcpAppendU32(&options, alloc, lease_seconds);
+    return options.toOwnedSlice(alloc);
+}
+
+/// Build a DHCPv4 Ethernet frame (`op` = 1 BOOTREQUEST / 2 BOOTREPLY).
+fn dhcpFrame(
+    alloc: std.mem.Allocator,
+    op: u8,
+    xid: u32,
+    chaddr: Mac,
+    ciaddr: IPv4,
+    yiaddr: IPv4,
+    ip_src: IPv4,
+    ip_dst: IPv4,
+    options: []const u8,
+) ![]u8 {
+    var dhcp: std.ArrayList(u8) = .empty;
+    defer dhcp.deinit(alloc);
+    try dhcp.appendSlice(alloc, &.{ op, 1, 6, 0 }); // op, htype, hlen, hops
+    try dhcpAppendU32(&dhcp, alloc, xid);
+    try dhcp.appendSlice(alloc, &.{ 0, 0 }); // secs
+    try dhcp.appendSlice(alloc, &.{ 0, 0 }); // flags
+    try dhcp.appendSlice(alloc, &ciaddr);
+    try dhcp.appendSlice(alloc, &yiaddr);
+    try dhcp.appendSlice(alloc, &.{ 0, 0, 0, 0 }); // siaddr
+    try dhcp.appendSlice(alloc, &.{ 0, 0, 0, 0 }); // giaddr
+    var client_hw_addr = [_]u8{0} ** 16;
+    client_hw_addr[0..6].* = chaddr;
+    try dhcp.appendSlice(alloc, &client_hw_addr);
+    try dhcp.appendSlice(alloc, &([_]u8{0} ** 64)); // sname
+    try dhcp.appendSlice(alloc, &([_]u8{0} ** 128)); // file
+    try dhcp.appendSlice(alloc, &.{ 0x63, 0x82, 0x53, 0x63 }); // magic
+    try dhcp.appendSlice(alloc, options);
+    try dhcp.append(alloc, 255); // End
+
+    const udp_bytes = try Packets.udp(alloc, ip_src, ip_dst, .{
+        .src_port = if (op == 2) 67 else 68,
+        .dst_port = if (op == 2) 68 else 67,
+        .checksum = 0,
+        .payload = dhcp.items,
+    });
+    defer alloc.free(udp_bytes);
+    const ip_bytes = try Packets.ipv4(alloc, .{
+        .src = ip_src,
+        .dst = ip_dst,
+        .protocol = 17,
+        .payload = udp_bytes,
+    });
+    defer alloc.free(ip_bytes);
+    return Packets.eth(alloc, .{
+        .dst = .{0xff} ** 6,
+        .src = if (op == 2) gateway_mac else RecordingNic.wan_mac,
+        .ethertype = 0x0800,
+        .payload = ip_bytes,
+    });
+}
+
+fn dhcpPacketOf(tx: []const u8) !Router.Protocols.DHCPv4.DHCPv4PacketView {
+    const eth_view = try Ethernet.parse(tx);
+    const ip_view = try Router.Protocols.IPv4.parse(eth_view.get(.payload));
+    const udp_view = try Router.Protocols.Udp.parse(ip_view.get(.payload), ip_view);
+    return Router.Protocols.DHCPv4.parse(udp_view.get(.payload));
+}
+
+/// Drive the WAN DHCP client through DISCOVER -> OFFER -> REQUEST -> ACK for
+/// the given server-assigned address.
+fn runWanDhcpHandshake(
+    h: *Harness,
+    alloc: std.mem.Allocator,
+    offered_ip: IPv4,
+    server_ip: IPv4,
+    mask: IPv4,
+    gateway: IPv4,
+    lease_seconds: u32,
+) !void {
+    try Router.Protocols.DHCPv4.tickWan(std.testing.io, h.nic.api());
+    const discover_tx = h.lastTx() orelse return error.TestUnexpectedResult;
+    const discover = try dhcpPacketOf(discover_tx.bytes);
+    const xid = discover.get(.xid);
+    try std.testing.expect(discover.get(.op) == .BOOTREQUEST);
+
+    const offer_options = try dhcpServerOptions(alloc, 2, server_ip, mask, gateway, lease_seconds);
+    defer alloc.free(offer_options);
+    const offer_frame = try dhcpFrame(
+        alloc,
+        2,
+        xid,
+        RecordingNic.wan_mac,
+        .{ 0, 0, 0, 0 },
+        offered_ip,
+        server_ip,
+        .{ 255, 255, 255, 255 },
+        offer_options,
+    );
+    defer alloc.free(offer_frame);
+    try h.inject(.wan, offer_frame);
+    _ = h.runAll(.wan);
+
+    try Router.Protocols.DHCPv4.tickWan(std.testing.io, h.nic.api());
+
+    const ack_options = try dhcpServerOptions(alloc, 5, server_ip, mask, gateway, lease_seconds);
+    defer alloc.free(ack_options);
+    const ack_frame = try dhcpFrame(
+        alloc,
+        2,
+        xid,
+        RecordingNic.wan_mac,
+        .{ 0, 0, 0, 0 },
+        offered_ip,
+        server_ip,
+        .{ 255, 255, 255, 255 },
+        ack_options,
+    );
+    defer alloc.free(ack_frame);
+    try h.inject(.wan, ack_frame);
+    _ = h.runAll(.wan);
+}
+
+test "DHCP client must reject a WAN lease that assigns a non-unicast address" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, std.testing.io, .{});
+    defer h.deinit();
+
+    const server_ip: IPv4 = .{ 203, 0, 113, 1 };
+    const mask: IPv4 = .{ 255, 255, 255, 0 };
+    const gateway: IPv4 = .{ 203, 0, 113, 1 };
+
+    // Positive control: a valid unicast offer/ack is accepted.
+    try runWanDhcpHandshake(&h, alloc, .{ 203, 0, 113, 50 }, server_ip, mask, gateway, 3600);
+    try std.testing.expectEqual(@as(?IPv4, .{ 203, 0, 113, 50 }), if (State.wan_lease) |lease| lease.ip else null);
+
+    // Reset the negotiated lease so a second handshake starts clean.
+    h.setWanLease(null);
+    h.nic.resetLogs();
+
+    // A DHCP server must never assign a loopback address to an interface. The
+    // client currently accepts one and then uses it as the WAN source address
+    // for every NATed packet (and in its ARP/DHCP traffic).
+    try runWanDhcpHandshake(&h, alloc, .{ 127, 0, 0, 1 }, server_ip, mask, gateway, 3600);
+    try std.testing.expectEqual(
+        @as(?IPv4, null),
+        if (State.wan_lease) |lease| lease.ip else null,
+    );
+}
