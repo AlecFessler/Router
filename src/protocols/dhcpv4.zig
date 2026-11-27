@@ -352,6 +352,7 @@ pub fn handle(
 
     const message_type = options.message_type orelse return error.MissingMessageType;
     const mac = view.get(.client_hw_addr)[0..6].*;
+    const sender_mac = views.getView(.ethernet).get(.src_mac);
     const xid = view.get(.xid);
 
     switch (iface) {
@@ -374,7 +375,7 @@ pub fn handle(
             const reply: MessageType = switch (message_type) {
                 .decline => {
                     const ip = options.requested_ip_address orelse return device.release(buffer);
-                    dhcp_table.decline(client, ip);
+                    dhcp_table.decline(client, sender_mac, ip);
                     return device.release(buffer);
                 },
                 .discover => offer: {
@@ -388,7 +389,7 @@ pub fn handle(
                 },
                 .inform => if (has_ciaddr) .ack else return device.release(buffer),
                 .release => {
-                    dhcp_table.release(client, ciaddr);
+                    dhcp_table.release(client, sender_mac, ciaddr);
                     return device.release(buffer);
                 },
                 .request => request: {
