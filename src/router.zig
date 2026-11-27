@@ -22,5 +22,6 @@ test {
     _ = Tables.ArpTable;
     _ = Tables.ArpWaitersTable;
     _ = Tables.DhcpTable;
+    _ = Tables.IPv4FragmentTable;
     _ = Tables.NatTable;
 }
