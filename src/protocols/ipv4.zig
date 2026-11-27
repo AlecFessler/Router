@@ -138,7 +138,9 @@ pub fn handle(
 
         const lease = wan_lease.* orelse return device.release(buffer);
         const should_forward = switch (iface) {
-            .lan => classifyDestination(view.get(.dst)) == .wan,
+            .lan => classifyDestination(view.get(.dst)) == .wan or
+                ((protocol == .udp or protocol == .tcp) and view.fieldCmp(.dst, .{ .eq = lan_ip.* }) and
+                    validLanSource(views)),
             .wan => view.fieldCmp(.dst, .{ .eq = lease.ip }) and
                 classifyDestination(view.get(.src)) == .wan,
         };
@@ -182,6 +184,14 @@ pub fn handle(
     }
 }
 
+// When an ARP binding exists, only that MAC may send for the LAN address.
+fn validLanSource(views: *ViewStack) bool {
+    const ip = views.getView(.ipv4).get(.src);
+    if (classifyDestination(ip) != .lan) return false;
+    const mac = lan_arp_table.lookup(ip) orelse return true;
+    return std.meta.eql(mac, views.getView(.ethernet).get(.src_mac));
+}
+
 pub fn forwardNat(
     buffer: []u8,
     device: NicApi,
@@ -191,6 +201,7 @@ pub fn forwardNat(
     comptime fields: struct {
         lan: @TypeOf(transport_view.*).Field,
         wan: @TypeOf(transport_view.*).Field,
+        service_peer: ?NatTable.Peer = null,
     },
     port_allocator: *PortAllocator,
     timeout: std.Io.Duration,
@@ -202,20 +213,11 @@ pub fn forwardNat(
 
     switch (iface) {
         .lan => {
-            if (classifyDestination(ip_view.get(.dst)) != .wan)
+            const destination = if (fields.service_peer) |peer| peer.ip else ip_view.get(.dst);
+            if (classifyDestination(destination) != .wan)
                 return device.release(buffer);
 
-            // A LAN source must look like a LAN host, and when an ARP
-            // binding exists it must come from that MAC. This stops one host
-            // from creating NAT state for another host's address.
-            const source_ip = ip_view.get(.src);
-            if (classifyDestination(source_ip) != .lan)
-                return device.release(buffer);
-            const source_mac = views.getView(.ethernet).get(.src_mac);
-            if (lan_arp_table.lookup(source_ip)) |cached| {
-                if (!std.meta.eql(cached, source_mac))
-                    return device.release(buffer);
-            }
+            if (!validLanSource(views)) return device.release(buffer);
 
             if (ip_view.get(.ttl) <= 1) {
                 return sendTtlExceeded(buffer, device, iface, views);
@@ -225,6 +227,7 @@ pub fn forwardNat(
                 .protocol = ip_view.get(.protocol),
                 .ip = ip_view.get(.src),
                 .port = transport_view.get(fields.lan),
+                .service_peer = fields.service_peer,
             };
 
             const mapping = if (nat_table.outboundEntry(key, lease.ip)) |existing| hit: {
@@ -238,7 +241,7 @@ pub fn forwardNat(
             );
 
             nat_table.appendPeer(key, .{
-                .ip = ip_view.get(.dst),
+                .ip = destination,
                 .port = transport_view.get(fields.wan),
             });
 
@@ -254,9 +257,11 @@ pub fn forwardNat(
                     key,
                     mapping.generation,
                     mapping.outside.ip,
+                    fields.service_peer,
                 );
             }
 
+            rewriteServiceAddress(views, .wan, fields.service_peer);
             ip_view.setUpdateChecksum(.src, mapping.outside.ip, views);
             return forward(buffer, device, .wan, lease.router, views);
         },
@@ -282,7 +287,7 @@ pub fn forwardNat(
                 .ip = ip_view.get(.src),
                 .port = transport_view.get(fields.lan),
             };
-            if (!mapping.acceptsPeer(source_peer))
+            if (!inside.permitsReply(mapping, source_peer))
                 return device.release(buffer);
 
             if (ip_view.get(.ttl) <= 1) {
@@ -301,12 +306,23 @@ pub fn forwardNat(
                     key,
                     mapping.generation,
                     inside.ip,
+                    inside.service_peer,
                 );
             }
 
+            rewriteServiceAddress(views, .lan, inside.service_peer);
             ip_view.setUpdateChecksum(.dst, inside.ip, views);
             return forward(buffer, device, .lan, inside.ip, views);
         },
+    }
+}
+
+fn rewriteServiceAddress(views: *ViewStack, egress: IFace, service_peer: ?NatTable.Peer) void {
+    const peer = service_peer orelse return;
+    const ip = views.getView(.ipv4);
+    switch (egress) {
+        .wan => ip.setUpdateChecksum(.dst, peer.ip, views),
+        .lan => ip.setUpdateChecksum(.src, lan_ip.*, views),
     }
 }
 
@@ -319,6 +335,7 @@ fn forwardFirstFragment(
     nat_key: NatTable.Key,
     generation: u64,
     translated_ip: IPv4,
+    service_peer: ?NatTable.Peer,
 ) !void {
     const ip_view = views.getView(.ipv4);
     const ingress: IFace = if (egress == .wan) .lan else .wan;
@@ -349,6 +366,7 @@ fn forwardFirstFragment(
     const batch = try table.resolve(key, translation, device);
     errdefer for (batch.buffers[0..batch.len]) |queued_buffer| device.release(queued_buffer);
 
+    rewriteServiceAddress(views, egress, service_peer);
     ip_view.setUpdateChecksum(.identification, translation.identification, views);
     switch (egress) {
         .wan => ip_view.setUpdateChecksum(.src, translated_ip, views),
@@ -390,12 +408,12 @@ pub fn forwardFragment(
 
     const lease = wan_lease.* orelse return device.release(buffer);
 
-    const ip, const generation = switch (iface) {
+    const ip, const generation, const service_peer = switch (iface) {
         .lan => blk: {
             const entry = nat_table.outboundEntry(translation.nat_key, lease.ip) orelse
                 return device.release(buffer);
 
-            break :blk .{ entry.outside.ip, entry.generation };
+            break :blk .{ entry.outside.ip, entry.generation, translation.nat_key.service_peer };
         },
         .wan => blk: {
             if (!ip_view.fieldCmp(.dst, .{ .eq = lease.ip }))
@@ -407,7 +425,7 @@ pub fn forwardFragment(
             if (!entry.acceptsPeerIp(ip_view.get(.src)))
                 return device.release(buffer);
 
-            break :blk .{ inside.ip, entry.generation };
+            break :blk .{ inside.ip, entry.generation, inside.service_peer };
         },
     };
 
@@ -416,10 +434,12 @@ pub fn forwardFragment(
     ip_view.setUpdateChecksum(.identification, translation.identification, views);
     switch (iface) {
         .lan => {
+            rewriteServiceAddress(views, .wan, service_peer);
             ip_view.setUpdateChecksum(.src, ip, views);
             return forward(buffer, device, .wan, lease.router, views);
         },
         .wan => {
+            rewriteServiceAddress(views, .lan, service_peer);
             ip_view.setUpdateChecksum(.dst, ip, views);
             return forward(buffer, device, .lan, ip, views);
         },

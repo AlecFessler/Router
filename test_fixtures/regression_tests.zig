@@ -1,24 +1,3 @@
-//! Cross-cutting security regression tests.
-//!
-//! This file is its own test root (see `build.zig`). Audit branches add one
-//! failing test per confirmed bug here. A regression test must encode the
-//! *expected* (safe) router behavior, so it fails while the bug is present and
-//! passes once the bug is fixed. Production code is intentionally not fixed by
-//! the audit agents.
-//!
-//! It also hosts the shared end-to-end test harness announced on
-//! `audit/harness-v1`:
-//!
-//! - `RecordingNic` implements `Router.Nic.Api.Api`, records every transmit
-//!   (copying bytes before the buffer is freed), counts drops/errors, and frees
-//!   every outstanding buffer on deinit.
-//! - `Harness` initializes the same process-global `Router.State` tables that
-//!   `src/main.zig` creates, injects pcap/raw frames, and runs them through
-//!   `Router.Protocols.Ethernet.handle` with a fresh `ViewStack` per packet.
-//! - `Packets` builds synthetic classic-pcap files and Ethernet/IPv4/UDP/TCP/
-//!   ICMP/ARP frames with correct checksums plus override knobs for malformed
-//!   fields (lengths, checksums, flags, IHL/data offset, VLAN tags, TTL, ...).
-
 const std = @import("std");
 const Router = @import("router");
 
@@ -39,10 +18,6 @@ const State = Router.State;
 const ViewStack = Router.Protocols.ViewStack;
 
 const checksumContribution = Router.Meta.Checksum.checksumContribution;
-
-test {
-    _ = Router;
-}
 
 /// Recording test NIC.
 ///
@@ -990,7 +965,7 @@ test "harness smoke: ICMP echo request to the LAN IP gets a LAN echo reply" {
 }
 
 /// Minimal DHCPv4 client message builder used by the state-table regressions.
-const DhcpClient = struct {
+pub const DhcpClient = struct {
     pub const Opts = struct {
         message_type: u8,
         xid: u32 = 0x1122_3344,
@@ -2650,7 +2625,7 @@ fn dhcpAppendU32(list: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32)
 }
 
 /// DHCP server options used by the client handshake below.
-fn dhcpServerOptions(
+pub fn dhcpServerOptions(
     alloc: std.mem.Allocator,
     message_type: u8,
     server_ip: IPv4,
@@ -2673,7 +2648,7 @@ fn dhcpServerOptions(
 }
 
 /// Build a DHCPv4 Ethernet frame (`op` = 1 BOOTREQUEST / 2 BOOTREPLY).
-fn dhcpFrame(
+pub fn dhcpFrame(
     alloc: std.mem.Allocator,
     op: u8,
     xid: u32,
@@ -3453,7 +3428,7 @@ test "L2 bytes after the IP packet must not be forwarded across interfaces" {
     }
 }
 
-fn expectDhcpMessage(frame: []const u8, kind: Router.Protocols.DHCPv4.MessageType) !Router.Protocols.DHCPv4.DHCPv4PacketView {
+pub fn expectDhcpMessage(frame: []const u8, kind: Router.Protocols.DHCPv4.MessageType) !Router.Protocols.DHCPv4.DHCPv4PacketView {
     const packet = try dhcpPacketOf(frame);
     var reader: std.Io.Reader = .fixed(packet.get(.options));
     while (try Router.Protocols.DHCPv4.parseOption(&reader)) |opt| {

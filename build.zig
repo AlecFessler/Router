@@ -56,20 +56,10 @@ pub fn build(b: *std.Build) void {
 
     const run_tests = b.addRunArtifact(tests);
 
-    // Cross-cutting regression tests live in their own binary so audit branches can
-    // add failing reproductions without touching the production test modules.
-    const regression_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test_fixtures/regression_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    regression_tests.root_module.addImport("router", router);
-    regression_tests.root_module.addImport("test_fixtures", test_fixtures);
-    const run_regression_tests = b.addRunArtifact(regression_tests);
+    const fixture_tests = b.addTest(.{ .root_module = test_fixtures });
+    const run_fixture_tests = b.addRunArtifact(fixture_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
-    test_step.dependOn(&run_regression_tests.step);
+    test_step.dependOn(&run_fixture_tests.step);
 }

@@ -4,6 +4,7 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const CsvParser = UdpFixtures.CsvParser;
 const DHCPv4 = Router.Protocols.DHCPv4;
+const Dns = Router.Protocols.Dns;
 const Ethernet = Router.Protocols.Ethernet;
 const IFace = Router.Nic.Api.IFace;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
@@ -78,6 +79,9 @@ pub fn handle(
         if (first_fragment) return error.NeedsReassembly;
         return DHCPv4.handle(buffer, device, iface, views);
     }
+
+    if (Dns.isLanEndpoint(iface, ip_view.get(.dst), view.get(.dst_port)))
+        return Dns.handle(buffer, device, views, &view, &port_allocator, UDP_NAT_TIMEOUT);
 
     return forwardNat(
         buffer,

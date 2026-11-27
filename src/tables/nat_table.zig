@@ -52,6 +52,13 @@ pub const NatTable = struct {
         protocol: Protocol,
         ip: IPv4,
         port: u16,
+        // A client can use the same local socket for direct and gateway DNS.
+        service_peer: ?Peer = null,
+
+        pub fn permitsReply(self: Key, entry: Entry, peer: Peer) bool {
+            if (self.service_peer) |upstream| return std.meta.eql(upstream, peer);
+            return entry.acceptsPeer(peer);
+        }
     };
 
     pub const IpPort = struct { IPv4, u16 };

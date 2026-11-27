@@ -4,6 +4,7 @@ const Router = @import("router");
 const Cli = Router.Debug.Cli;
 const CsvParser = ICMPv4Fixtures.CsvParser;
 const DestinationUnreachable = Router.Protocols.ICMPv4Messages.DestinationUnreachable;
+const Dns = Router.Protocols.Dns;
 const Echo = Router.Protocols.ICMPv4Messages.Echo;
 const Ethernet = Router.Protocols.Ethernet;
 const Format = Router.Meta.Format;
@@ -149,16 +150,22 @@ pub fn forwardQuotedError(
                 .ip = quote.get(.dst),
                 .port = transport.get(.dst_port),
             };
-            if (!mapping.acceptsPeer(quoted_peer))
+            if (!inside.permitsReply(mapping, quoted_peer))
                 return device.release(buffer);
 
             rewriteQuotedEndpoint(&quote, &transport, .src, inside.ip, inside.port);
+            if (inside.service_peer) |peer| {
+                rewriteQuotedEndpoint(&quote, &transport, .dst, Router.State.lan_ip, peer.port);
+                if (outer.fieldCmp(.src, .{ .eq = peer.ip }))
+                    outer.setUpdateChecksum(.src, Router.State.lan_ip, views);
+            }
             outer.setUpdateChecksum(.dst, inside.ip, views);
             break :wan .{ IFace.lan, inside.ip };
         },
         .lan => lan: {
             const remote_ip = outer.get(.dst);
-            if (classifyDestination(remote_ip) != .wan or
+            const local_dns = Dns.isLanEndpoint(.lan, remote_ip, transport.get(.src_port));
+            if ((!local_dns and classifyDestination(remote_ip) != .wan) or
                 !quote.fieldCmp(.src, .{ .eq = remote_ip }))
                 return device.release(buffer);
 
@@ -169,9 +176,14 @@ pub fn forwardQuotedError(
                 .protocol = protocol,
                 .ip = quote.get(.dst),
                 .port = transport.get(.dst_port),
+                .service_peer = if (local_dns) Dns.upstream else null,
             }, lease.ip) orelse return device.release(buffer);
 
             rewriteQuotedEndpoint(&quote, &transport, .dst, public_ip, public_port);
+            if (local_dns) {
+                rewriteQuotedEndpoint(&quote, &transport, .src, Dns.upstream.ip, Dns.port);
+                outer.setUpdateChecksum(.dst, Dns.upstream.ip, views);
+            }
             outer.setUpdateChecksum(.src, public_ip, views);
             break :lan .{ IFace.wan, lease.router };
         },

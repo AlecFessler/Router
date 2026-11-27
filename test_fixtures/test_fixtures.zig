@@ -8,3 +8,8 @@ pub const Tcp = @import("tcp/tcp.zig");
 pub const Udp = @import("udp/udp.zig");
 pub const Utils = @import("utils.zig");
 pub const WanCaptures = @import("wan_captures/wan_captures.zig");
+
+test {
+    _ = @import("regression_tests.zig");
+    _ = @import("requirements_tests.zig");
+}

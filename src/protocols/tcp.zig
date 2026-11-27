@@ -3,6 +3,7 @@ const Router = @import("router");
 
 const Cli = Router.Debug.Cli;
 const CsvParser = TcpFixtures.CsvParser;
+const Dns = Router.Protocols.Dns;
 const Ethernet = Router.Protocols.Ethernet;
 const IFace = Router.Nic.Api.IFace;
 const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
@@ -81,6 +82,9 @@ pub fn handle(
     var view = try parse(ip_view.get(.payload), ip_view.*);
     Cli.enter(.tcp, view);
     views.setView(.tcp, &view);
+
+    if (Dns.isLanEndpoint(iface, ip_view.get(.dst), view.get(.dst_port)))
+        return Dns.handle(buffer, device, views, &view, &port_allocator, NAT_TIMEOUT);
 
     return forwardNat(
         buffer,
