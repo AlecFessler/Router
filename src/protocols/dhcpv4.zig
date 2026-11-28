@@ -498,6 +498,7 @@ pub fn handle(
                         t2.toNanoseconds() >= lease_ns)
                         return device.release(buffer);
 
+                    if (wan_lease.* == null) wan_arp_table.defend_after = .zero;
                     wan_lease.* = .{
                         .ip = offered_ip,
                         .subnet_mask = mask,
@@ -532,6 +533,24 @@ pub fn handle(
     }
 
     device.release(buffer);
+}
+
+pub fn declineWan(device: NicApi, tags: []u8) !void {
+    const lease = wan_lease.*.?;
+    wan_lease.* = null;
+    wan_transaction.* = null;
+    if (std.meta.eql(lease.server_id, ZERO_IP)) return; // Shadow lease has no issuing server.
+    var xid: u32 = undefined;
+    wan_arp_table.io.random(std.mem.asBytes(&xid));
+    try transmit(device, .wan, .{
+        .kind = .decline,
+        .xid = xid,
+        .mac = device.macAddress(.wan),
+        .requested_ip = lease.ip,
+        .server_id = lease.server_id,
+        .broadcast = false,
+        .vlan_tags = tags,
+    });
 }
 
 pub fn tickWan(io: std.Io, device: NicApi) !void {
@@ -633,7 +652,7 @@ fn transmit(device: NicApi, iface: IFace, tx: Tx) !void {
     if (iface == .wan) {
         const client_id = [_]u8{1} ++ tx.mac;
         try serializeOption(.client_id, client_id, &option_writer);
-        try serializeOption(
+        if (tx.kind != .decline) try serializeOption(
             .parameter_request_list,
             std.mem.asBytes(&WAN_PARAMETER_REQUEST_LIST),
             &option_writer,

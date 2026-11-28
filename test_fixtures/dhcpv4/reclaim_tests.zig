@@ -82,20 +82,6 @@ test "DHCP reclaim emits three spaced LAN probes and waits before offering the d
     try eq(f.client, (try f.message(&h, .lan, .offer)).get(.your_ip));
 }
 
-fn arpFrame(h: *f.H, side: f.Iface, vlan: f.P.VlanTag, opts: f.P.ArpOpts) !void {
-    const arp = try f.P.arp(alloc, opts);
-    defer alloc.free(arp);
-    const frame = try f.P.eth(alloc, .{
-        .src = opts.sender_mac,
-        .dst = broadcast,
-        .ethertype = 0x0806,
-        .vlan_tags = &.{vlan},
-        .payload = arp,
-    });
-    defer alloc.free(frame);
-    try f.inject(h, side, frame);
-}
-
 test "LAN ARP claims and competing probes cancel queued DHCP reclaim work" {
     // Deliver each timeout immediately so the conflict can be injected at a specific step.
     var vtable = io.vtable.*;
@@ -109,10 +95,10 @@ test "LAN ARP claims and competing probes cancel queued DHCP reclaim work" {
         var h = try f.H.init(alloc, fast_io, .{ .dhcp_pool = &.{f.client}, .wan_lease = f.activeLease() });
         defer h.deinit();
         try startReclaim(&h);
-        try arpFrame(&h, .wan, tags[0], conflict);
-        try arpFrame(&h, .lan, .{ .vid = 38 }, conflict);
-        try arpFrame(&h, .lan, tags[0], .{ .sender_mac = f.Nic.lan_mac, .sender_ip = zero_ip, .target_ip = f.client });
-        try arpFrame(&h, .lan, tags[0], .{ .sender_mac = next_mac, .sender_ip = f.peer, .target_ip = f.client });
+        try f.arpFrame(&h, .wan, tags[0], conflict);
+        try f.arpFrame(&h, .lan, .{ .vid = 38 }, conflict);
+        try f.arpFrame(&h, .lan, tags[0], .{ .sender_mac = f.Nic.lan_mac, .sender_ip = zero_ip, .target_ip = f.client });
+        try f.arpFrame(&h, .lan, tags[0], .{ .sender_mac = next_mac, .sender_ip = f.peer, .target_ip = f.client });
         try expect(table.reclaim != null);
 
         // Inject the conflict before the first probe, between probes, or after the last.
@@ -121,7 +107,7 @@ test "LAN ARP claims and competing probes cancel queued DHCP reclaim work" {
             try table.tickReclaim(h.nic.api());
         }
         try table.probe_due.wait(io);
-        try arpFrame(&h, .lan, .{ .vid = 37, .pcp = 3 }, conflict);
+        try f.arpFrame(&h, .lan, .{ .vid = 37, .pcp = 3 }, conflict);
         try expect(table.reclaim == null);
         try table.tickReclaim(h.nic.api());
         try eq(probes_sent, h.txCount());

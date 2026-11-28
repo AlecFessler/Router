@@ -85,10 +85,10 @@ pub const Mock = struct {
             self.emit('F', id, buffer);
         } else if (self.current) |id| {
             const ethernet = Ethernet.parse(buffer) catch return;
-            // A generated ARP request is a neighbor lookup for queued traffic.
+            // Suppress neighbor lookups and DHCP probes; report defensive announcements.
             if (ethernet.get(.ethertype) == .arp) {
-                const payload = ethernet.get(.payload);
-                if (payload.len < 8 or std.mem.readInt(u16, payload[6..8], .big) != 2) return;
+                const arp = Router.Protocols.Arp.parse(ethernet.get(.payload)) catch return;
+                if (arp.get(.opcode) == .request and !arp.fieldCmp(.sender_ip, .{ .eq = arp.get(.target_ip) })) return;
             }
             self.emit(if (entry.value.iface == .lan) 'R' else 'S', id, buffer);
         }

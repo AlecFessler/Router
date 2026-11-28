@@ -38,6 +38,20 @@ pub fn inject(h: *H, side: Iface, frame: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 1), h.runAll(side));
 }
 
+pub fn arpFrame(h: *H, side: Iface, vlan: P.VlanTag, opts: P.ArpOpts) !void {
+    const arp = try P.arp(h.alloc, opts);
+    defer h.alloc.free(arp);
+    const frame = try P.eth(h.alloc, .{
+        .src = opts.sender_mac,
+        .dst = .{255} ** 6,
+        .ethertype = 0x0806,
+        .vlan_tags = &.{vlan},
+        .payload = arp,
+    });
+    defer h.alloc.free(frame);
+    try inject(h, side, frame);
+}
+
 pub fn send(h: *H, side: Iface, opts: P.Ipv4Opts) !void {
     const ip = try P.ipv4(h.alloc, opts);
     defer h.alloc.free(ip);

@@ -121,7 +121,9 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             },
-            'T' => {},
+            'T' => Router.Protocols.DHCPv4.tickWan(init.io, nic) catch |err| {
+                std.log.scoped(.dhcp).warn("WAN DHCP: {t}", .{err});
+            },
             else => return error.InvalidCommand,
         }
         State.dhcp_table.tickReclaim(nic) catch |err| {

@@ -16,6 +16,7 @@ pub const ArpTable = struct {
     io: std.Io,
     table: Table,
     ttl: std.Io.Duration,
+    defend_after: std.Io.Timestamp = .zero,
 
     pub fn init(
         alloc: std.mem.Allocator,

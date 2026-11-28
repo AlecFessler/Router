@@ -119,8 +119,21 @@ pub fn handle(
     }
 
     if (view.fieldCmp(.sender_ip, .{ .eq = my_ip.? })) {
-        // TODO: defend this interface's IP against a conflicting MAC.
-        // Queue at most one ARP announcement every 10 seconds.
+        const other_iface: IFace = if (iface == .lan) .wan else .lan;
+        const sender = view.get(.sender_mac);
+        if (std.meta.eql(sender, device.macAddress(other_iface)) or std.meta.eql(sender, [_]u8{0} ** 6))
+            return device.release(buffer);
+
+        const now = std.Io.Timestamp.now(table.io, .boot);
+        const recent = now.toNanoseconds() < table.defend_after.toNanoseconds();
+        if (!recent) {
+            device.transmit(try requestFrame(device, iface, my_ip.?, my_ip.?, ethernet_view.get(.vlan_tags)));
+            std.log.scoped(.arp).warn("defending {t} address {any} against {x}", .{ iface, my_ip.?, &sender });
+        } else if (iface == .wan) {
+            std.log.scoped(.arp).warn("relinquishing WAN address {any} after repeated conflict with {x}", .{ my_ip.?, &sender });
+            try Router.Protocols.DHCPv4.declineWan(device, ethernet_view.get(.vlan_tags));
+        }
+        table.defend_after = now.addDuration(.fromSeconds(10));
         return device.release(buffer);
     }
 
