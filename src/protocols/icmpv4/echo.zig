@@ -88,36 +88,94 @@ pub fn handle(
     }
     if (message_type != .echo_request or !addressed_to_me) return device.release(buffer);
 
-    // TODO: reassemble locally-addressed fragments in a dedicated reassembly
-    // table (keyed by src/dst/id/protocol, with a timeout and size cap) and
-    // answer a complete echo request instead of dropping it.
-    if (ip_view.get(.more_fragments)) return device.release(buffer);
+    try reply(buffer, device, iface, views);
+    device.release(buffer);
+}
 
+pub fn replyReassembled(frame: []u8, device: NicApi, iface: IFace) !void {
+    var ethernet = try Ethernet.parse(frame);
+    var header = try IPv4Protocol.parse(ethernet.get(.payload));
+    var icmp = try ICMPv4.parse(header.get(.payload));
+    _ = try parse(icmp);
+    if (icmp.get(.message_type) != .echo_request) return;
+    var views: ViewStack = .{};
+    views.setView(.ethernet, &ethernet);
+    views.setView(.ipv4, &header);
+    views.setView(.icmpv4, &icmp);
+    try reply(frame, device, iface, &views);
+}
+
+fn reply(buffer: []u8, device: NicApi, iface: IFace, views: *ViewStack) !void {
+    const ip_view = views.getView(.ipv4);
+    const icmpv4_view = views.getView(.icmpv4);
     const ethernet_view = views.getView(.ethernet);
     const sender_ip = ip_view.get(.src);
     const sender_class = classifyDestination(sender_ip);
     if (ethernet_view.get(.src_mac)[0] & 1 != 0 or
         sender_class == .broadcast or
         sender_class == .multicast or
-        sender_class == .drop)
-        return device.release(buffer);
+        sender_class == .drop) return;
 
     const frame_len = buffer.len - ethernet_view.get(.payload).len + ip_view.get(.total_length);
 
     ethernet_view.set(.dst_mac, ethernet_view.get(.src_mac));
     ethernet_view.set(.src_mac, device.macAddress(iface));
-    ip_view.setUpdateChecksum(.src, my_ip, views);
+    ip_view.setUpdateChecksum(.src, ip_view.get(.dst), views);
     ip_view.setUpdateChecksum(.dst, sender_ip, views);
     ip_view.setUpdateChecksum(.ttl, REPLY_TTL, views);
     icmpv4_view.setUpdateChecksum(.message_type, .echo_reply, views);
 
-    const tx_buffer = device.nextTxBuffer(iface);
-    errdefer device.release(tx_buffer);
+    const payload = ip_view.get(.payload);
+    const prefix = buffer[0 .. frame_len - payload.len];
+    const header_len = @as(usize, ip_view.get(.ihl)) * 4;
+    const max_chunk = (Ethernet.PAYLOAD_LEN_MAX - header_len) & ~@as(usize, 7);
+    const split = ip_view.get(.total_length) > Ethernet.PAYLOAD_LEN_MAX and !ip_view.get(.dont_fragment);
+    const options = ip_view.get(.options);
+    var scratch: [40]u8 = undefined;
+    const copied_options = scratch[0..options.len];
+    if (split) {
+        @memcpy(copied_options, options);
+        try keepCopiedOptions(copied_options);
+    }
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const len = if (split) @min(max_chunk, payload.len - offset) else payload.len;
+        if (split) {
+            if (offset == max_chunk) @memcpy(options, copied_options);
+            ip_view.set(.total_length, @intCast(header_len + len));
+            ip_view.set(.more_fragments, offset + len < payload.len);
+            ip_view.set(.fragment_offset, @intCast(offset / 8));
+            ip_view.set(.header_checksum, 0);
+            var checksum = ip_view.checksum();
+            checksum.addFields(.version, .options);
+            ip_view.set(.header_checksum, checksum.finish());
+        }
+        const tx_buffer = device.nextTxBuffer(iface);
+        errdefer device.release(tx_buffer);
+        var writer: std.Io.Writer = .fixed(tx_buffer);
+        try writer.writeAll(prefix);
+        try writer.writeAll(payload[offset..][0..len]);
+        device.transmit(tx_buffer[0..writer.end]);
+        offset += len;
+    }
+}
 
-    var writer: std.Io.Writer = .fixed(tx_buffer);
-    try writer.writeAll(buffer[0..frame_len]);
-    device.transmit(tx_buffer[0..writer.end]);
-    device.release(buffer);
+// Preserve option alignment while removing first-fragment-only options.
+fn keepCopiedOptions(options: []u8) !void {
+    var i: usize = 0;
+    while (i < options.len) {
+        const kind = options[i];
+        if (kind == 0) break;
+        if (kind == 1) {
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= options.len) return error.InvalidField;
+        const len = options[i + 1];
+        if (len < 2 or i + len > options.len) return error.InvalidField;
+        if (kind & 0x80 == 0) @memset(options[i..][0..len], 1);
+        i += len;
+    }
 }
 
 const test_request = [_]u8{ 0x08, 0x00, 0x21, 0x68, 0x12, 0x34, 0x00, 0x01, 'a', 'b', 'c' };

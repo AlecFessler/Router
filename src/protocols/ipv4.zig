@@ -133,6 +133,32 @@ pub fn handle(
     const protocol = view.get(.protocol);
     const offset = view.get(.fragment_offset);
 
+    const table = if (iface == .lan) lan_fragment_table else wan_fragment_table;
+    const key = IPv4FragmentTable.Key.from(view);
+    const local_icmp = protocol == .icmp and switch (iface) {
+        .lan => view.fieldCmp(.dst, .{ .eq = lan_ip.* }),
+        .wan => if (wan_lease.*) |lease| view.fieldCmp(.dst, .{ .eq = lease.ip }) else false,
+    };
+    if (local_icmp and (offset != 0 or view.get(.more_fragments))) {
+        const echo_candidate = if (offset == 0)
+            view.get(.payload)[0] == @intFromEnum(ICMPv4.MessageType.echo_request)
+        else
+            iface == .lan or table.get(key) == null;
+        if (echo_candidate) {
+            // An early WAN tail may also belong to NAT. Once the head identifies a
+            // local request, release the NIC buffers held for that possibility.
+            if (iface == .wan and offset == 0) table.removeEntry(key, device);
+            const reassembly = &Router.State.reassembly_tables[@intFromEnum(iface)];
+            switch (try reassembly.append(buffer, views.getView(.ethernet).*, view)) {
+                .complete => |frame| {
+                    try Router.Protocols.ICMPv4Messages.Echo.replyReassembled(frame, device, iface);
+                    return device.release(buffer);
+                },
+                .assembling => |pending| if (iface == .lan or pending.has_first) return device.release(buffer),
+            }
+        }
+    }
+
     if (offset != 0) {
         if (view.get(.ttl) <= 1) return device.release(buffer);
 
@@ -146,18 +172,11 @@ pub fn handle(
         };
         if (!should_forward) return device.release(buffer);
 
-        const table = switch (iface) {
-            .lan => lan_fragment_table,
-            .wan => wan_fragment_table,
+        const pending = table.append(key, buffer, device) catch |err| {
+            if (local_icmp and err == error.FragmentBatchFull) return device.release(buffer);
+            return err;
         };
-        const key: IPv4FragmentTable.Key = .{
-            .src = view.get(.src),
-            .dst = view.get(.dst),
-            .identification = view.get(.identification),
-            .protocol = protocol,
-        };
-
-        switch (try table.append(key, buffer, device)) {
+        switch (pending) {
             .queued => return,
             .resolved => |translation| return forwardFragment(
                 buffer,
@@ -343,12 +362,7 @@ fn forwardFirstFragment(
         .lan => lan_fragment_table,
         .wan => wan_fragment_table,
     };
-    const key: IPv4FragmentTable.Key = .{
-        .src = ip_view.get(.src),
-        .dst = ip_view.get(.dst),
-        .identification = ip_view.get(.identification),
-        .protocol = ip_view.get(.protocol),
-    };
+    const key = IPv4FragmentTable.Key.from(ip_view.*);
 
     const payload_len = ip_view.get(.payload).len;
     const translation = if (table.get(key)) |existing| blk: {

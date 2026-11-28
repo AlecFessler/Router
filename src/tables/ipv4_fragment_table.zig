@@ -14,6 +14,15 @@ pub const IPv4FragmentTable = struct {
         dst: IPv4,
         identification: u16,
         protocol: Protocol,
+
+        pub fn from(ip: Router.Protocols.IPv4.IPv4PacketView) Key {
+            return .{
+                .src = ip.get(.src),
+                .dst = ip.get(.dst),
+                .identification = ip.get(.identification),
+                .protocol = ip.get(.protocol),
+            };
+        }
     };
 
     pub const Translation = struct {
@@ -140,7 +149,7 @@ pub const IPv4FragmentTable = struct {
         return identification;
     }
 
-    fn removeEntry(self: *IPv4FragmentTable, key: Key, device: NicApi) void {
+    pub fn removeEntry(self: *IPv4FragmentTable, key: Key, device: NicApi) void {
         const entry = self.table.get(key) orelse return;
         if (entry.state == .waiting) entry.state.waiting.release(device);
         _ = self.table.remove(key);

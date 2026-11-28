@@ -13,4 +13,5 @@ test {
     _ = @import("requirements_tests.zig");
     _ = @import("dhcpv4/reclaim_tests.zig");
     _ = @import("arp/defense_tests.zig");
+    _ = @import("ipv4/reassembly_tests.zig");
 }

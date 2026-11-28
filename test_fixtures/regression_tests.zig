@@ -215,6 +215,7 @@ pub const Harness = struct {
         nat: bool = false,
         lan_fragments: bool = false,
         wan_fragments: bool = false,
+        reassembly_tables: usize = 0,
     } = .{},
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, options: Options) !Harness {
@@ -272,6 +273,10 @@ pub const Harness = struct {
             options.fragment_timeout,
         );
         self.ready.wan_fragments = true;
+        for (&State.reassembly_tables) |*table| {
+            table.* = try .init(alloc, io, 16, .fromSeconds(60));
+            self.ready.reassembly_tables += 1;
+        }
 
         return self;
     }
@@ -284,6 +289,8 @@ pub const Harness = struct {
             State.arp_waiters_table.deinit(self.alloc);
             self.ready.waiters = false;
         }
+        for (State.reassembly_tables[0..self.ready.reassembly_tables]) |*table| table.deinit(self.alloc);
+        self.ready.reassembly_tables = 0;
         if (self.ready.lan_fragments) {
             State.lan_fragment_table.deinit(self.alloc, self.nic.api());
             self.ready.lan_fragments = false;

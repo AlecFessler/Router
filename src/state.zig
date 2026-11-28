@@ -20,6 +20,7 @@ pub var arp_waiters_table: ArpWaitersTable = undefined;
 
 pub var lan_fragment_table: IPv4FragmentTable = undefined;
 pub var wan_fragment_table: IPv4FragmentTable = undefined;
+pub var reassembly_tables: [2]Router.Tables.ReassemblyTable.ReassemblyTable = undefined;
 
 pub var wan_lease: ?DHCPv4Lease = null;
 pub var wan_transaction: ?WanTransaction = null;

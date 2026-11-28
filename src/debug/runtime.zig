@@ -57,9 +57,15 @@ pub fn setup(alloc: std.mem.Allocator, io: std.Io, nic: Router.Nic.Api.Api, lan_
     errdefer State.lan_fragment_table.deinit(alloc, nic);
 
     State.wan_fragment_table = try IPv4FragmentTable.init(alloc, io, FRAGMENT_CAPACITY, FRAGMENT_TIMEOUT);
+    errdefer State.wan_fragment_table.deinit(alloc, nic);
+
+    State.reassembly_tables[0] = try .init(alloc, io, 16, .fromSeconds(60));
+    errdefer State.reassembly_tables[0].deinit(alloc);
+    State.reassembly_tables[1] = try .init(alloc, io, 16, .fromSeconds(60));
 }
 
 pub fn teardown(alloc: std.mem.Allocator, nic: Router.Nic.Api.Api) void {
+    for (&State.reassembly_tables) |*table| table.deinit(alloc);
     State.wan_fragment_table.deinit(alloc, nic);
     State.lan_fragment_table.deinit(alloc, nic);
     State.arp_waiters_table.expireAll(nic);
