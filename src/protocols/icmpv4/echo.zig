@@ -12,7 +12,6 @@ const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
 const TestUtils = Router.TestFixtures.Utils;
-const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
 
@@ -24,8 +23,6 @@ const wan_lease = &Router.State.wan_lease;
 
 const NAT_TIMEOUT = std.Io.Duration.fromSeconds(60);
 const REPLY_TTL: u8 = 64;
-
-var port_allocator: PortAllocator = .{};
 
 pub const EchoMsg = struct {
     identifier: u16,
@@ -82,7 +79,7 @@ pub fn handle(
             views,
             &view,
             .{ .lan = .identifier, .wan = .identifier },
-            &port_allocator,
+            &Router.State.nat_table.icmp_ports,
             NAT_TIMEOUT,
         );
     }

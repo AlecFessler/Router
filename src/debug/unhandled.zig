@@ -9,6 +9,7 @@ pub const Sink = struct {
     dir: std.Io.Dir,
     file: ?std.Io.File = null,
     size: usize = 0,
+    mutex: std.Io.Mutex = .init,
     failed: bool = false,
 
     pub fn open(io: std.Io, path: []const u8) !Sink {
@@ -40,18 +41,36 @@ pub const Sink = struct {
 };
 
 pub var sink: ?*Sink = null;
-pub var packet_id: ?u64 = null;
-pub var seen: bool = false;
+pub threadlocal var packet_id: ?u64 = null;
+pub threadlocal var seen: bool = false;
+
+pub const Observation = struct {
+    count: usize = 0,
+    line: [256]u8 = undefined,
+    len: usize = 0,
+};
+pub threadlocal var observation: ?*Observation = null;
+
+fn warn(comptime format: []const u8, args: anytype) void {
+    if (comptime @import("builtin").is_test or @hasDecl(@import("root"), "trace_router_handlers")) {
+        if (observation) |report_line| {
+            report_line.count += 1;
+            const line = std.fmt.bufPrint(&report_line.line, format, args) catch report_line.line[0..0];
+            report_line.len = line.len;
+            return;
+        }
+    }
+    log.warn(format, args);
+}
 
 pub fn report(iface: IFace, comptime format: []const u8, args: anytype) void {
     seen = true;
     if (packet_id) |id| {
-        log.warn("packet={} ingress={s} " ++ format, .{ id, @tagName(iface) } ++ args);
+        warn("packet={} ingress={s} " ++ format, .{ id, @tagName(iface) } ++ args);
     } else {
-        log.warn("ingress={s} " ++ format, .{@tagName(iface)} ++ args);
+        warn("ingress={s} " ++ format, .{@tagName(iface)} ++ args);
     }
     if (sink) |output| {
-        if (output.failed) return;
         const now = std.Io.Timestamp.now(output.io, .real).toMilliseconds();
         var buffer: [1024]u8 = undefined;
         const line = std.fmt.bufPrint(
@@ -59,6 +78,9 @@ pub fn report(iface: IFace, comptime format: []const u8, args: anytype) void {
             "unix_ms={} packet={?d} ingress={s} " ++ format ++ "\n",
             .{ now, packet_id, @tagName(iface) } ++ args,
         ) catch unreachable;
+        output.mutex.lockUncancelable(output.io);
+        defer output.mutex.unlock(output.io);
+        if (output.failed) return;
         output.write(line) catch |err| {
             output.failed = true;
             log.err("file write failed: {t}", .{err});

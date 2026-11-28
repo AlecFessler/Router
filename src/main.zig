@@ -1,6 +1,6 @@
 const std = @import("std");
 const Router = @import("router");
-const Runtime = @import("debug/runtime.zig");
+const Runtime = Router.Debug.Runtime;
 
 const Ethernet = Router.Protocols.Ethernet;
 const ICMPv4Fixtures = Router.TestFixtures.ICMPv4;

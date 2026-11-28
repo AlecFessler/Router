@@ -650,8 +650,10 @@ pub const Packets = struct {
         try appendU16(&list, alloc, 0); // checksum placeholder
         try appendBytes(&list, alloc, opts.payload);
 
-        const checksum = opts.checksum orelse
-            transportChecksum(src, dst, 17, length, list.items);
+        const checksum = opts.checksum orelse value: {
+            const sum = transportChecksum(src, dst, 17, length, list.items);
+            break :value if (sum == 0) 0xffff else sum;
+        };
         writeU16At(list.items, 6, checksum);
         return list.toOwnedSlice(alloc);
     }
@@ -3443,4 +3445,15 @@ test "readiness from cold start negotiates WAN and LAN leases and resolves gatew
     try std.testing.expectEqual(outside, ip.get(.src));
     try std.testing.expectEqual(peer, ip.get(.dst));
     _ = try Router.Protocols.Udp.parse(ip.get(.payload), ip);
+}
+
+test "synthetic UDP encodes a computed zero checksum as all ones" {
+    const ip = [_]u8{0} ** 4;
+    const bytes = try Packets.udp(std.testing.allocator, ip, ip, .{
+        .src_port = 1,
+        .dst_port = 1,
+        .payload = &.{ 0xff, 0xd8 },
+    });
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(u16, 0xffff), std.mem.readInt(u16, bytes[6..8], .big));
 }

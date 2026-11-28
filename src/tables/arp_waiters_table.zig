@@ -56,36 +56,29 @@ pub const ArpWaitersTable = struct {
         self.table.deinit(alloc);
     }
 
-    fn expireLocked(
-        self: *ArpWaitersTable,
-        now: std.Io.Timestamp,
-        device: NicApi,
-    ) void {
+    pub fn expire(self: *ArpWaitersTable, device: NicApi) void {
+        const now = std.Io.Timestamp.now(self.io, .boot);
+        self.mutex.lockUncancelable(self.io);
         var i: usize = 0;
         while (i < self.table.count()) {
-            const entry = &self.table.values()[i];
+            const entry = self.table.values()[i];
             if (entry.deadline.durationTo(now).toNanoseconds() < 0) {
                 i += 1;
                 continue;
             }
-            entry.release(device);
             self.table.swapRemoveAt(i);
+            self.mutex.unlock(self.io);
+            entry.release(device);
+            self.mutex.lockUncancelable(self.io);
+            i = 0; // Another worker may have moved a neighbor while the lock was released.
         }
+        self.mutex.unlock(self.io);
     }
 
-    pub fn expire(self: *ArpWaitersTable, device: NicApi) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.expireLocked(std.Io.Timestamp.now(self.io, .boot), device);
-    }
-
+    /// Both interface workers have stopped at teardown.
     pub fn expireAll(self: *ArpWaitersTable, device: NicApi) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        while (self.table.count() > 0) {
-            self.table.values()[self.table.count() - 1].release(device);
-            self.table.swapRemoveAt(self.table.count() - 1);
-        }
+        for (self.table.values()) |*entry| entry.release(device);
+        self.table.clearRetainingCapacity();
     }
 
     pub fn appendIfPending(self: *ArpWaitersTable, key: Key, buffer: []u8) !bool {
@@ -104,17 +97,20 @@ pub const ArpWaitersTable = struct {
         self: *ArpWaitersTable,
         key: Key,
         buffer: []u8,
-        device: NicApi,
+        expired: *?Entry,
     ) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const now = std.Io.Timestamp.now(self.io, .boot);
-        self.expireLocked(now, device);
 
         if (self.table.getPtr(key)) |entry| {
-            try entry.append(buffer);
-            return false;
+            if (entry.deadline.durationTo(now).toNanoseconds() < 0) {
+                try entry.append(buffer);
+                return false;
+            }
+            expired.* = entry.*;
+            _ = self.table.swapRemove(key);
         }
 
         if (self.table.count() == self.capacity) return error.ArpWaitersTableFull;
@@ -128,25 +124,10 @@ pub const ArpWaitersTable = struct {
         return true;
     }
 
-    pub fn get(
-        self: *ArpWaitersTable,
-        key: Key,
-        device: NicApi,
-    ) ?Entry {
-        const pending = blk: {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-
-            const removed = self.table.fetchSwapRemove(key) orelse return null;
-            break :blk removed.value;
-        };
-
-        const now = std.Io.Timestamp.now(self.io, .boot);
-        if (pending.deadline.durationTo(now).toNanoseconds() >= 0) {
-            pending.release(device);
-            return null;
-        }
-
-        return pending;
+    pub fn take(self: *ArpWaitersTable, key: Key) ?Entry {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const removed = self.table.fetchSwapRemove(key) orelse return null;
+        return removed.value;
     }
 };

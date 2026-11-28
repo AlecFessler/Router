@@ -4,7 +4,7 @@ const Router = @import("router");
 const IPv4 = Router.Protocols.IPv4.IPv4;
 const Protocol = Router.Protocols.IPv4.Protocol;
 
-// Each protocol that accesses the NAT table needs to initialize its own Port Allocator
+// TCP, UDP and ICMP identifiers have independent allocation spaces.
 pub const PortAllocator = struct {
     const PortSet = std.StaticBitSet(1 << 16);
 
@@ -115,6 +115,10 @@ pub const NatTable = struct {
     next_generation: u64 = 0,
     inside: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
     outside: std.AutoHashMapUnmanaged(Key, Key) = .empty,
+    mutex: std.Io.Mutex = .init,
+    tcp_ports: PortAllocator = .{},
+    udp_ports: PortAllocator = .{},
+    icmp_ports: PortAllocator = .{},
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, capacity: u32) !NatTable {
         var table: NatTable = .{
@@ -139,7 +143,20 @@ pub const NatTable = struct {
         return deadline.durationTo(now).toNanoseconds() >= 0;
     }
 
+    pub fn mapOutbound(self: *NatTable, ports: *PortAllocator, key: Key, outside_ip: IPv4, duration: std.Io.Duration, peer: Peer) !Entry {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = if (self.outboundEntryLocked(key, outside_ip)) |existing| hit: {
+            self.inside.getPtr(key).?.deadline = std.Io.Timestamp.now(self.io, .boot).addDuration(duration);
+            break :hit existing;
+        } else try self.insert(ports, key, outside_ip, duration);
+        self.appendPeer(key, peer);
+        return entry;
+    }
+
     pub fn inboundEntry(self: *NatTable, key: Key) ?struct { Key, Entry } {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const inside_key = self.outside.get(key) orelse return null;
         const entry = self.inside.get(inside_key) orelse unreachable;
         const now = std.Io.Timestamp.now(self.io, .boot);
@@ -160,6 +177,12 @@ pub const NatTable = struct {
     }
 
     pub fn outboundEntry(self: *NatTable, key: Key, outside_ip: IPv4) ?Entry {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.outboundEntryLocked(key, outside_ip);
+    }
+
+    fn outboundEntryLocked(self: *NatTable, key: Key, outside_ip: IPv4) ?Entry {
         const entry = self.inside.get(key) orelse return null;
         const now = std.Io.Timestamp.now(self.io, .boot);
         if (!std.mem.eql(u8, &entry.outside.ip, &outside_ip) or isExpired(entry.deadline, now)) {
@@ -169,7 +192,7 @@ pub const NatTable = struct {
         return entry;
     }
 
-    pub fn insert(
+    fn insert(
         self: *NatTable,
         port_allocator: *PortAllocator,
         key: Key,
@@ -228,21 +251,7 @@ pub const NatTable = struct {
         return entry;
     }
 
-    pub fn refresh(
-        self: *NatTable,
-        key: Key,
-        duration: std.Io.Duration,
-    ) !void {
-        const now = std.Io.Timestamp.now(self.io, .boot);
-        const entry = self.inside.getPtr(key) orelse return error.NotFound;
-        if (isExpired(entry.deadline, now)) {
-            self.remove(key);
-            return error.NotFound;
-        }
-        entry.deadline = now.addDuration(duration);
-    }
-
-    pub fn appendPeer(self: *NatTable, key: Key, peer: Peer) void {
+    fn appendPeer(self: *NatTable, key: Key, peer: Peer) void {
         const entry = self.inside.getPtr(key) orelse return;
         const count = @as(usize, entry.peer_count);
         for (entry.peers[0..count]) |candidate| {
@@ -258,19 +267,16 @@ pub const NatTable = struct {
     }
 
     pub fn removeAllForInsideIp(self: *NatTable, ip: IPv4) void {
-        while (true) {
-            var victim: ?Key = null;
-            for (self.inside.keys()) |key| {
-                if (!std.meta.eql(key.ip, ip)) continue;
-                victim = key;
-                break;
-            }
-            const key = victim orelse return;
-            self.remove(key);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var index: usize = 0;
+        while (index < self.inside.count()) {
+            const key = self.inside.keys()[index];
+            if (std.meta.eql(key.ip, ip)) self.remove(key) else index += 1;
         }
     }
 
-    pub fn remove(self: *NatTable, key: Key) void {
+    fn remove(self: *NatTable, key: Key) void {
         const removed = self.inside.fetchSwapRemove(key) orelse return;
         const reverse_removed = self.outside.remove(removed.value.outside);
         std.debug.assert(reverse_removed);
@@ -297,14 +303,13 @@ test "NAT mappings resolve in both directions, refresh, and release their port" 
     try std.testing.expectEqualDeep(inside.ip, inbound.ip);
     try std.testing.expectEqual(inside.port, inbound.port);
 
-    try table.refresh(inside, .fromSeconds(120));
+    _ = try table.mapOutbound(&port_allocator, inside, outside_ip, .fromSeconds(120), .{ .ip = .{ 8, 8, 8, 8 }, .port = 443 });
     try std.testing.expect(table.inside.get(inside).?.deadline.toNanoseconds() > entry.deadline.toNanoseconds());
 
     table.remove(inside);
     try std.testing.expect(!port_allocator.used.isSet(entry.outside.port));
     try std.testing.expect(table.outboundLookup(inside, outside_ip) == null);
     try std.testing.expect(table.inboundEntry(entry.outside) == null);
-    try std.testing.expectError(error.NotFound, table.refresh(inside, .fromSeconds(60)));
 }
 
 test "NAT outbound lookup removes mappings for the old WAN IP" {

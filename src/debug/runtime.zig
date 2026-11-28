@@ -18,6 +18,7 @@ const FRAGMENT_TIMEOUT = std.Io.Duration.fromSeconds(30);
 const NAT_CAPACITY: u32 = 16_384;
 
 pub fn setup(alloc: std.mem.Allocator, io: std.Io, nic: Router.Nic.Api.Api, lan_ip: [4]u8, lan_mask: [4]u8) !void {
+    State.io = io;
     State.lan_ip = lan_ip;
     State.lan_subnet_mask = lan_mask;
     State.wan_lease = null;

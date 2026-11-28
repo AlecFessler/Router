@@ -31,6 +31,7 @@ pub const EntryPoint = enum {
     ethernet,
     arp,
     dhcpv4,
+    dns,
     icmpv4,
     echo,
     destination_unreachable,
@@ -355,8 +356,12 @@ fn shouldPause(entrypoint: EntryPoint, ptr: usize) bool {
 }
 
 pub var enabled = true;
+pub threadlocal var visited: ?*std.EnumSet(EntryPoint) = null;
 
 pub fn enter(entrypoint: EntryPoint, data: anytype) void {
+    if (comptime builtin.is_test or @hasDecl(@import("root"), "trace_router_handlers")) {
+        if (visited) |set| set.insert(entrypoint);
+    }
     if (builtin.is_test or builtin.mode != .Debug or !enabled) return;
     const ptr = dataPointer(data);
     if (entrypoint == .rx) {

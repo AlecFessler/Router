@@ -7,6 +7,8 @@ pub const Tables = @import("tables/tables.zig");
 pub const TestFixtures = @import("test_fixtures");
 
 test {
+    _ = Debug.NetworkSimulation;
+    _ = @import("debug/campaign.zig");
     _ = Meta.Checksum;
     _ = Meta.View;
     _ = Protocols.Arp;

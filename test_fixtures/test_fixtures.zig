@@ -1,3 +1,4 @@
+pub const Synthetic = @import("regression_tests.zig");
 pub const Arp = @import("arp/arp.zig");
 pub const DHCPv4 = @import("dhcpv4/dhcpv4.zig");
 pub const Ethernet = @import("ethernet/ethernet.zig");
@@ -11,6 +12,7 @@ pub const Utils = @import("utils.zig");
 test {
     _ = @import("regression_tests.zig");
     _ = @import("requirements_tests.zig");
+    _ = @import("network_sim_tests.zig");
     _ = @import("dhcpv4/reclaim_tests.zig");
     _ = @import("arp/defense_tests.zig");
     _ = @import("ipv4/reassembly_tests.zig");

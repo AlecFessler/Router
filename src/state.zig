@@ -1,3 +1,4 @@
+const std = @import("std");
 const Router = @import("router");
 
 const ArpTable = Router.Tables.ArpTable.ArpTable;
@@ -23,6 +24,21 @@ pub var wan_fragment_table: IPv4FragmentTable = undefined;
 pub var reassembly_tables: [2]Router.Tables.ReassemblyTable.ReassemblyTable = undefined;
 
 pub var wan_lease: ?DHCPv4Lease = null;
+pub var io: std.Io = if (@import("builtin").is_test) std.testing.io else undefined;
+var lease_mutex: std.Io.Mutex = .init;
+
+pub fn wanLease() ?DHCPv4Lease {
+    lease_mutex.lockUncancelable(io);
+    defer lease_mutex.unlock(io);
+    return wan_lease;
+}
+
+pub fn setWanLease(lease: ?DHCPv4Lease) void {
+    lease_mutex.lockUncancelable(io);
+    defer lease_mutex.unlock(io);
+    wan_lease = lease;
+}
+
 pub var wan_transaction: ?WanTransaction = null;
 
 pub var lan_ip: IPv4 = undefined;

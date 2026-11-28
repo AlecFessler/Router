@@ -499,7 +499,7 @@ pub fn handle(
                         return device.release(buffer);
 
                     if (wan_lease.* == null) wan_arp_table.defend_after = .zero;
-                    wan_lease.* = .{
+                    Router.State.setWanLease(.{
                         .ip = offered_ip,
                         .subnet_mask = mask,
                         .router = gateway,
@@ -507,12 +507,12 @@ pub fn handle(
                         .renewal_deadline = sent_at.addDuration(t1),
                         .rebinding_deadline = sent_at.addDuration(t2),
                         .expiration_deadline = sent_at.addDuration(lifetime),
-                    };
+                    });
                     wan_transaction.* = null;
                 },
                 .nak => {
                     if (request_sent_at == null) return device.release(buffer);
-                    wan_lease.* = null;
+                    Router.State.setWanLease(null);
                     wan_transaction.* = null;
                 },
                 .offer => {
@@ -537,7 +537,7 @@ pub fn handle(
 
 pub fn declineWan(device: NicApi, tags: []u8) !void {
     const lease = wan_lease.*.?;
-    wan_lease.* = null;
+    Router.State.setWanLease(null);
     wan_transaction.* = null;
     if (std.meta.eql(lease.server_id, ZERO_IP)) return; // Shadow lease has no issuing server.
     var xid: u32 = undefined;
@@ -559,7 +559,7 @@ pub fn tickWan(io: std.Io, device: NicApi) !void {
 
     if (wan_lease.*) |lease| {
         if (now_ns >= lease.expiration_deadline.toNanoseconds()) {
-            wan_lease.* = null;
+            Router.State.setWanLease(null);
             wan_transaction.* = null;
         } else if (now_ns < lease.renewal_deadline.toNanoseconds()) {
             return;

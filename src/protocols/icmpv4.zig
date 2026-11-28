@@ -27,7 +27,6 @@ const parseQuoted = Router.Protocols.IPv4.parseQuoted;
 const updateChecksum = Router.Meta.Checksum.update;
 
 const nat_table = &Router.State.nat_table;
-const wan_lease = &Router.State.wan_lease;
 
 pub const MessageType = enum(u8) {
     echo_reply = 0,
@@ -108,7 +107,7 @@ pub fn forwardQuotedError(
     const outer = views.getView(.ipv4);
     if (outer.get(.ttl) <= 1) return device.release(buffer);
 
-    const lease = wan_lease.* orelse return device.release(buffer);
+    const lease = Router.State.wanLease() orelse return device.release(buffer);
     const icmp = views.getView(.icmpv4);
 
     var quote = try parseQuoted(quoted_packet);

@@ -11,7 +11,6 @@ const IPv4PacketView = Router.Protocols.IPv4.IPv4PacketView;
 const IPv4Protocol = Router.Protocols.IPv4;
 const NicApi = Router.Nic.Api.Api;
 const PcapParser = Router.TestFixtures.PcapParser;
-const PortAllocator = Router.Tables.NatTable.PortAllocator;
 const UdpFixtures = Router.TestFixtures.Udp;
 const View = Router.Meta.View.View;
 const ViewStack = Router.Protocols.ViewStack;
@@ -19,8 +18,6 @@ const ViewStack = Router.Protocols.ViewStack;
 const forwardNat = Router.Protocols.IPv4.forwardNat;
 
 const UDP_NAT_TIMEOUT = std.Io.Duration.fromSeconds(300);
-
-var port_allocator: PortAllocator = .{};
 
 pub const UdpPacket = struct {
     src_port: u16,
@@ -81,7 +78,7 @@ pub fn handle(
     }
 
     if (Dns.isLanEndpoint(iface, ip_view.get(.dst), view.get(.dst_port)))
-        return Dns.handle(buffer, device, views, &view, &port_allocator, UDP_NAT_TIMEOUT);
+        return Dns.handle(buffer, device, views, &view, &Router.State.nat_table.udp_ports, UDP_NAT_TIMEOUT);
 
     return forwardNat(
         buffer,
@@ -90,7 +87,7 @@ pub fn handle(
         views,
         &view,
         .{ .lan = .src_port, .wan = .dst_port },
-        &port_allocator,
+        &Router.State.nat_table.udp_ports,
         UDP_NAT_TIMEOUT,
     );
 }

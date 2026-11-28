@@ -30,6 +30,7 @@ pub fn handle(
     allocator: *Router.Tables.NatTable.PortAllocator,
     timeout: std.Io.Duration,
 ) !void {
+    Router.Debug.Cli.enter(.dns, transport.*);
     return IP.forwardNat(
         buffer,
         device,

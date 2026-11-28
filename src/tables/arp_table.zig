@@ -14,6 +14,7 @@ pub const ArpTable = struct {
     pub const Table = std.MultiArrayList(Entry);
 
     io: std.Io,
+    mutex: std.Io.Mutex = .init,
     table: Table,
     ttl: std.Io.Duration,
     defend_after: std.Io.Timestamp = .zero,
@@ -56,6 +57,12 @@ pub const ArpTable = struct {
     }
 
     pub fn lookup(self: *ArpTable, ip: IPv4) ?Mac {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.lookupLocked(ip);
+    }
+
+    pub fn lookupLocked(self: *ArpTable, ip: IPv4) ?Mac {
         const index = self.indexOfValue(.ip, ip) orelse return null;
         const timestamp = self.table.items(.timestamp)[index];
         const age = timestamp.untilNow(self.io, .boot);
@@ -68,10 +75,18 @@ pub const ArpTable = struct {
     }
 
     pub fn remove(self: *ArpTable, ip: IPv4) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.indexOfValue(.ip, ip)) |index| self.table.swapRemove(index);
     }
 
     pub fn cache(self: *ArpTable, ip: IPv4, mac: Mac) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.cacheLocked(ip, mac);
+    }
+
+    pub fn cacheLocked(self: *ArpTable, ip: IPv4, mac: Mac) void {
         const entry: Entry = .{
             .ip = ip,
             .mac = mac,

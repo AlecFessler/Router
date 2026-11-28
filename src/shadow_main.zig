@@ -5,7 +5,7 @@
 //! F/R/X/U/E/N: id:u64, size:u16, bytes (forward/reply/release/unhandled/error/NAT port).
 const std = @import("std");
 const Router = @import("router");
-const Runtime = @import("debug/runtime.zig");
+const Runtime = Router.Debug.Runtime;
 
 const Mock = Router.Nic.Shadow.Mock;
 const IFace = Router.Nic.Api.IFace;

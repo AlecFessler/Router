@@ -137,7 +137,7 @@ pub fn handle(
     const key = IPv4FragmentTable.Key.from(view);
     const local_icmp = protocol == .icmp and switch (iface) {
         .lan => view.fieldCmp(.dst, .{ .eq = lan_ip.* }),
-        .wan => if (wan_lease.*) |lease| view.fieldCmp(.dst, .{ .eq = lease.ip }) else false,
+        .wan => if (Router.State.wanLease()) |lease| view.fieldCmp(.dst, .{ .eq = lease.ip }) else false,
     };
     if (local_icmp and (offset != 0 or view.get(.more_fragments))) {
         const echo_candidate = if (offset == 0)
@@ -162,7 +162,7 @@ pub fn handle(
     if (offset != 0) {
         if (view.get(.ttl) <= 1) return device.release(buffer);
 
-        const lease = wan_lease.* orelse return device.release(buffer);
+        const lease = Router.State.wanLease() orelse return device.release(buffer);
         const should_forward = switch (iface) {
             .lan => classifyDestination(view.get(.dst)) == .wan or
                 ((protocol == .udp or protocol == .tcp) and view.fieldCmp(.dst, .{ .eq = lan_ip.* }) and
@@ -228,7 +228,7 @@ pub fn forwardNat(
     const ip_view = views.getView(.ipv4);
     const first_fragment = ip_view.get(.more_fragments);
 
-    const lease = wan_lease.* orelse return device.release(buffer);
+    const lease = Router.State.wanLease() orelse return device.release(buffer);
 
     switch (iface) {
         .lan => {
@@ -249,17 +249,7 @@ pub fn forwardNat(
                 .service_peer = fields.service_peer,
             };
 
-            const mapping = if (nat_table.outboundEntry(key, lease.ip)) |existing| hit: {
-                try nat_table.refresh(key, timeout);
-                break :hit existing;
-            } else try nat_table.insert(
-                port_allocator,
-                key,
-                lease.ip,
-                timeout,
-            );
-
-            nat_table.appendPeer(key, .{
+            const mapping = try nat_table.mapOutbound(port_allocator, key, lease.ip, timeout, .{
                 .ip = destination,
                 .port = transport_view.get(fields.wan),
             });
@@ -420,7 +410,7 @@ pub fn forwardFragment(
 
     if (offset < translation.first_payload_len) return device.release(buffer);
 
-    const lease = wan_lease.* orelse return device.release(buffer);
+    const lease = Router.State.wanLease() orelse return device.release(buffer);
 
     const ip, const generation, const service_peer = switch (iface) {
         .lan => blk: {
@@ -523,7 +513,7 @@ pub fn classifyDestination(dst: IPv4) DstClass {
         return .drop;
 
     if (dst_bits == lan_bits) return .local;
-    if (wan_lease.*) |lease| {
+    if (Router.State.wanLease()) |lease| {
         const wan_bits: u32 = @bitCast(lease.ip);
         if (dst_bits == wan_bits) return .local;
     }

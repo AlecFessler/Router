@@ -164,10 +164,7 @@ pub fn handle(
                 const sender_mac = view.get(.sender_mac);
                 if (view.fieldCmp(.sender_ip, .{ .eq = IPv4{ 0, 0, 0, 0 } })) return;
                 if (!senderIsOnLink(iface, my_ip.?, sender_ip)) return;
-                if (table.lookup(sender_ip)) |existing| {
-                    if (!std.meta.eql(existing, sender_mac)) return;
-                }
-                table.cache(sender_ip, sender_mac);
+                learn(device, iface, table, sender_ip, sender_mac, false);
             } else {
                 device.release(buffer);
             }
@@ -180,23 +177,34 @@ pub fn handle(
                 const sender_ip = view.get(.sender_ip);
                 const mac = view.get(.sender_mac);
                 if (!senderIsOnLink(iface, my_ip.?, sender_ip)) return;
-                const pending = arp_waiters_table.get(
-                    .{ .iface = iface, .ip = sender_ip },
-                    device,
-                );
-
-                if (table.lookup(sender_ip)) |existing| {
-                    if (!std.meta.eql(existing, mac) and pending == null) return;
-                }
-
-                table.cache(sender_ip, mac);
-                const batch = pending orelse return;
-                for (batch.buffers[0..batch.len]) |queued_buffer| {
-                    queued_buffer[0..mac.len].* = mac;
-                    device.transmit(queued_buffer);
-                }
+                learn(device, iface, table, sender_ip, mac, true);
             }
         },
+    }
+}
+
+fn learn(device: NicApi, iface: IFace, table: *ArpTableModule.ArpTable, ip: IPv4, mac: Mac, reply_received: bool) void {
+    var expired: ?ArpWaitersTable.Entry = null;
+    defer if (expired) |*entry| entry.release(device);
+    const batch = blk: {
+        table.mutex.lockUncancelable(table.io);
+        defer table.mutex.unlock(table.io);
+        const changed = if (table.lookupLocked(ip)) |old| !std.meta.eql(old, mac) else false;
+        if (changed and !reply_received) return;
+        var pending = arp_waiters_table.take(.{ .iface = iface, .ip = ip });
+        if (pending) |entry| {
+            if (entry.deadline.untilNow(table.io, .boot).toNanoseconds() >= 0) {
+                expired = pending;
+                pending = null;
+            }
+        }
+        if (changed and pending == null) return;
+        table.cacheLocked(ip, mac);
+        break :blk pending orelse return;
+    };
+    for (batch.buffers[0..batch.len]) |buffer| {
+        buffer[0..mac.len].* = mac;
+        device.transmit(buffer);
     }
 }
 
@@ -210,11 +218,27 @@ pub fn queueForArpResolution(
 
     const sender_ip = switch (key.iface) {
         .lan => lan_ip.*,
-        .wan => if (wan_lease.*) |lease| lease.ip else return error.NoWanLease,
+        .wan => if (Router.State.wanLease()) |lease| lease.ip else return error.NoWanLease,
     };
     const tx_buffer = try requestFrame(device, key.iface, sender_ip, key.ip, &.{});
     errdefer device.release(tx_buffer);
-    const should_send_request = try arp_waiters_table.register(key, buffer, device);
+    const table = if (key.iface == .lan) lan_arp_table else wan_arp_table;
+    arp_waiters_table.expire(device);
+    var expired: ?ArpWaitersTable.Entry = null;
+    defer if (expired) |*entry| entry.release(device);
+    var should_send_request = false;
+    const mac = blk: {
+        table.mutex.lockUncancelable(table.io);
+        defer table.mutex.unlock(table.io);
+        if (table.lookupLocked(key.ip)) |mac| break :blk mac;
+        should_send_request = try arp_waiters_table.register(key, buffer, &expired);
+        break :blk @as(?Mac, null);
+    };
+    if (mac) |resolved| {
+        device.release(tx_buffer);
+        buffer[0..6].* = resolved;
+        return device.transmit(buffer);
+    }
     if (!should_send_request) return device.release(tx_buffer);
     device.transmit(tx_buffer);
 }
@@ -531,6 +555,8 @@ fn testHandle(
 }
 
 test "handle() replies to LAN requests and probes with the incoming VLAN tags" {
+    arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 8, .fromSeconds(2));
+    defer arp_waiters_table.deinit(std.testing.allocator);
     const my_ip: IPv4 = .{ 192, 168, 86, 1 };
     const peer_ip: IPv4 = .{ 192, 168, 86, 42 };
     const peer_mac: Mac = .{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
@@ -738,6 +764,8 @@ test "ARP reply forwards all queued frames for its neighbor" {
 }
 
 test "ARP pending frames are released on expiry and stay with the caller on request failure" {
+    lan_arp_table.* = try ArpTableModule.ArpTable.init(std.testing.allocator, std.testing.io, 1, .fromSeconds(60));
+    defer lan_arp_table.deinit(std.testing.allocator);
     lan_ip.* = .{ 192, 168, 86, 1 };
     lan_subnet_mask.* = .{ 255, 255, 255, 0 };
     const key: ArpWaitersTable.Key = .{ .iface = .lan, .ip = .{ 192, 168, 86, 42 } };
@@ -757,4 +785,23 @@ test "ARP pending frames are released on expiry and stay with the caller on requ
         try std.testing.expectEqual(@as(usize, 0), nic.forwarded_count);
         try std.testing.expectEqual(@as(usize, if (tx_capacity == 8) 1 else 0), nic.tx_releases);
     }
+}
+
+test "ARP queue rechecks a binding learned after the forwarding cache miss" {
+    const ip: IPv4 = .{ 192, 168, 86, 42 };
+    const mac: Mac = .{ 2, 0, 0, 0, 0, 42 };
+    lan_ip.* = .{ 192, 168, 86, 1 };
+    lan_arp_table.* = try ArpTableModule.ArpTable.init(std.testing.allocator, std.testing.io, 1, .fromSeconds(60));
+    defer lan_arp_table.deinit(std.testing.allocator);
+    arp_waiters_table.* = try ArpWaitersTable.init(std.testing.allocator, std.testing.io, 1, .fromSeconds(2));
+    defer arp_waiters_table.deinit(std.testing.allocator);
+
+    var nic: HandlerTestNic = .{};
+    try std.testing.expectEqual(null, lan_arp_table.lookup(ip));
+    lan_arp_table.cache(ip, mac);
+    const packet = nic.rx[0..60];
+    try queueForArpResolution(packet, nic.api(), .{ .iface = .lan, .ip = ip });
+    try std.testing.expectEqual(1, nic.forwarded_count);
+    try std.testing.expectEqual(mac, packet[0..6].*);
+    try std.testing.expectEqual(0, arp_waiters_table.table.count());
 }
