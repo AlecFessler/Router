@@ -46,12 +46,18 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("DHCPv4: {t}\n", .{err});
             };
         }
-        const packet = mock_nic.receive(iface) orelse break;
-        var views: ViewStack = .{};
-        Ethernet.handle(packet, mock_nic, iface, &views) catch |err| {
-            mock_nic.release(packet);
-            std.debug.print("Error: {}\n", .{err});
+        if (mock_nic.receive(iface)) |packet| {
+            var views: ViewStack = .{};
+            Ethernet.handle(packet, mock_nic, iface, &views) catch |err| {
+                mock_nic.release(packet);
+                std.debug.print("Error: {}\n", .{err});
+            };
+            std.debug.print("\n", .{});
+        } else if (iface != .lan or Router.State.dhcp_table.reclaim == null) {
+            break;
+        }
+        if (iface == .lan) Router.State.dhcp_table.tickReclaim(mock_nic) catch |err| {
+            std.log.scoped(.dhcp).warn("LAN address reclaim failed: {t}", .{err});
         };
-        std.debug.print("\n", .{});
     }
 }

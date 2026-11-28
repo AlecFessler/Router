@@ -36,29 +36,26 @@ pub const DhcpTable = struct {
     pub const Table = std.MultiArrayList(Entry);
     pub const IpPool = std.ArrayList(IPv4);
 
+    const initial_quarantine_seconds = 600;
+
     pub const ExcludedIp = struct {
         ip: IPv4,
         deadline: std.Io.Timestamp,
+        quarantine_seconds: i64 = initial_quarantine_seconds,
+        // null if the incoming VLAN stack could not be saved for probing.
+        vlan_tags: ?[]u8,
     };
 
-    /// RFC 2131 4.3.3 only requires a declined address to be marked
-    /// unavailable; it does not define for how long. Keep a short probation
-    /// instead of excluding forever, so one client cannot permanently burn
-    /// the pool by repeatedly declining its own leases.
-    ///
-    /// TODO: replace this fixed deadline with RFC 5227 Address Conflict
-    /// Detection when reclaiming:
-    ///   - broadcast an ARP Probe (sender IP 0.0.0.0) three times, 1-2 s
-    ///     apart, and only return the address to the pool if nobody answers;
-    ///   - if there is a conflict, extend the probation with backoff and log
-    ///     it;
-    ///   - rate-limit/cap DECLINEs per client and per MAC; otherwise a client
-    ///     can keep the pool in probation indefinitely by re-declining
-    ///     addresses as they expire;
-    ///   - only probe under pool pressure, not on every DISCOVER, to avoid
-    ///     turning declines into an ARP-probe amplifier.
-    const EXCLUDED_QUARANTINE: std.Io.Duration = .fromSeconds(600);
+    const Reclaim = struct {
+        // Exclusions are appended; only this sequence can remove its entry.
+        index: usize,
+        probes_sent: u2 = 0,
+    };
 
+    alloc: std.mem.Allocator,
+    reclaim: ?Reclaim = null,
+    probe_timer: std.Io.Group = .init,
+    probe_due: std.Io.Event = .unset,
     io: std.Io,
     table: Table,
     ip_pool: IpPool,
@@ -76,6 +73,7 @@ pub const DhcpTable = struct {
         errdefer excluded_ips.deinit(alloc);
         try excluded_ips.ensureTotalCapacity(alloc, ip_pool.items.len);
         return .{
+            .alloc = alloc,
             .io = io,
             .table = table,
             .ip_pool = ip_pool,
@@ -84,6 +82,10 @@ pub const DhcpTable = struct {
     }
 
     pub fn deinit(self: *DhcpTable, alloc: std.mem.Allocator) void {
+        self.probe_timer.cancel(self.io);
+        for (self.excluded_ips.items) |entry| {
+            if (entry.vlan_tags) |tags| alloc.free(tags);
+        }
         self.table.deinit(alloc);
         self.ip_pool.deinit(alloc);
         self.excluded_ips.deinit(alloc);
@@ -208,7 +210,6 @@ pub const DhcpTable = struct {
         preferred_ip: ?IPv4,
         offer_duration: std.Io.Duration,
     ) !?IPv4 {
-        self.reclaimExpiredExcluded();
         if (self.lookupByClient(client)) |index| {
             return self.table.items(.ip)[index];
         }
@@ -254,6 +255,7 @@ pub const DhcpTable = struct {
                 self.ip_pool.appendAssumeCapacity(ip);
                 break :pick ip;
             }
+            try self.startReclaim();
             return null;
         };
 
@@ -308,31 +310,79 @@ pub const DhcpTable = struct {
         client: Client,
         mac: Mac,
         ip: IPv4,
+        vlan_tags: []const u8,
     ) void {
-        const client_index = self.lookupByClient(client) orelse return;
-        if (!std.meta.eql(self.table.items(.mac)[client_index], mac)) return;
-        if (!std.meta.eql(self.table.items(.ip)[client_index], ip)) return;
+        if (!self.removeEntry(client, mac, ip)) return;
 
-        const deadline = std.Io.Timestamp.now(self.io, .boot)
-            .addDuration(EXCLUDED_QUARANTINE);
-        self.excluded_ips.appendAssumeCapacity(.{ .ip = ip, .deadline = deadline });
-        self.removeAtIndex(client_index);
+        const now = std.Io.Timestamp.now(self.io, .boot);
+        const tags = self.alloc.dupe(u8, vlan_tags) catch blk: {
+            std.log.scoped(.dhcp).warn("Keeping declined IP {any} excluded: could not save VLAN tags", .{ip});
+            break :blk null;
+        };
+        self.excluded_ips.appendAssumeCapacity(.{
+            .ip = ip,
+            .deadline = now.addDuration(.fromSeconds(initial_quarantine_seconds)),
+            .vlan_tags = tags,
+        });
     }
 
-    /// Return probation-expired addresses to the free pool. Called from
-    /// `offer`, which is the only path that can consume a freed address.
-    /// This is the low-cost placeholder for the ACD probing described on
-    /// EXCLUDED_QUARANTINE.
-    fn reclaimExpiredExcluded(self: *DhcpTable) void {
-        var i: usize = 0;
-        while (i < self.excluded_ips.items.len) {
-            if (!self.isExpired(self.excluded_ips.items[i].deadline)) {
-                i += 1;
-                continue;
-            }
-            const ip = self.excluded_ips.swapRemove(i).ip;
-            self.ip_pool.appendAssumeCapacity(ip);
+    fn probeDelay(self: *DhcpTable, min_ms: u32) std.Io.Duration {
+        const source: std.Random.IoSource = .{ .io = self.io };
+        return .fromMilliseconds(source.interface().intRangeAtMost(u32, min_ms, min_ms + 1000));
+    }
+
+    fn armProbeTimer(self: *DhcpTable, delay: std.Io.Duration) !void {
+        self.probe_due.reset();
+        const deadline = std.Io.Timestamp.now(self.io, .boot).addDuration(delay).withClock(.boot);
+        try self.probe_timer.concurrent(self.io, signalAt, .{ self.io, deadline, &self.probe_due });
+    }
+
+    fn signalAt(io: std.Io, deadline: std.Io.Clock.Timestamp, due: *std.Io.Event) std.Io.Cancelable!void {
+        try deadline.wait(io);
+        due.set(io);
+    }
+
+    fn startReclaim(self: *DhcpTable) !void {
+        if (self.reclaim != null) return;
+        for (self.excluded_ips.items, 0..) |entry, i| {
+            if (entry.vlan_tags == null or !self.isExpired(entry.deadline)) continue;
+            try self.armProbeTimer(self.probeDelay(0));
+            self.reclaim = .{ .index = i };
+            return;
         }
+    }
+
+    pub fn tickReclaim(self: *DhcpTable, device: Router.Nic.Api.Api) !void {
+        const probe = if (self.reclaim) |*p| p else return;
+        if (!self.probe_due.isSet()) return;
+        const entry = self.excluded_ips.items[probe.index];
+        if (probe.probes_sent == 3) {
+            _ = self.excluded_ips.swapRemove(probe.index);
+            self.alloc.free(entry.vlan_tags.?);
+            self.ip_pool.appendAssumeCapacity(entry.ip);
+            self.reclaim = null;
+            return;
+        }
+
+        errdefer self.reclaim = null;
+        device.transmit(try Router.Protocols.Arp.requestFrame(device, .lan, .{0} ** 4, entry.ip, entry.vlan_tags.?));
+        probe.probes_sent += 1;
+        const delay: std.Io.Duration = if (probe.probes_sent == 3) .fromSeconds(2) else self.probeDelay(1000);
+        try self.armProbeTimer(delay);
+    }
+
+    pub fn observeConflict(self: *DhcpTable, ip: IPv4, mac: Mac, vlan_tags: []const u8) void {
+        const probe = self.reclaim orelse return;
+        const entry = &self.excluded_ips.items[probe.index];
+        if (!std.meta.eql(entry.ip, ip)) return;
+        if (!Router.Protocols.Ethernet.sameVlan(entry.vlan_tags.?, vlan_tags)) return;
+        entry.quarantine_seconds = @min(2 * entry.quarantine_seconds, 3600);
+        entry.deadline = std.Io.Timestamp.now(self.io, .boot).addDuration(.fromSeconds(entry.quarantine_seconds));
+        self.probe_timer.cancel(self.io);
+        self.reclaim = null;
+        std.log.scoped(.dhcp).warn("ARP conflict for {d}.{d}.{d}.{d} from {x}; quarantining for {d}s", .{
+            ip[0], ip[1], ip[2], ip[3], &mac, entry.quarantine_seconds,
+        });
     }
 };
 
@@ -439,14 +489,16 @@ test "DHCP decline excludes an address and release makes another address reusabl
     const client_b: DhcpTable.Client = .{ .id = "client-b" };
 
     _ = try table.offer(client_a, test_mac, test_ip1, .fromSeconds(60));
-    table.decline(client_b, test_mac, test_ip1);
+    table.decline(client_b, test_mac, test_ip1, &.{});
     try std.testing.expectEqual(@as(usize, 0), table.excluded_ips.items.len);
     try std.testing.expectEqual(@as(usize, 1), table.table.len);
 
-    table.decline(client_a, test_mac, test_ip1);
+    table.decline(client_a, test_mac, test_ip1, &.{});
     try std.testing.expectEqual(@as(usize, 1), table.excluded_ips.items.len);
     try std.testing.expectEqual(test_ip1, table.excluded_ips.items[0].ip);
+    table.excluded_ips.items[0].deadline = .zero;
     try std.testing.expectEqual(test_ip2, try table.offer(client_b, test_mac, test_ip1, .fromSeconds(60)));
+    try std.testing.expect(table.reclaim == null);
     table.release(client_b, test_mac, test_ip2);
     try std.testing.expectEqual(@as(usize, 1), table.ip_pool.items.len);
     try std.testing.expectEqual(test_ip2, table.ip_pool.items[0]);
@@ -496,7 +548,7 @@ test "DHCP client identifier storage is bounded by the option length" {
     try std.testing.expect(table.lookupByClient(.{ .id = &max_id }) != null);
 }
 
-test "declined DHCP addresses are quarantined, not excluded forever" {
+test "pool pressure starts a probe only after the decline quarantine" {
     const alloc = std.testing.allocator;
     var table = try testTable(&.{test_ip1});
     defer table.deinit(alloc);
@@ -504,13 +556,13 @@ test "declined DHCP addresses are quarantined, not excluded forever" {
     const other: DhcpTable.Client = .{ .id = "next-client" };
 
     _ = try table.offer(client, test_mac, test_ip1, .fromSeconds(60));
-    table.decline(client, test_mac, test_ip1);
+    table.decline(client, test_mac, test_ip1, &.{});
     try std.testing.expectEqual(@as(usize, 1), table.excluded_ips.items.len);
 
-    // While the quarantine is live the address stays unavailable...
     try std.testing.expect((try table.offer(other, test_mac, null, .fromSeconds(60))) == null);
 
-    // ...but once it expires the address is reused instead of being lost forever.
+    try std.testing.expect(table.reclaim == null);
     table.excluded_ips.items[0].deadline = .fromNanoseconds(0);
-    try std.testing.expectEqual(test_ip1, try table.offer(other, test_mac, null, .fromSeconds(60)));
+    try std.testing.expect(try table.offer(other, test_mac, null, .fromSeconds(60)) == null);
+    try std.testing.expect(table.reclaim != null);
 }

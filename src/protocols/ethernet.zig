@@ -147,6 +147,25 @@ pub fn parseVlanTag(reader: *std.Io.Reader) !VlanTagView {
     return view;
 }
 
+fn nextVlan(tags: *[]const u8) ?u32 {
+    while (tags.len >= 4) {
+        const tag = std.mem.readInt(u32, tags.*[0..4], .big) & 0xffff_0fff;
+        tags.* = tags.*[4..];
+        if (tag & 0xfff != 0) return tag;
+    }
+    return null;
+}
+
+/// Compare parsed VLAN stacks by TPID and VID, ignoring priority-only tags.
+pub fn sameVlan(first: []const u8, second: []const u8) bool {
+    var a = first;
+    var b = second;
+    while (nextVlan(&a)) |tag| {
+        if (nextVlan(&b) != tag) return false;
+    }
+    return nextVlan(&b) == null;
+}
+
 pub fn handle(
     buffer: []u8,
     device: NicApi,

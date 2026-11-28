@@ -124,6 +124,9 @@ pub fn main(init: std.process.Init) !void {
             'T' => {},
             else => return error.InvalidCommand,
         }
+        State.dhcp_table.tickReclaim(nic) catch |err| {
+            std.log.scoped(.dhcp).warn("LAN address reclaim failed: {t}", .{err});
+        };
         if (mock.failed) return error.WriteFailed;
         if (log_sink.failed) return error.UnhandledLogWriteFailed;
         try output.interface.writeByte('D');

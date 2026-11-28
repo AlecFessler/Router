@@ -108,6 +108,16 @@ pub fn handle(
     if (view.get(.sender_mac)[0] & 1 != 0) return device.release(buffer);
     if (view.fieldCmp(.sender_mac, .{ .eq = my_mac })) return device.release(buffer);
 
+    if (iface == .lan) {
+        const sender = view.get(.sender_ip);
+        const is_probe = view.get(.opcode) == .request and std.meta.eql(sender, IPv4{ 0, 0, 0, 0 });
+        Router.State.dhcp_table.observeConflict(
+            if (is_probe) view.get(.target_ip) else sender,
+            view.get(.sender_mac),
+            ethernet_view.get(.vlan_tags),
+        );
+    }
+
     if (view.fieldCmp(.sender_ip, .{ .eq = my_ip.? })) {
         // TODO: defend this interface's IP against a conflicting MAC.
         // Queue at most one ARP announcement every 10 seconds.
@@ -189,28 +199,32 @@ pub fn queueForArpResolution(
         .lan => lan_ip.*,
         .wan => if (wan_lease.*) |lease| lease.ip else return error.NoWanLease,
     };
-    const sender_mac = device.macAddress(key.iface);
+    const tx_buffer = try requestFrame(device, key.iface, sender_ip, key.ip, &.{});
+    errdefer device.release(tx_buffer);
+    const should_send_request = try arp_waiters_table.register(key, buffer, device);
+    if (!should_send_request) return device.release(tx_buffer);
+    device.transmit(tx_buffer);
+}
 
-    const tx_buffer = device.nextTxBuffer(key.iface);
+pub fn requestFrame(device: NicApi, iface: IFace, sender_ip: IPv4, target_ip: IPv4, tags: []u8) ![]u8 {
+    const sender_mac = device.macAddress(iface);
+    const tx_buffer = device.nextTxBuffer(iface);
     errdefer device.release(tx_buffer);
     var writer: std.Io.Writer = .fixed(tx_buffer);
 
     try EthernetFrameView.serialize(.{
         .dst_mac = .{0xff} ** 6,
         .src_mac = sender_mac,
-        .vlan_tags = &.{},
+        .vlan_tags = tags,
         .ethertype = .arp,
         .payload = &.{},
     }, &writer);
     try ArpPacketView.serialize(
-        request(sender_ip, sender_mac, key.ip, null),
+        request(sender_ip, sender_mac, target_ip, null),
         &writer,
     );
 
-    const should_send_request = try arp_waiters_table.register(key, buffer, device);
-    if (!should_send_request) return device.release(tx_buffer);
-
-    device.transmit(tx_buffer[0..writer.end]);
+    return tx_buffer[0..writer.end];
 }
 
 pub fn reply(
@@ -495,6 +509,8 @@ fn testHandle(
     device: NicApi,
     iface: IFace,
 ) !void {
+    Router.State.dhcp_table = try Router.Tables.DhcpTable.DhcpTable.init(std.testing.allocator, std.testing.io, .empty);
+    defer Router.State.dhcp_table.deinit(std.testing.allocator);
     var parent_view = ethernet_view;
     var views: ViewStack = .{};
     views.setView(.ethernet, &parent_view);

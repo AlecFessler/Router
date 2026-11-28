@@ -396,7 +396,7 @@ pub fn handle(
             const reply: MessageType = switch (message_type) {
                 .decline => {
                     const ip = options.requested_ip_address orelse return device.release(buffer);
-                    dhcp_table.decline(client, sender_mac, ip);
+                    dhcp_table.decline(client, sender_mac, ip, views.getView(.ethernet).get(.vlan_tags));
                     if (dhcp_table.lookupByIp(ip) == null)
                         flushForwardingState(ip);
                     return device.release(buffer);

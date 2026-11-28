@@ -11,4 +11,5 @@ pub const Utils = @import("utils.zig");
 test {
     _ = @import("regression_tests.zig");
     _ = @import("requirements_tests.zig");
+    _ = @import("dhcpv4/reclaim_tests.zig");
 }

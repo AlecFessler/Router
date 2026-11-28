@@ -912,6 +912,7 @@ test "harness smoke: ICMP echo request to the LAN IP gets a LAN echo reply" {
 pub const DhcpClient = struct {
     pub const Opts = struct {
         message_type: u8,
+        vlan_tags: []const Packets.VlanTag = &.{},
         xid: u32 = 0x1122_3344,
         ciaddr: IPv4 = .{ 0, 0, 0, 0 },
         client_id: ?[]const u8 = null,
@@ -1007,6 +1008,7 @@ pub const DhcpClient = struct {
         return Packets.eth(alloc, .{
             .dst = .{0xff} ** 6,
             .src = mac,
+            .vlan_tags = opts.vlan_tags,
             .ethertype = 0x0800,
             .payload = ip_bytes,
         });
