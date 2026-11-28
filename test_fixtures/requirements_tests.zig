@@ -498,3 +498,76 @@ test "REQ-08 ICMP errors for gateway DNS quote the endpoint visible to the recip
         try std.testing.expectEqualSlices(u8, if (from_wan) query[0..8] else answer[0..8], quote.get(.payload));
     }
 }
+
+test "REQ-08 ICMP errors translate quoted echo identifiers in both directions without refreshing NAT" {
+    var h = try f.warm();
+    defer h.deinit();
+    const echo = try P.echo(alloc, .{ .identifier = 42, .sequence_number = 7, .data = "echo body outside the quote" });
+    defer alloc.free(echo);
+    try f.send(&h, .lan, .{ .src = f.client, .dst = f.peer, .protocol = 1, .payload = echo });
+    const outbound = try f.emitted(&h, 0, .wan);
+    const public_id = std.mem.readInt(u16, outbound.get(.payload)[4..6], .big);
+    try expect(public_id != 42);
+    const reply = try P.echo(alloc, .{
+        .message_type = 0,
+        .identifier = public_id,
+        .sequence_number = 7,
+        .data = "echo body outside the quote",
+    });
+    defer alloc.free(reply);
+    try f.send(&h, .wan, .{ .src = f.peer, .dst = f.public, .protocol = 1, .payload = reply });
+    _ = try f.emitted(&h, 1, .lan);
+
+    const key: R.Tables.NatTable.NatTable.Key = .{ .ip = f.client, .port = 42, .protocol = .icmp };
+    const entry = State.nat_table.inside.get(key).?;
+    const previous_mode = State.nat_filtering_mode;
+    defer State.nat_filtering_mode = previous_mode;
+    State.nat_filtering_mode = .endpoint_dependent;
+    for ([_]f.Iface{ .wan, .lan }, 0..) |ingress, i| {
+        const inbound = ingress == .wan;
+        const original = try f.Eth.parse(h.txAt(i).bytes);
+        var body = [_]u8{0} ** 32;
+        @memcpy(body[4..], original.get(.payload)[0..28]);
+        const message_type: u8 = if (inbound) 11 else 3;
+        const code: u8 = if (inbound) 0 else 1;
+        const message = try P.icmp(alloc, .{ .message_type = message_type, .code = code, .body = &body });
+        defer alloc.free(message);
+        try f.send(&h, ingress, .{
+            .src = if (inbound) f.gateway else f.client,
+            .dst = if (inbound) f.public else f.peer,
+            .protocol = 1,
+            .payload = message,
+        });
+        const output = try f.emitted(&h, 2 + i, if (inbound) .lan else .wan);
+        try eq(if (inbound) f.client else f.peer, output.get(.dst));
+        try eq(if (inbound) f.gateway else f.public, output.get(.src));
+        const error_msg = try R.Protocols.ICMPv4.parse(output.get(.payload));
+        try eq(message_type, @intFromEnum(error_msg.get(.message_type)));
+        try eq(code, error_msg.get(.code));
+        const quote = try f.IP.parseQuoted(error_msg.get(.payload)[4..]);
+        try eq(if (inbound) f.client else f.peer, quote.get(.src));
+        try eq(if (inbound) f.peer else f.public, quote.get(.dst));
+        try std.testing.expectEqualSlices(u8, if (inbound) echo[0..8] else reply[0..8], quote.get(.payload));
+    }
+    const unrelated = [4]u8{ 198, 51, 100, 99 };
+    for ([_]struct { id: u16, peer: [4]u8, kind: u8 }{
+        .{ .id = public_id + 1, .peer = f.peer, .kind = 8 },
+        .{ .id = public_id, .peer = unrelated, .kind = 8 },
+        .{ .id = public_id, .peer = f.peer, .kind = 0 },
+    }) |invalid| {
+        const quoted_echo = try P.echo(alloc, .{ .message_type = invalid.kind, .identifier = invalid.id });
+        defer alloc.free(quoted_echo);
+        const quoted_ip = try P.ipv4(alloc, .{ .src = f.public, .dst = invalid.peer, .protocol = 1, .payload = quoted_echo });
+        defer alloc.free(quoted_ip);
+        var body = [_]u8{0} ** 32;
+        @memcpy(body[4..], quoted_ip[0..28]);
+        const error_msg = try P.icmp(alloc, .{ .message_type = 11, .body = &body });
+        defer alloc.free(error_msg);
+        try f.send(&h, .wan, .{ .src = f.gateway, .dst = f.public, .protocol = 1, .payload = error_msg });
+        try eq(@as(usize, 4), h.txCount());
+    }
+    try eq(@as(usize, 0), h.errorCount());
+    try eq(entry.deadline, State.nat_table.inside.get(key).?.deadline);
+    try eq(entry.generation, State.nat_table.inside.get(key).?.generation);
+    try eq(@as(usize, 1), State.nat_table.inside.count());
+}

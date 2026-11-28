@@ -118,20 +118,30 @@ pub fn forwardQuotedError(
     if (quote.get(.fragment_offset) != 0 or payload.len < 8)
         return device.release(buffer);
 
-    const checksum_offset: usize = switch (protocol) {
-        .tcp => 16,
-        .udp => 6,
-        else => return device.release(buffer),
-    };
-
     var transport: QuotedTransportView = undefined;
     var reader: std.Io.Reader = .fixed(payload);
-    try transport.takeFields(.src_port, .dst_port, &reader);
-    if (payload.len >= checksum_offset + 2) {
-        try reader.discardAll(checksum_offset - 4);
+    if (protocol == .icmp) {
+        const expected: MessageType = if (iface == .wan) .echo_request else .echo_reply;
+        if (payload[0] != @intFromEnum(expected) or payload[1] != 0) return device.release(buffer);
+        try reader.discardAll(2);
         try transport.takeField(.checksum, &reader);
+        // An echo has one identifier for both NAT directions.
+        var identifier = reader;
+        try transport.takeField(.src_port, &identifier);
+        try transport.takeField(.dst_port, &reader);
     } else {
-        transport.set(.checksum, null);
+        const checksum_offset: usize = switch (protocol) {
+            .tcp => 16,
+            .udp => 6,
+            else => return device.release(buffer),
+        };
+        try transport.takeFields(.src_port, .dst_port, &reader);
+        if (payload.len >= checksum_offset + 2) {
+            try reader.discardAll(checksum_offset - 4);
+            try transport.takeField(.checksum, &reader);
+        } else {
+            transport.set(.checksum, null);
+        }
     }
 
     const egress, const next_hop = switch (iface) {
@@ -148,7 +158,7 @@ pub fn forwardQuotedError(
 
             const quoted_peer: NatTable.Peer = .{
                 .ip = quote.get(.dst),
-                .port = transport.get(.dst_port),
+                .port = if (protocol == .icmp) inside.port else transport.get(.dst_port),
             };
             if (!inside.permitsReply(mapping, quoted_peer))
                 return device.release(buffer);
@@ -164,7 +174,7 @@ pub fn forwardQuotedError(
         },
         .lan => lan: {
             const remote_ip = outer.get(.dst);
-            const local_dns = Dns.isLanEndpoint(.lan, remote_ip, transport.get(.src_port));
+            const local_dns = protocol != .icmp and Dns.isLanEndpoint(.lan, remote_ip, transport.get(.src_port));
             if ((!local_dns and classifyDestination(remote_ip) != .wan) or
                 !quote.fieldCmp(.src, .{ .eq = remote_ip }))
                 return device.release(buffer);
@@ -172,12 +182,17 @@ pub fn forwardQuotedError(
             if (!quote.fieldCmp(.dst, .{ .eq = outer.get(.src) }))
                 return device.release(buffer);
 
-            const public_ip, const public_port = nat_table.outboundLookup(.{
+            const key: NatTable.Key = .{
                 .protocol = protocol,
                 .ip = quote.get(.dst),
                 .port = transport.get(.dst_port),
                 .service_peer = if (local_dns) Dns.upstream else null,
-            }, lease.ip) orelse return device.release(buffer);
+            };
+            const public_ip, const public_port = if (protocol == .icmp) echo: {
+                const mapping = nat_table.outboundEntry(key, lease.ip) orelse return device.release(buffer);
+                if (!key.permitsReply(mapping, .{ .ip = remote_ip, .port = key.port })) return device.release(buffer);
+                break :echo NatTable.IpPort{ mapping.outside.ip, mapping.outside.port };
+            } else nat_table.outboundLookup(key, lease.ip) orelse return device.release(buffer);
 
             rewriteQuotedEndpoint(&quote, &transport, .dst, public_ip, public_port);
             if (local_dns) {
@@ -222,6 +237,10 @@ fn rewriteQuotedEndpoint(
 
     const is_udp = quote.get(.protocol) == .udp;
     const old_checksum = transport.get(.checksum) orelse return;
+    if (quote.get(.protocol) == .icmp) {
+        transport.set(.checksum, updateChecksum(old_checksum, old_port, port, 1));
+        return;
+    }
     if (is_udp and old_checksum == 0) return;
 
     const updated = updateChecksum(
