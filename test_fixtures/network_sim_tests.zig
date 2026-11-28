@@ -6,13 +6,14 @@ test "correlated LAN and WAN conversations" {
     const corpus = comptime blk: {
         const scenarios = Simulation.Scenarios;
         // Short raw Smith inputs replay in ordinary tests as well as seeding the fuzzer.
-        var cases: [3][20 * 8]u8 = undefined;
-        for (&cases, [_]scenarios.Conversation{ .download, .peer_rotation, .path_mtu }, [_]scenarios.ClientScenario{ .dns_udp, .fragmented_echo, .udp }) |*bytes, conversation, client| {
+        var cases: [3][21 * 8]u8 = undefined;
+        for (&cases, [_]scenarios.Conversation{ .download, .peer_rotation, .path_mtu }, [_]scenarios.ClientScenario{ .dns_udp, .fragmented_echo, .udp }, 0..) |*bytes, conversation, client, mode| {
             const words = [_]u64{
                 42,                   4,                                     3, 15, 0xfffffffe, 0xfffffff0, 5,                  1,   0, @intFromEnum(conversation), 1,
                 @intFromEnum(client), @intFromEnum(scenarios.Outcome.reply), 2, 7,  0xa8,       63,         0x7766554433221100, 128, 0,
             };
             for (words, 0..) |word, i| std.mem.writeInt(u64, bytes[i * 8 ..][0..8], word, .little);
+            std.mem.writeInt(u64, bytes[20 * 8 ..][0..8], mode, .little);
             if (@import("sim_settings").campaign_dir != null and conversation == .download)
                 std.mem.writeInt(u64, bytes[19 * 8 ..][0..8], 1, .little);
         }
@@ -81,6 +82,29 @@ test "DNS over TCP can reuse a socket number still mapped for a cancelled downlo
     const io: std.Io = .{ .vtable = &clock, .userdata = base.userdata };
     var mock = Router.Nic.Simulation.Mock{ .io = io, .alloc = std.testing.allocator };
     try Simulation.run(io, &mock, 1, 128, .{ .conversations = &episodes }, null, .{});
+}
+
+test "the TCP client retransmitting its FIN remains bound through another client's DHCPDECLINE" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+    var clock = Router.Debug.SimulationClock.vtable(base);
+    const io: std.Io = .{ .vtable = &clock, .userdata = base.userdata };
+    var mock = Router.Nic.Simulation.Mock{ .io = io, .alloc = std.testing.allocator };
+    try Simulation.run(io, &mock, 701, 128, .{ .conversations = &.{.download} }, null, .{});
+}
+
+test "UDP media from alternate ports and participants follows the configured NAT filter" {
+    try std.testing.expect(Simulation.Scenarios.conversations.udp_filtering.mandatory);
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const base = threaded.io();
+    var clock = Router.Debug.SimulationClock.vtable(base);
+    const io: std.Io = .{ .vtable = &clock, .userdata = base.userdata };
+    var mock = Router.Nic.Simulation.Mock{ .io = io, .alloc = std.testing.allocator };
+    for (std.meta.tags(Simulation.FilteringMode)) |mode| {
+        try Simulation.run(io, &mock, 42, 128, .{ .filtering_mode = mode }, null, .{});
+    }
 }
 
 test "peer state gates DHCP, ARP, forwarding and upstream replies" {

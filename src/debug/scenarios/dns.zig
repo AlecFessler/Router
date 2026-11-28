@@ -5,7 +5,7 @@ const Job = Sim.Job;
 const State = Router.State;
 const Nat = Router.Tables.NatTable.NatTable;
 const dns = Sim.dns;
-const wan = Sim.wan;
+const resolver = Nat.Peer{ .ip = dns, .port = 53 };
 const packet = Sim.packet;
 
 pub fn addressResponse(message: []u8, question_len: usize, address_len: usize, records: u8, alias: bool) usize {
@@ -109,20 +109,86 @@ pub const ParallelDns = struct {
         const nat = &State.nat_table;
         if (nat.inside.count() != self.previous_mappings + count or nat.outside.count() != self.previous_mappings + count or
             nat.next_generation != self.first_generation + count or nat.udp_ports.next != network.next[2]) return error.WrongDnsMappings;
-        for (self.answers[0..count], 0..) |expected, i| try checkUdpMapping(expected, self.first_generation + i, self.deadline);
+        for (self.answers[0..count], 0..) |*expected, i| try expected.checkUdpMapping(self.first_generation + i, self.deadline, &.{resolver});
     }
 };
 
-fn checkUdpMapping(expected: Job, generation: u64, deadline: std.Io.Timestamp) !void {
-    const nat = &State.nat_table;
-    const inside = expected.insideKey();
-    const outside: Nat.Key = .{ .protocol = .udp, .ip = wan, .port = expected.public_port };
-    const entry = nat.inside.get(inside) orelse return error.MissingNatState;
-    if (!std.meta.eql(entry.outside, outside) or !std.meta.eql(nat.outside.get(outside), @as(?Nat.Key, inside)) or
-        entry.generation != generation or !std.meta.eql(entry.deadline, deadline) or
-        !nat.udp_ports.used.isSet(outside.port) or entry.peer_count != 1 or
-        !std.meta.eql(entry.peers[0], Nat.Peer{ .ip = dns, .port = 53 })) return error.WrongDnsMappings;
-}
+pub const Retry = struct {
+    query: Job,
+    response: Job,
+    first_sent: std.Io.Timestamp,
+    deadline: std.Io.Timestamp,
+    mappings: usize,
+    generation: u64,
+    completed_id: ?u16 = null,
+
+    pub fn step(self: *Retry, peer: *Sim.Peer, phase: Sim.Scenarios.Lifecycle) !void {
+        const querying = phase == .dns_initial_query or phase == .dns_retransmit;
+        if (querying != (peer.iface == .lan)) return;
+        const net = peer.network;
+        const nat = &State.nat_table;
+        var scratch = std.heap.FixedBufferAllocator.init(&peer.scratch);
+        const alloc = scratch.allocator();
+        const now = std.Io.Timestamp.now(net.io, .boot);
+        if (querying) {
+            if (phase == .dns_initial_query) {
+                var prng = std.Random.DefaultPrng.init(net.seed);
+                const random = prng.random();
+                self.* = .{
+                    .query = net.cold,
+                    .response = undefined,
+                    .first_sent = now,
+                    .deadline = undefined,
+                    .mappings = nat.inside.count() + 1,
+                    .generation = net.newConversationBinding(),
+                };
+                self.query.choice.kind = .dns_udp;
+                self.query.choice.host = random.intRangeAtMost(u4, 1, 15);
+                self.query.choice.token = random.int(u32) | 1;
+                self.query.remote = dns;
+                // Choose a socket number held on WAN so both replies must restore the client's port.
+                self.query.source_port = @intCast(net.used[2].findLastSet() orelse return error.MissingNatState);
+                self.query.public_port = net.reservePort(.udp, self.query.source_port);
+                if (self.query.public_port == self.query.source_port) return error.ExpectedUdpPortCollision;
+                self.query.dns_records = random.intRangeAtMost(u4, 1, 3);
+                self.query.makeDnsQuery(random.int(u16), "upd".*);
+            } else {
+                const elapsed = self.first_sent.durationTo(now).toMilliseconds();
+                if (elapsed < 2000 or elapsed > 5000) return error.WrongDnsRetryTime;
+            }
+            self.deadline = now.addDuration(.fromSeconds(300));
+            var sent = self.query;
+            if (phase == .dns_retransmit) sent.choice.token +%= 4;
+            _ = try peer.send(alloc, &sent, false);
+            const tx = try peer.observation.take(0, .wan);
+            if (phase == .dns_initial_query) {
+                // The resolver builds its answer from the query and source socket it received.
+                self.response = sent;
+                self.response.wan_ip = tx[26..30].*;
+                self.response.remote = tx[30..34].*;
+                self.response.makeResponse();
+                self.response.choice.token ^= 0x4000;
+            } else if (!std.mem.eql(u8, sent.payload[0..sent.len], self.query.payload[0..self.query.len]) or
+                sent.public_port != self.response.public_port) return error.WrongDnsRetryQuestion;
+        } else {
+            // A delayed resolver answer arrives after the retry, then a byte-identical copy arrives.
+            try peer.inject(try packet(alloc, self.response, true, false, 64));
+            try peer.count(1);
+            var expected = self.query;
+            expected.makeResponse();
+            expected.choice.token ^= 0x4000;
+            const tx = try peer.expect(0, .lan, try packet(alloc, expected, true, true, 63));
+            const id = std.mem.readInt(u16, tx[42..44], .big);
+            if (phase == .dns_delayed_answer) {
+                if (self.completed_id != null) return error.UnexpectedDnsCompletion;
+                self.completed_id = id;
+            } else if (self.completed_id != id) return error.UnexpectedDnsCompletion;
+        }
+        try self.query.checkUdpMapping(self.generation, self.deadline, &.{resolver});
+        if (nat.inside.count() != self.mappings or nat.outside.count() != self.mappings or
+            nat.next_generation != self.generation + 1) return error.WrongDnsMappings;
+    }
+};
 
 pub const Fallback = struct {
     query: Job,
@@ -171,7 +237,7 @@ pub const Fallback = struct {
                     .port = port,
                     .public_port = undefined,
                     .remote = dns,
-                    .service_peer = .{ .ip = dns, .port = 53 },
+                    .service_peer = resolver,
                     .client_next = random.int(u32),
                     .server_next = random.int(u32),
                     .generation = undefined,
@@ -222,7 +288,7 @@ pub const Fallback = struct {
         const nat = &State.nat_table;
         if (nat.inside.count() != self.previous_mappings + n or nat.outside.count() != self.previous_mappings + n or
             nat.next_generation != self.udp_generation + n) return error.WrongDnsMappings;
-        try checkUdpMapping(query.*, self.udp_generation, self.udp_deadline);
+        try query.checkUdpMapping(self.udp_generation, self.udp_deadline, &.{resolver});
     }
 
     fn fullAnswer(self: *const Fallback, buffer: []u8, question: []const u8) usize {

@@ -924,6 +924,7 @@ pub const DhcpClient = struct {
         vlan_tags: []const Packets.VlanTag = &.{},
         xid: u32 = 0x1122_3344,
         ciaddr: IPv4 = .{ 0, 0, 0, 0 },
+        requested_options: []const u8 = &.{},
         client_id: ?[]const u8 = null,
         requested_ip: ?IPv4 = null,
         server_id: ?IPv4 = null,
@@ -983,6 +984,7 @@ pub const DhcpClient = struct {
         if (opts.client_id) |id| try option(&list, alloc, 61, id);
         if (opts.requested_ip) |ip| try option(&list, alloc, 50, &ip);
         if (opts.server_id) |ip| try option(&list, alloc, 54, &ip);
+        if (opts.requested_options.len > 0) try option(&list, alloc, 55, opts.requested_options);
         try list.append(alloc, 255); // end
 
         return list.toOwnedSlice(alloc);

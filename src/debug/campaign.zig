@@ -42,7 +42,9 @@ const Status = struct {
     weights: Json = .{ .object = .empty },
     frames: usize = 100000,
     checked_full_size_input: bool = false,
+    extend_after_failure: bool = false,
     fuzz: ?Coverage = null,
+    last_wire_replay: ?WireReplay = null,
     stage: []const u8 = "starting",
     updated: f64 = 0,
 };
@@ -243,6 +245,33 @@ fn coverage(log: []const u8) !Coverage {
     return c;
 }
 
+// A failed bounded worker can exit before Zig prints the textual report.
+fn checkpointCoverage(f: Files, cache: []const u8) !?Coverage {
+    const Header = std.Build.abi.fuzz.SeenPcsHeader;
+    var dir = cwd.openDir(f.io, try f.path(&.{ cache, "v" }), .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close(f.io);
+    var checkpoint: ?Coverage = null;
+    var it = dir.iterate();
+    while (try it.next(f.io)) |entry| {
+        if (entry.kind != .file or entry.name.len != 16 or !hexName(entry.name)) continue;
+        // This profile builds one instrumented test. Avoid merging unrelated maps.
+        if (checkpoint != null) return null;
+        const data = try dir.readFileAllocOptions(f.io, entry.name, f.alloc, .unlimited, .of(Header), null);
+        if (data.len < @sizeOf(Header)) return null;
+        const head: *const Header = @ptrCast(data.ptr);
+        const words = (data.len - @sizeOf(Header)) / @sizeOf(usize);
+        if (head.pcs_len == 0 or head.pcs_len > words or data.len % @sizeOf(usize) != 0 or
+            words - head.pcs_len != Header.seenElemsLen(head.pcs_len)) return null;
+        var sites: usize = 0;
+        for (head.seenBits()) |word| sites += @popCount(word);
+        checkpoint = .{ .runs = head.n_runs, .unique = head.unique_runs, .sites = sites, .instrumented_sites = head.pcs_len };
+    }
+    return checkpoint;
+}
+
 fn hexName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'))) return false;
@@ -250,7 +279,10 @@ fn hexName(name: []const u8) bool {
 }
 
 fn corpus(f: Files, folder: []const u8) ![][]const u8 {
-    var root = try cwd.openDir(f.io, folder, .{ .iterate = true });
+    var root = cwd.openDir(f.io, folder, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
     defer root.close(f.io);
     var items: std.ArrayList([]const u8) = .empty;
     var walker = try root.walk(f.alloc);
@@ -260,7 +292,6 @@ fn corpus(f: Files, folder: []const u8) ![][]const u8 {
         const parent = std.fs.path.dirname(e.path) orelse continue;
         if (parent.len == 16 and hexName(parent)) try items.append(f.alloc, try f.path(&.{ folder, e.path }));
     }
-    if (items.items.len == 0) return error.EmptyCoverageCorpus;
     std.mem.sort([]const u8, items.items, {}, struct {
         fn less(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -285,6 +316,12 @@ fn dispatches(f: Files, totals: *Json, log: []const u8) !void {
         }
     }
 }
+
+const WireReplay = struct {
+    seed: u64,
+    engine: ChildResult,
+    comparison: ?ChildResult,
+};
 
 const Batch = struct {
     f: Files,
@@ -312,24 +349,49 @@ const Batch = struct {
         const log = try cwd.createFile(f.io, try b.inWork("run.log"), .{});
         defer log.close(f.io);
         const frames = try f.fmt("{d}", .{b.s.frames});
-        const replay = try b.inWork("replay");
         for ([_][]const []const u8{
             &.{ b.s.engine, "smith", b.work, try b.inWork("input.smith"), "--weights", try b.inProfile("weights.json"), if (exact) "--full-size" else "--frames", frames },
             &.{ b.s.engine, "check", b.work },
-            &.{ b.s.engine, "replay", replay },
-            &.{ b.s.engine, "check", replay },
-        }, [_][]const u8{ "generate", "check", "replay", "check replay" }) |argv, name| {
-            if (same(name, "replay")) {
-                try cwd.createDirPath(f.io, replay);
-                for ([_][]const u8{ "lan-rx.pcap", "lan-expected.pcap", "wan-rx.pcap", "wan-expected.pcap" }) |pcap| {
-                    try f.link(try b.inWork(pcap), try f.path(&.{ replay, pcap }));
-                }
-            }
+        }, [_][]const u8{ "generate", "check" }) |argv, name| {
             if (!exact) try b.stage(name);
             const result = try runChild(f, argv, b.s.source, log, b.o.timeout, null);
             if (result != .passed) return result;
         }
-        return .passed;
+        const verified = try b.replay(!exact) orelse return error.MissingReplayInputs;
+        return if (verified.engine != .passed) verified.engine else verified.comparison orelse .failed;
+    }
+
+    // State assertions can fail after flushing valid RX and expected TX captures.
+    // Replay that prefix independently, retaining the original failure as well.
+    fn replay(b: Batch, update_stage: bool) !?WireReplay {
+        const f = b.f;
+        const streams = .{ "lan-rx.pcap", "lan-expected.pcap", "wan-rx.pcap", "wan-expected.pcap" };
+        inline for (streams) |name| {
+            const st = cwd.statFile(f.io, try b.inWork(name), .{}) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            if (st.size < 24) return null;
+        }
+        const dir = try b.inWork("replay");
+        try cwd.createDirPath(f.io, dir);
+        inline for (streams ++ .{"filtering-mode"}) |name| {
+            const src = try b.inWork(name);
+            const dst = try f.path(&.{ dir, name });
+            if (!try f.exists(dst) and try f.exists(src)) try f.link(src, dst);
+        }
+        const log = try cwd.createFile(f.io, try b.inWork("replay.log"), .{});
+        defer log.close(f.io);
+        if (update_stage) try b.stage("replay");
+        const replay_result = try runChild(f, &.{ b.s.engine, "replay", dir }, b.s.source, log, b.o.timeout, null);
+        var result: WireReplay = .{ .seed = b.s.seed, .engine = replay_result, .comparison = null };
+        if (try f.exists(try f.path(&.{ dir, "lan-tx.pcap" })) and try f.exists(try f.path(&.{ dir, "wan-tx.pcap" }))) {
+            if (update_stage and replay_result == .passed) try b.stage("check replay");
+            result.comparison = try runChild(f, &.{ b.s.engine, "check", dir }, b.s.source, log, b.o.timeout, null);
+        }
+        b.s.last_wire_replay = result;
+        try f.write(try b.inWork("wire-replay.json"), try f.json(result));
+        return result;
     }
 
     fn explore(b: Batch, zig: []const u8) !ChildResult {
@@ -362,12 +424,18 @@ const Batch = struct {
             return result;
         }
         b.s.fuzz = try coverage(try f.read(report));
-        const inputs = try corpus(f, try f.path(&.{ cache, "f" }));
-        b.s.fuzz.?.corpus_inputs = inputs.len;
         b.s.checked_full_size_input = try f.exists(try b.inProfile("last-full.smith"));
+        return try b.extend() orelse error.EmptyCoverageCorpus;
+    }
+
+    fn extend(b: Batch) !?ChildResult {
+        const f = b.f;
+        const inputs = try corpus(f, try b.inProfile("zig-cache/f"));
+        if (b.s.fuzz) |*c| c.corpus_inputs = inputs.len;
+        if (inputs.len == 0) return null;
         var prng = std.Random.DefaultPrng.init(b.s.seed);
         try f.copy(inputs[prng.random().uintLessThan(usize, inputs.len)], try b.inWork("input.smith"));
-        return b.capture(false);
+        return try b.capture(false);
     }
 
     const Failure = struct {
@@ -391,10 +459,27 @@ const Batch = struct {
             if (try f.exists(report)) try f.copy(report, try b.inWork("fuzz.log"));
             reproduced = try b.capture(true);
         }
+        const recorded = try b.inWork("wire-replay.json");
+        const wire = if (try f.exists(recorded)) try f.parse(WireReplay, try f.read(recorded)) else try b.replay(false);
+        if (wire) |outcome| b.s.last_wire_replay = outcome;
+        if (exact) {
+            const cache = try b.inProfile("zig-cache");
+            if (checkpointCoverage(f, cache) catch |err| blk: {
+                std.debug.print("Coverage checkpoint unavailable: {t}\n", .{err});
+                break :blk null;
+            }) |c| {
+                b.s.fuzz = c;
+                if (corpus(f, try b.inProfile("zig-cache/f"))) |inputs| {
+                    b.s.fuzz.?.corpus_inputs = inputs.len;
+                } else |err| std.debug.print("Corpus count unavailable: {t}\n", .{err});
+            }
+            b.s.checked_full_size_input = try f.exists(try b.inProfile("last-full.smith"));
+        }
         const key = hex(try f.read(raw));
         const input = try f.path(&.{ root, "inputs", &key });
         if (!try f.exists(input)) try f.copy(raw, input);
-        const reason = try diagnostic(f, if (exact and reproduced != .failed) try b.inWork("fuzz.log") else try b.inWork("run.log"), &key);
+        const log_name = if (same(failure.stage, "replay") or same(failure.stage, "check replay")) "replay.log" else if (exact and reproduced != .failed) "fuzz.log" else "run.log";
+        const reason = try diagnostic(f, try b.inWork(log_name), &key);
         const digest = hex(try f.json(.{ b.s.workspace, failure, reason }));
         const id = if (b.o.keep_all) try f.fmt("{s}-{d}", .{ digest[0..24], b.s.seed }) else digest[0..24];
         const dest = try f.path(&.{ root, id });
@@ -408,9 +493,11 @@ const Batch = struct {
             .weights = b.s.weights,
             .stage = failure.stage,
             .result = failure.result,
+            .diagnostic = reason,
             .timeout_seconds = failure.timeout_seconds,
             .workload = if (exact) "exact" else "extended",
             .capture_replay = reproduced,
+            .wire_replay = wire,
             .input = input,
             .evidence = dest,
             .time = Io.Timestamp.now(f.io, .real).toSeconds(),
@@ -435,7 +522,7 @@ const Batch = struct {
         };
         try f.write(try b.inProfile("archive.ready"), try f.json(ready));
         try b.finishArchive(ready);
-        std.debug.print("FAIL {s} during {s}. Evidence in {s}\n", .{ @tagName(failure.result), failure.stage, dest });
+        std.debug.print("FAIL {s} during {s}: {s}. Evidence in {s}\n", .{ @tagName(failure.result), failure.stage, reason, dest });
     }
 
     const Archived = struct {
@@ -454,6 +541,7 @@ const Batch = struct {
         if (ready.known) |known| try f.write(known, "");
         if (!same(b.s.stage, "failed")) {
             b.s.failed += 1;
+            b.s.extend_after_failure = ready.known != null;
             b.s.next_seed = b.s.seed +% 1;
             b.s.last_failure = ready.evidence;
             try b.stage("failed");
@@ -500,9 +588,10 @@ fn diagnostic(f: Files, logfile: []const u8, fallback: []const u8) ![]const u8 {
     if (!try f.exists(logfile)) return fallback;
     var lines = std.mem.tokenizeScalar(u8, try f.read(logfile), '\n');
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "error: scenario ")) {
-            if (std.mem.indexOf(u8, line, " (round ")) |i| return line[0..i];
-        }
+        // The capture executable can decorate its log prefix when launched from tmux.
+        const start = std.mem.indexOf(u8, line, "scenario ") orelse continue;
+        const detail = line[start..];
+        if (std.mem.indexOf(u8, detail, " (round ")) |end| return detail[0..end];
     }
     lines.reset();
     while (lines.next()) |line| {
@@ -557,6 +646,8 @@ fn campaign(init: std.process.Init) !usize {
     const ws = try f.path(&.{ build, try f.fmt("profile-{s}", .{profile[0..16]}) });
     if (!same(initial.workspace, ws)) {
         initial.fuzz = null;
+        initial.extend_after_failure = false;
+        initial.last_wire_replay = null;
         initial.checked_full_size_input = false;
     }
     initial.frames = frames;
@@ -585,7 +676,10 @@ fn campaign(init: std.process.Init) !usize {
         if (stopping.load(.monotonic)) return error.Interrupted;
         try cwd.deleteTree(f.io, work);
         try cwd.createDirPath(f.io, work);
-        const result = batch.explore(zig) catch |err| {
+        // A stream of known native failures must not starve the independent large replay.
+        const scheduled = s.extend_after_failure;
+        s.extend_after_failure = false;
+        const result = (if (scheduled) try batch.extend() else null) orelse batch.explore(zig) catch |err| {
             if (err == error.Interrupted) try batch.stage("interrupted");
             return err;
         };
@@ -601,8 +695,11 @@ fn campaign(init: std.process.Init) !usize {
             try batch.archive(failure);
         }
         try cwd.deleteTree(f.io, work);
-        const c = s.fuzz orelse Coverage{};
-        std.debug.print("{d} passed, {d} failed batches. {d} fuzz iterations, {d}/{d} sites, {d} corpus inputs. Next batch {d}.\n", .{ s.passed, s.failed, c.runs, c.sites, c.instrumented_sites, c.corpus_inputs, s.next_seed.? });
+        std.debug.print("{d} passed, {d} failed batches. ", .{ s.passed, s.failed });
+        if (s.fuzz) |c| {
+            std.debug.print("Coverage: {d} iterations, {d}/{d} sites, {d} corpus inputs. ", .{ c.runs, c.sites, c.instrumented_sites, c.corpus_inputs });
+        } else std.debug.print("Awaiting the first coverage checkpoint for this build/profile. ", .{});
+        std.debug.print("Next batch {d}.\n", .{s.next_seed.?});
         if (o.runs != null and done + 1 == o.runs.?) return s.failed - original_failures;
     }
     return 0;
@@ -620,6 +717,23 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     if (failures != 0) std.process.exit(1);
+}
+
+test "a stopped Zig worker exposes its counters and coverage bits on disk" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f: Files = .{ .io = io, .alloc = arena.allocator() };
+    const root = try tmp.dir.realPathFileAlloc(io, ".", f.alloc);
+    const path = try f.path(&.{ root, "v", "0123456789abcdef" });
+    const words = [_]usize{ 91, 24, 3, 0b101, 0, 0, 0 };
+    try f.write(path, std.mem.asBytes(&words));
+    const c = (try checkpointCoverage(f, root)).?;
+    try std.testing.expectEqual(Coverage{ .runs = 91, .unique = 24, .sites = 2, .instrumented_sites = 3 }, c);
+    try f.write(path, std.mem.asBytes(&words)[0 .. @sizeOf(usize) * 4]);
+    try std.testing.expect(try checkpointCoverage(f, root) == null);
 }
 
 test "coverage-selected inputs exclude Zig's index and lock files" {
@@ -662,4 +776,24 @@ test "an interrupted failure archive commits its ledger and counter once across 
     try b.recover();
     try std.testing.expectEqual(@as(usize, 1), state.failed);
     try std.testing.expectEqualStrings(start ++ "{\"seed\":42}\n", try f.read(ledger));
+}
+
+test "a repeated scenario diagnostic has the same key for colored and plain worker logs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f: Files = .{ .io = io, .alloc = arena.allocator() };
+    const root = try tmp.dir.realPathFileAlloc(io, ".", f.alloc);
+    const log = try f.path(&.{ root, "run.log" });
+    const expected = "scenario fragmented_feedback on wan: BadChecksum";
+    for ([_][]const u8{
+        "\x1b[31merror\x1b[0m: " ++ expected ++ " (round 944, RX 102802)\n",
+        "[default] (err): " ++ expected ++ " (round 86, RX 157)\n",
+        "error: " ++ expected ++ " (round 90, RX 160)\n",
+    }) |report| {
+        try f.write(log, report);
+        try std.testing.expectEqualStrings(expected, try diagnostic(f, log, "another input"));
+    }
 }

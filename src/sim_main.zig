@@ -87,9 +87,12 @@ pub fn main(init: std.process.Init) !void {
     var weights: Network.Scenarios.Weights = .{};
     var extended: ?usize = null;
     var full_size: usize = 100000;
+    var mode: ?Network.FilteringMode = null;
     while (args.next()) |flag| {
         if (synthetic and std.mem.eql(u8, flag, "--weights")) {
             weights = try readWeights(init, args.next() orelse return error.ExpectedWeightsFile);
+        } else if (synthetic and !raw_smith and std.mem.eql(u8, flag, "--filtering-mode")) {
+            mode = std.meta.stringToEnum(Network.FilteringMode, args.next() orelse return error.ExpectedFilteringMode) orelse return error.InvalidFilteringMode;
         } else if (raw_smith and std.mem.eql(u8, flag, "--frames")) {
             extended = try std.fmt.parseInt(usize, args.next() orelse return error.ExpectedFrameCount, 10);
         } else if (raw_smith and std.mem.eql(u8, flag, "--full-size")) {
@@ -108,6 +111,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const dir = if (synthetic) try std.Io.Dir.cwd().createDirPathOpen(init.io, path, .{}) else try std.Io.Dir.cwd().openDir(init.io, path, .{});
     defer dir.close(init.io);
+    if (synthetic) {
+        workload.filtering_mode = mode orelse workload.filtering_mode;
+        try dir.writeFile(init.io, .{ .sub_path = "filtering-mode", .data = @tagName(workload.filtering_mode) });
+    }
     if (raw_smith and extended == null) {
         var canonical: [Router.Debug.SimulationFuzzInput.encoded_max]u8 = undefined;
         try dir.writeFile(init.io, .{ .sub_path = "normalized.smith", .data = input.encode(&canonical) });
@@ -171,6 +178,13 @@ fn replayFiles(init: std.process.Init, dir: std.Io.Dir, io: std.Io, mock: *Sim.M
         phases.items[count] = t;
         count += 1;
     }
+    const saved_mode = dir.readFileAlloc(init.io, "filtering-mode", init.arena.allocator(), .limited(64)) catch |err| switch (err) {
+        error.FileNotFound => "address_restricted", // Captures written before modes were recorded.
+        else => return err,
+    };
+    const previous_mode = Router.State.nat_filtering_mode;
+    Router.State.nat_filtering_mode = std.meta.stringToEnum(Network.FilteringMode, saved_mode) orelse return error.InvalidFilteringMode;
+    defer Router.State.nat_filtering_mode = previous_mode;
     Router.Debug.Cli.enabled = false;
     try Runtime.setup(init.gpa, io, mock.api(), .{ 192, 168, 86, 1 }, .{ 255, 255, 255, 0 });
     var replay = Replay{ .mock = mock, .io = io, .barrier = .{ .io = io }, .phases = phases.items[0..count] };

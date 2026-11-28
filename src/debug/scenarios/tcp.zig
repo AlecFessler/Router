@@ -276,10 +276,10 @@ pub const WindowUpdate = struct {
         switch (phase) {
             .syn => {
                 c.* = TcpConnection.open(peer, random, random.int(u4), .{ 203, 0, 113, 86 }, @intCast(39000 + turn.index));
-                try c.exchange(peer, .{ .syn = true, .ack = false }, null, first_window, .forward);
+                try c.exchange(peer, .{ .syn = true, .ack = false }, null, .{ .window = first_window });
             },
             .syn_ack => try c.segment(peer, .{ .syn = true }, null),
-            .request => try c.exchange(peer, .{ .psh = true, .payload = "GET /file HTTP/1.0\r\n\r\n" }, null, first_window, .forward),
+            .request => try c.exchange(peer, .{ .psh = true, .payload = "GET /file HTTP/1.0\r\n\r\n" }, null, .{ .window = first_window }),
             .first_data => {
                 var first: [chunk_len]u8 = undefined;
                 random.bytes(&first);
@@ -290,7 +290,7 @@ pub const WindowUpdate = struct {
             .acknowledge, .reopen_window => {
                 const small = phase == .acknowledge;
                 const window: u16 = if (small) first_window - chunk_len else random.intRangeAtMost(u16, 8192, 32768);
-                try c.exchange(peer, .{}, null, window, .forward);
+                try c.exchange(peer, .{}, null, .{ .window = window });
                 const ack = try peer.observation.take(0, .wan);
                 const seq = std.mem.readInt(u32, ack[38..42], .big);
                 const cumulative = std.mem.readInt(u32, ack[42..46], .big);
@@ -307,10 +307,10 @@ pub const WindowUpdate = struct {
             },
             .acknowledge_burst => {
                 if (c.server_next != self.window_ack +% (3 * chunk_len)) return error.WrongCumulativeAck;
-                try c.exchange(peer, .{}, null, self.available, .forward);
+                try c.exchange(peer, .{}, null, .{ .window = self.available });
             },
             .server_close => try c.segment(peer, .{ .fin = true }, null),
-            .client_close => try c.exchange(peer, .{ .fin = true }, null, self.available, .forward),
+            .client_close => try c.exchange(peer, .{ .fin = true }, null, .{ .window = self.available }),
             .final_ack => try c.segment(peer, .{}, null),
         }
     }
@@ -385,10 +385,10 @@ pub const WanChange = struct {
         const cursor = nat.tcp_ports.next;
         if (phase == .after_expiry) {
             // The client times out and aborts its socket while the router has no WAN address.
-            try self.original.exchange(peer, .{ .rst = true }, null, 0, .drop);
+            try self.original.exchange(peer, .{ .rst = true }, null, .{ .window = 0, .drop = true });
         } else {
             // The server acknowledges the verified old GET, even after the same client socket reopens.
-            try self.original.exchange(peer, .{ .psh = true, .payload = late }, null, 32768, .drop);
+            try self.original.exchange(peer, .{ .psh = true, .payload = late }, null, .{ .drop = true });
         }
         if (nat.inside.count() != count or nat.outside.count() != count or nat.next_generation != generation or
             nat.tcp_ports.next != cursor or !std.meta.eql(nat.inside.get(other), @as(?Nat.Entry, untouched)) or
@@ -411,7 +411,7 @@ pub const TcpConnection = struct {
     service_peer: ?Nat.Peer = null,
     public_ip: IPv4 = wan,
 
-    fn open(peer: *Peer, random: std.Random, client: u4, remote: IPv4, port: u16) TcpConnection {
+    pub fn open(peer: *Peer, random: std.Random, client: u4, remote: IPv4, port: u16) TcpConnection {
         const network = peer.network;
         const host = 2 + @as(u8, client);
         return .{
@@ -433,10 +433,15 @@ pub const TcpConnection = struct {
     }
 
     pub fn segment(self: *TcpConnection, peer: *Peer, options: Packets.TcpOpts, retransmit_seq: ?u32) !void {
-        try self.exchange(peer, options, retransmit_seq, if (options.rst) 0 else 32768, .forward);
+        try self.exchange(peer, options, retransmit_seq, .{ .window = if (options.rst) 0 else 32768 });
     }
 
-    fn exchange(self: *TcpConnection, peer: *Peer, options: Packets.TcpOpts, retransmit_seq: ?u32, window: u16, expected: enum { forward, drop }) !void {
+    pub fn exchange(self: *TcpConnection, peer: *Peer, options: Packets.TcpOpts, retransmit_seq: ?u32, settings: struct {
+        window: u16 = 32768,
+        ecn: u2 = 0,
+        drop: bool = false,
+        accepted_by_peer: bool = true,
+    }) !void {
         var scratch = std.heap.FixedBufferAllocator.init(&peer.scratch);
         const alloc = scratch.allocator();
         const from_lan = peer.iface == .lan;
@@ -445,7 +450,7 @@ pub const TcpConnection = struct {
         var tcp = options;
         tcp.seq_number = retransmit_seq orelse next.*;
         tcp.ack_number = if (!tcp.ack) 0 else if (from_lan) self.server_next else self.client_next;
-        tcp.window = window;
+        tcp.window = settings.window;
         var timestamps: [16]u8 = .{ 2, 4, 5, 180, 1, 1, 8, 10 } ++ .{0} ** 8;
         std.mem.writeInt(u32, timestamps[8..12], @intCast(Router.Nic.Simulation.phase + 1), .big);
         std.mem.writeInt(u32, timestamps[12..16], self.last_timestamp[@intFromEnum(egress)], .big);
@@ -473,6 +478,7 @@ pub const TcpConnection = struct {
                 .dst = dst,
                 .protocol = 6,
                 .identification = @truncate(tcp.seq_number),
+                .ecn = settings.ecn,
                 .dont_fragment = true,
                 .ttl = if (translated) 63 else 64,
                 .payload = try Packets.tcp(alloc, src, dst, tcp),
@@ -481,7 +487,7 @@ pub const TcpConnection = struct {
                 tx = try peer.expect(0, egress, frame);
             } else {
                 try peer.inject(frame);
-                if (expected == .drop) return peer.expectDrop();
+                if (settings.drop) return peer.expectDrop();
                 try peer.count(1);
             }
         }
@@ -489,7 +495,7 @@ pub const TcpConnection = struct {
         const header_len = @as(usize, tx[46] >> 4) * 4;
         const consumed = tx.len - 34 - header_len + @intFromBool(tcp.syn or tcp.fin);
         if (retransmit_seq == null) next.* = std.mem.readInt(u32, tx[38..42], .big) +% @as(u32, @intCast(consumed));
-        if (!tcp.rst) self.last_timestamp[@intFromEnum(peer.iface)] = std.mem.readInt(u32, tx[34 + header_len - 8 ..][0..4], .big);
+        if (!tcp.rst and settings.accepted_by_peer) self.last_timestamp[@intFromEnum(peer.iface)] = std.mem.readInt(u32, tx[34 + header_len - 8 ..][0..4], .big);
         if (from_lan) {
             self.public_port = std.mem.readInt(u16, tx[34..36], .big);
             self.deadline = std.Io.Timestamp.now(peer.network.io, .boot).addDuration(.fromSeconds(7440));

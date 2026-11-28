@@ -6,6 +6,7 @@ const Simulation = Router.Debug.NetworkSimulation;
 seed: u64,
 length: usize,
 full_size: bool,
+filtering_mode: Simulation.FilteringMode,
 width: u8,
 lag: u8,
 download: Simulation.Scenarios.Download,
@@ -44,6 +45,11 @@ pub fn read(self: *@This(), smith: *std.testing.Smith, profile: Simulation.Scena
         .value(bool, false, 127),
         .value(bool, true, 1),
     });
+    self.filtering_mode = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => .address_restricted,
+        1 => .full_cone,
+        else => .endpoint_dependent,
+    };
     self.seed = seed;
     self.length = length;
     self.width = width;
@@ -70,6 +76,7 @@ fn weighted(smith: *std.testing.Smith, comptime catalog: anytype, profile: Simul
 
 pub fn workload(self: *const @This()) Simulation.Workload {
     return .{
+        .filtering_mode = self.filtering_mode,
         .choices = self.choices[0..self.length],
         .download = self.download,
         .conversations = @as(*const [1]Simulation.Scenarios.Conversation, &self.conversation),
@@ -79,7 +86,7 @@ pub fn workload(self: *const @This()) Simulation.Workload {
 }
 
 // Zig 0.16 Smith replays each scalar from a little-endian u64 and each byte block verbatim.
-pub const encoded_max = (12 + 8 * 64) * 8;
+pub const encoded_max = (13 + 8 * 64) * 8;
 
 pub fn encode(self: *const @This(), buffer: *[encoded_max]u8) []const u8 {
     var out: std.Io.Writer = .fixed(buffer);
@@ -95,5 +102,10 @@ pub fn encode(self: *const @This(), buffer: *[encoded_max]u8) []const u8 {
         out.writeInt(u64, choice.ttl, .little) catch unreachable;
     }
     out.writeInt(u64, @intFromBool(self.full_size), .little) catch unreachable;
+    out.writeInt(u64, switch (self.filtering_mode) {
+        .address_restricted => 0,
+        .full_cone => 1,
+        .endpoint_dependent => 2,
+    }, .little) catch unreachable;
     return out.buffered();
 }

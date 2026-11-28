@@ -84,8 +84,12 @@ pub fn exchange(self: *Sim.Peer, scratch: *std.heap.FixedBufferAllocator, episod
                     break;
                 }
             } else {
-                try self.inject(try Sim.packet(alloc, job, true, false, 64));
-                try self.expectDrop();
+                if (network.filtering_mode == .full_cone) {
+                    try self.answer(alloc, job);
+                } else {
+                    try self.inject(try Sim.packet(alloc, job, true, false, 64));
+                    try self.expectDrop();
+                }
             }
             try sequence.check(job);
         }

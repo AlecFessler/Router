@@ -28,7 +28,10 @@ const Startup = Scenarios.Startup;
 const Lifecycle = Scenarios.Lifecycle;
 const first_burst = std.meta.fields(Startup).len;
 
+pub const FilteringMode = Nat.FilteringMode;
+
 pub const Workload = struct {
+    filtering_mode: FilteringMode = .address_restricted,
     choices: []const Choice = &.{},
     conversations: []const Scenarios.Conversation = &.{},
     download: ?Scenarios.Download = null,
@@ -50,9 +53,12 @@ pub const Choice = struct {
 
 pub const Job = struct {
     choice: Choice,
+    lan_address: ?IPv4 = null,
     public_port: u16,
     source_port: u16,
     remote: IPv4,
+    remote_port: u16 = 443,
+    omit_udp_checksum: bool = false,
     wan_ip: IPv4 = wan,
     reply_source_port: ?u16 = null,
     dns_records: u4 = 1,
@@ -71,7 +77,7 @@ pub const Job = struct {
     }
 
     pub fn host(self: Job) IPv4 {
-        return .{ 192, 168, 86, 2 + @as(u8, self.choice.host) };
+        return self.lan_address orelse .{ 192, 168, 86, 2 + @as(u8, self.choice.host) };
     }
 
     pub fn mac(self: Job) Mac {
@@ -91,7 +97,7 @@ pub const Job = struct {
     }
 
     pub fn service(self: Job) u16 {
-        return if (self.isDns()) 53 else 443;
+        return if (self.isDns()) 53 else self.remote_port;
     }
 
     pub fn insideKey(self: Job) Nat.Key {
@@ -101,6 +107,20 @@ pub const Job = struct {
             .protocol = @enumFromInt(self.protocol()),
             .service_peer = if (self.isDns()) .{ .ip = dns, .port = 53 } else null,
         };
+    }
+
+    // Conversation turns inspect shared state while the opposite interface is idle.
+    pub fn checkUdpMapping(self: *const Job, generation: u64, deadline: std.Io.Timestamp, peers: []const Nat.Peer) !void {
+        const nat = &State.nat_table;
+        const inside = self.insideKey();
+        const outside: Nat.Key = .{ .protocol = .udp, .ip = self.wan_ip, .port = self.public_port };
+        const entry = nat.inside.get(inside) orelse return error.MissingNatState;
+        if (!std.meta.eql(entry.outside, outside) or !std.meta.eql(nat.outside.get(outside), @as(?Nat.Key, inside)) or
+            entry.generation != generation or !std.meta.eql(entry.deadline, deadline) or
+            !nat.udp_ports.used.isSet(outside.port) or entry.peer_count != peers.len) return error.WrongUdpMapping;
+        for (entry.peers[0..entry.peer_count], peers) |actual, expected| {
+            if (!std.meta.eql(actual, expected)) return error.WrongNatPeer;
+        }
     }
 
     pub fn makeDnsQuery(self: *Job, id: u16, label: [3]u8) void {
@@ -150,6 +170,10 @@ pub fn arp(alloc: std.mem.Allocator, mac: Mac, addr: IPv4, target: IPv4, peer: ?
 }
 
 pub fn packet(alloc: std.mem.Allocator, job: Job, reply: bool, translated: bool, ttl: u8) ![]u8 {
+    return packetWithPayload(alloc, job, reply, translated, ttl, job.payload[0..job.len]);
+}
+
+pub fn packetWithPayload(alloc: std.mem.Allocator, job: Job, reply: bool, translated: bool, ttl: u8, data: []const u8) ![]u8 {
     const outside = reply != translated;
     const remote = if (outside or !job.isDns()) job.remote else lan;
     const local = if (outside) job.wan_ip else job.host();
@@ -158,9 +182,13 @@ pub fn packet(alloc: std.mem.Allocator, job: Job, reply: bool, translated: bool,
     const port = if (outside) job.public_port else job.source_port;
     const src_port = if (reply) job.reply_source_port orelse job.service() else port;
     const dst_port = if (reply) port else job.service();
-    const data = job.payload[0..job.len];
     const msg = switch (job.protocol()) {
-        17 => try Packets.udp(alloc, src, dst, .{ .src_port = src_port, .dst_port = dst_port, .payload = data }),
+        17 => try Packets.udp(alloc, src, dst, .{
+            .src_port = src_port,
+            .dst_port = dst_port,
+            .payload = data,
+            .checksum = if (job.omit_udp_checksum) 0 else null,
+        }),
         6 => try Packets.tcp(alloc, src, dst, .{
             .src_port = src_port,
             .dst_port = dst_port,
@@ -250,14 +278,14 @@ const FragmentModel = struct {
 };
 
 // A DHCP eviction may change only this client's NAT mappings.
-const AfterLeaseRemoval = struct {
+pub const AfterLeaseRemoval = struct {
     const Mapping = struct { key: Nat.Key, entry: Nat.Entry };
     survivors: []Mapping,
     used: [3]std.StaticBitSet(65536),
     next: [3]u16,
     generation: u64,
 
-    fn predict(network: *const Network, nat: *const Nat, host: IPv4) !AfterLeaseRemoval {
+    pub fn predict(network: *const Network, nat: *const Nat, host: IPv4) !AfterLeaseRemoval {
         try network.checkAllocatedPorts();
         var count: usize = 0;
         for (nat.inside.keys()) |key| if (!std.meta.eql(key.ip, host)) {
@@ -287,7 +315,7 @@ const AfterLeaseRemoval = struct {
         return model;
     }
 
-    fn check(self: *const AfterLeaseRemoval, nat: *const Nat) !void {
+    pub fn check(self: *const AfterLeaseRemoval, nat: *const Nat) !void {
         if (nat.inside.count() != self.survivors.len or nat.outside.count() != self.survivors.len or nat.next_generation != self.generation) return error.WrongBindingsAfterLeaseRemoval;
         for (self.survivors) |mapping| {
             const actual = nat.inside.get(mapping.key) orelse return error.UnrelatedMappingRemoved;
@@ -331,7 +359,7 @@ pub const Peer = struct {
         if (self.pending) return error.UncheckedObservation;
     }
 
-    fn tickWan(self: *Peer) !void {
+    pub fn tickWan(self: *Peer) !void {
         try self.beginObservation();
         try Router.Protocols.DHCPv4.tickWan(self.network.io, self.network.mock.api());
     }
@@ -387,6 +415,17 @@ pub const Peer = struct {
         self.drops += 1;
     }
 
+    pub fn expectDelivery(self: *Peer, iface: IFace, bytes: []const u8) !void {
+        if (self.observation.count == 0) {
+            // Keep the missing packet in the oracle PCAP when a conversation checks further deliveries.
+            if (self.expected) |out| out[@intFromEnum(iface)].frame(self.network.mock.io, bytes);
+            try self.count(0);
+            return error.MissingDelivery;
+        }
+        try self.count(1);
+        _ = try self.expect(0, iface, bytes);
+    }
+
     pub const DhcpExpectation = struct {
         xid: ?u32 = null,
         rebind: bool = false,
@@ -396,6 +435,7 @@ pub const Peer = struct {
         unicast_yiaddr: bool = false,
         requested: IPv4 = wan,
         server: IPv4 = gateway,
+        server_mac: Mac = gateway_mac,
     };
     pub fn dhcp(
         self: *Peer,
@@ -417,11 +457,11 @@ pub const Peer = struct {
         var boot: [300]u8 = @splat(0);
         boot[0..4].* = .{ if (client) 1 else 2, 1, 6, 0 };
         std.mem.writeInt(u32, boot[4..8], xid, .big);
-        const renewal = client and kind == .request and std.meta.eql(address, wan);
+        const renewal = client and kind == .request and !std.meta.eql(address, IPv4{ 0, 0, 0, 0 });
         std.mem.writeInt(u16, boot[8..10], expected.seconds, .big);
         const unicast = (renewal and !expected.rebind) or expected.client_ip != null or expected.unicast_yiaddr;
         if (!unicast and kind != .decline) boot[10] = 0x80;
-        if (renewal) boot[12..16].* = wan else boot[16..20].* = address;
+        if (renewal) boot[12..16].* = address else boot[16..20].* = address;
         if (expected.client_ip) |ip| boot[12..16].* = ip;
         boot[28..34].* = mac;
         boot[236..240].* = .{ 99, 130, 83, 99 };
@@ -446,14 +486,14 @@ pub const Peer = struct {
         var buf: [2048]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&buf);
         const alloc = fixed.allocator();
-        const src: IPv4 = if (renewal) wan else if (client) @splat(0) else lan;
-        const dst: IPv4 = if (!unicast) @splat(255) else if (client) gateway else expected.client_ip orelse address;
+        const src: IPv4 = if (renewal) address else if (client) @splat(0) else lan;
+        const dst: IPv4 = if (!unicast) @splat(255) else if (client) expected.server else expected.client_ip orelse address;
         const udp = try Packets.udp(alloc, src, dst, .{
             .src_port = if (client) 68 else 67,
             .dst_port = if (client) 67 else 68,
             .payload = &boot,
         });
-        const dst_mac = if (!unicast) broadcast else if (client) gateway_mac else mac;
+        const dst_mac = if (!unicast) broadcast else if (client) expected.server_mac else mac;
         _ = try self.expect(0, self.iface, try wire(alloc, if (client) wan_mac else lan_mac, dst_mac, .{
             .src = src,
             .dst = dst,
@@ -619,7 +659,10 @@ pub const Peer = struct {
             job.makeResponse();
             if (job.choice.outcome == .unknown_peer) job.remote = .{ 203, 0, 113, 250 } else job.public_port = 44000;
             try self.inject(try packet(alloc, job, true, false, 64));
-            return self.expectDrop();
+            if (job.choice.outcome == .unmapped or job.isDns() or self.network.filtering_mode != .full_cone) return self.expectDrop();
+            try self.count(1);
+            _ = try self.expect(0, .lan, try packet(alloc, job, true, true, 63));
+            return;
         }
         if (job.choice.outcome == .wan_ttl) {
             job.makeResponse();
@@ -678,6 +721,51 @@ pub const Peer = struct {
         const replacement_ip: IPv4 = .{ 198, 51, 100, 33 };
         const replacement_gateway: IPv4 = .{ 198, 51, 100, 254 };
         switch (step) {
+            .nak_gateway, .nak_lookup, .nak_renew, .nak_refusal, .nak_offline, .nak_offer, .nak_second_offer, .nak_bind, .nak_retry, .nak_resolve_gateway, .nak_answer => return self.network.renewal_nak.step(self, step, replacement_ip, replacement_gateway),
+            .rebind_server_neighbor, .rebind_unicast, .rebind_broadcast, .rebind_ack, .rebind_lookup, .rebind_route, .rebind_answer, .rebind_backup_neighbor, .rebind_backup_renewal => return self.network.renewal_nak.step(self, step, replacement_ip, replacement_gateway),
+            .opening_syn,
+            .opening_retry_syn,
+            .opening_syn_ack,
+            .opening_lost_ack,
+            .opening_retry_syn_ack,
+            .opening_ack,
+            .opening_request,
+            .opening_response,
+            .opening_response_ack,
+            => return self.network.tcp_retries.open(self, step),
+            .closing_server_fin,
+            .closing_client_ack,
+            .closing_client_fin,
+            .closing_lost_ack,
+            .closing_retry_fin,
+            .closing_ack,
+            => return self.network.tcp_retries.close(self, step),
+            .persist_syn,
+            .persist_syn_ack,
+            .persist_request,
+            .persist_fill,
+            .persist_zero,
+            .persist_probe,
+            .persist_zero_ack,
+            .persist_lost_update,
+            .persist_retry,
+            .persist_open_ack,
+            .persist_resume,
+            .persist_done,
+            => return self.network.persist.step(self, step),
+            .udp_subscribe,
+            .udp_initial_reading,
+            .udp_first_ping,
+            .udp_first_pong,
+            .udp_second_ping,
+            .udp_second_pong,
+            .udp_last_live,
+            .udp_idle_deadline,
+            .udp_after_idle,
+            => return self.network.subscriptions.step(self, step),
+            .dns_initial_query, .dns_retransmit, .dns_delayed_answer, .dns_duplicate_answer => return self.network.dns_retry.step(self, step),
+            .stun_initial_request, .stun_retry_request, .stun_success => return self.network.stun_retry.step(self, step),
+            .audio_start, .audio_second, .audio_third, .audio_first_sr, .audio_first_rr, .audio_resume, .audio_fifth, .audio_sixth, .audio_second_sr, .audio_second_rr => return self.network.audio_call.step(self, step),
             .wan_change_syn,
             .wan_change_accept,
             .wan_change_request,
@@ -687,7 +775,22 @@ pub const Peer = struct {
             .wan_change_response,
             .wan_change_ack,
             => return self.network.wan_change.step(self, step, replacement_ip, replacement_gateway),
-            .guest_discovery, .guest_requests, .guest_connectivity, .guest_echo_replies, .guest_departures => return self.network.guests.step(self, step),
+            .guest_lost_offer,
+            .guest_discovery,
+            .guest_requests,
+            .guest_connectivity,
+            .guest_echo_replies,
+            .guest_first_release,
+            .guest_replacement_discover,
+            .guest_replacement_request,
+            .guest_replacement_retry,
+            .guest_replacement_connectivity,
+            .guest_replacement_reply,
+            .guest_departures,
+            .static_inform,
+            .static_dns_query,
+            .static_dns_answer,
+            => return self.network.guests.step(self, step),
             .sleeping_client_queries,
             .sleeping_client_replies,
             .sleeping_client_still_waiting,
@@ -758,6 +861,7 @@ pub const Peer = struct {
                     const current = table.table.get(index);
                     const deadline = if (kind == 8) before.deadline else std.Io.Timestamp.now(self.network.io, .boot).addDuration(.fromSeconds(86400));
                     if (!std.meta.eql(current.deadline, deadline) or !std.meta.eql(current.mac, mac) or current.state != .bound) return error.WrongLeaseState;
+                    if (kind == 3) self.network.clients[0].lease_deadline = deadline;
                 }
                 try self.inject(try Fixtures.DhcpClient.frame(alloc, mac, .{ .message_type = 3, .server_id = .{ 192, 168, 86, 253 }, .requested_ip = host }));
                 try self.expectDrop();
@@ -1453,6 +1557,7 @@ pub const Network = struct {
     seed: u64,
     budget: usize,
     workload: Workload = .{},
+    filtering_mode: FilteringMode = .address_restricted,
     jobs: [max_reply_lag + 1][batch]?Job = undefined,
     cold: Job = undefined,
     returning_client: u4 = 1,
@@ -1469,7 +1574,14 @@ pub const Network = struct {
     conversations: std.EnumArray(Scenarios.Conversation, usize) = .initFill(0),
     fragment_jobs: [3]Job = undefined,
     wan_change: @import("scenarios/tcp.zig").WanChange = undefined,
+    renewal_nak: @import("scenarios/renewal_nak.zig") = undefined,
     sleeping_client: @import("scenarios/neighbor.zig").SleepingClient = .{},
+    dns_retry: @import("scenarios/dns.zig").Retry = undefined,
+    stun_retry: @import("scenarios/stun_discovery.zig").Retry = undefined,
+    audio_call: @import("scenarios/rtcp.zig") = undefined,
+    subscriptions: @import("scenarios/coap.zig") = undefined,
+    tcp_retries: @import("scenarios/tcp_retries.zig") = undefined,
+    persist: @import("scenarios/tcp_persist.zig") = undefined,
     guests: @import("scenarios/lease.zig").JoiningClients = .{},
     fragments: [2]FragmentModel = @splat(.{}),
     opened: [forced_count]?Job = @splat(null),
@@ -2083,6 +2195,7 @@ pub fn run(
         .returning_client = @intCast(1 + seed % 15),
         .budget = @max(budget, workload.choices.len + forced_count),
         .workload = workload,
+        .filtering_mode = workload.filtering_mode,
         .weights = weights,
     };
     var lan_peer = Peer{ .network = &network, .iface = .lan, .expected = expected };
@@ -2090,6 +2203,9 @@ pub fn run(
     defer lan_peer.observation.deinit(mock.alloc);
     defer wan_peer.observation.deinit(mock.alloc);
     Router.Debug.Cli.enabled = false;
+    const previous_mode = State.nat_filtering_mode;
+    State.nat_filtering_mode = workload.filtering_mode;
+    defer State.nat_filtering_mode = previous_mode;
     try Runtime.setup(mock.alloc, io, mock.api(), lan, mask);
     {
         defer Runtime.teardown(mock.alloc, mock.api());
@@ -2151,7 +2267,7 @@ fn worker(peer: *Peer) void {
         const traffic = round < traffic_end;
         const kind = if (!traffic and episode < conversation_count) network.conversationKind(episode) else null;
         const step: Lifecycle = @enumFromInt(lifecycle_index);
-        Sim.phase = if (traffic or kind != null) Startup.elapsed(round) else step.at(Startup.elapsed(round - lifecycle_index));
+        Sim.phase = if (traffic or kind != null) Startup.elapsed(round) else step.at(Startup.elapsed(round - lifecycle_index), network);
         const result = if (round < first_burst)
             network.startup(peer, @enumFromInt(round), prng.random())
         else if (traffic)
